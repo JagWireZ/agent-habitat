@@ -1,0 +1,105 @@
+<svg viewBox="0 0 1000 900" xmlns="http://www.w3.org/2000/svg" font-family="Inter, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#52606d"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#257942"/>
+    </marker>
+    <style>
+      .phase { font-size: 10.5px; font-weight: 700; letter-spacing: .8px; fill: #657786; }
+      .step-title { font-size: 15px; font-weight: 700; fill: #172b3a; }
+      .step-copy { font-size: 12px; fill: #52606d; }
+      .flow-label { font-size: 11px; font-weight: 600; fill: #52606d; }
+    </style>
+  </defs>
+
+  <rect width="1000" height="900" fill="#ffffff"/>
+
+  <text x="500" y="35" text-anchor="middle" font-size="22" font-weight="750" fill="#172b3a">What happens during a coding session</text>
+  <text x="500" y="59" text-anchor="middle" font-size="12.5" fill="#52606d">The agent works in a disposable microVM; you control which changes reach the host repository.</text>
+
+  <!-- Session setup -->
+  <text x="150" y="96" class="phase">SESSION SETUP</text>
+  <line x1="150" y1="104" x2="850" y2="104" stroke="#d5dce3"/>
+
+  <rect x="250" y="120" width="500" height="76" rx="10" fill="#eef5ff" stroke="#4773ad" stroke-width="1.5"/>
+  <circle cx="280" cy="158" r="17" fill="#4773ad"/>
+  <text x="280" y="163" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">1</text>
+  <text x="500" y="149" text-anchor="middle" class="step-title">Session starts</text>
+  <text x="500" y="172" text-anchor="middle" class="step-copy">Filtered workspace copied in; fresh synthetic Git repository created</text>
+
+  <!-- Repeating prompt loop -->
+  <rect x="150" y="225" width="700" height="455" rx="14" fill="#f5f7f9" stroke="#9aa8b5" stroke-width="1.3" stroke-dasharray="6,5"/>
+  <rect x="176" y="211" width="186" height="28" rx="14" fill="#334e68"/>
+  <text x="269" y="229" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">PROMPT ITERATION LOOP</text>
+  <text x="824" y="248" text-anchor="end" font-size="11" fill="#657786">Repeats until you end the session</text>
+
+  <!-- Enter the repeating loop -->
+  <line x1="500" y1="196" x2="500" y2="256" stroke="#52606d" stroke-width="1.7" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step 2 -->
+  <rect x="260" y="263" width="480" height="72" rx="10" fill="#f0faF2" stroke="#38864b" stroke-width="1.4"/>
+  <circle cx="290" cy="299" r="17" fill="#38864b"/>
+  <text x="290" y="304" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">2</text>
+  <text x="500" y="291" text-anchor="middle" class="step-title">Agent receives prompt</text>
+  <text x="500" y="314" text-anchor="middle" class="step-copy">Any host-side edits are filtered and synced into the guest first</text>
+
+  <line x1="500" y1="335" x2="500" y2="366" stroke="#52606d" stroke-width="1.7" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step 3 -->
+  <rect x="260" y="373" width="480" height="78" rx="10" fill="#eef5ff" stroke="#4773ad" stroke-width="1.4"/>
+  <circle cx="290" cy="412" r="17" fill="#4773ad"/>
+  <text x="290" y="417" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">3</text>
+  <text x="500" y="402" text-anchor="middle" class="step-title">Agent works</text>
+  <text x="500" y="425" text-anchor="middle" class="step-copy">Reads and edits the isolated project copy inside the microVM</text>
+  <text x="500" y="442" text-anchor="middle" class="step-copy">without changing the host repository</text>
+
+  <line x1="500" y1="451" x2="500" y2="482" stroke="#52606d" stroke-width="1.7" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step 4 -->
+  <rect x="260" y="489" width="480" height="78" rx="10" fill="#f0faf2" stroke="#38864b" stroke-width="1.4"/>
+  <circle cx="290" cy="528" r="17" fill="#38864b"/>
+  <text x="290" y="533" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">4</text>
+  <text x="500" y="518" text-anchor="middle" class="step-title">Agent prepares changes</text>
+  <text x="500" y="541" text-anchor="middle" class="step-copy">A validated patch is returned for review</text>
+  <text x="500" y="558" text-anchor="middle" class="step-copy">Nothing is applied to the host repository yet</text>
+
+  <line x1="500" y1="567" x2="500" y2="598" stroke="#52606d" stroke-width="1.7" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step 5 -->
+  <rect x="260" y="605" width="480" height="62" rx="10" fill="#fff8e8" stroke="#d39b2f" stroke-width="1.4"/>
+  <circle cx="290" cy="636" r="17" fill="#d39b2f"/>
+  <text x="290" y="641" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">5</text>
+  <text x="500" y="631" text-anchor="middle" class="step-title">User reviews + applies</text>
+  <text x="500" y="652" text-anchor="middle" class="step-copy">Apply the patch, commit and push—or send another prompt</text>
+
+  <!-- Repeat path -->
+  <path d="M740 636 H784 Q816 636 816 604 V326 Q816 299 788 299 H740" fill="none" stroke="#257942" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <rect x="774" y="447" width="84" height="22" rx="11" fill="#ffffff" stroke="#b9d7c3" transform="rotate(90 816 458)"/>
+  <text x="816" y="462" text-anchor="middle" class="flow-label" fill="#257942" transform="rotate(90 816 458)">another prompt</text>
+
+  <!-- Exit loop -->
+  <line x1="500" y1="667" x2="500" y2="725" stroke="#52606d" stroke-width="1.7" marker-end="url(#arrow-gray)"/>
+  <rect x="516" y="687" width="105" height="22" rx="11" fill="#ffffff" stroke="#d5dce3"/>
+  <text x="568.5" y="702" text-anchor="middle" class="flow-label">when finished</text>
+
+  <!-- Session cleanup -->
+  <text x="150" y="715" class="phase">SESSION CLEANUP</text>
+  <line x1="150" y1="723" x2="445" y2="723" stroke="#d5dce3"/>
+  <line x1="628" y1="723" x2="850" y2="723" stroke="#d5dce3"/>
+
+  <rect x="250" y="738" width="500" height="100" rx="10" fill="#f7f8fa" stroke="#52606d" stroke-width="1.5"/>
+  <circle cx="280" cy="788" r="17" fill="#52606d"/>
+  <text x="280" y="793" text-anchor="middle" font-size="14" font-weight="700" fill="#ffffff">6</text>
+  <text x="500" y="769" text-anchor="middle" class="step-title">Session ends</text>
+  <text x="500" y="793" text-anchor="middle" class="step-copy">The microVM and its temporary storage are destroyed</text>
+  <text x="500" y="812" text-anchor="middle" class="step-copy">Approved changes remain in the host repository;</text>
+  <text x="500" y="829" text-anchor="middle" class="step-copy">unapproved guest changes are discarded</text>
+
+  <!-- Legend -->
+  <line x1="292" y1="870" x2="330" y2="870" stroke="#52606d" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="342" y="874" font-size="11" fill="#52606d">session sequence</text>
+  <line x1="500" y1="870" x2="538" y2="870" stroke="#257942" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="550" y="874" font-size="11" fill="#52606d">repeat with another prompt</text>
+</svg>

@@ -1,0 +1,33 @@
+# Bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Python test caches
+.pytest_cache/
+.cache/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.pid
+tmp/
+*.swp
+*~
+.DS_Store
+
+# Editor/IDE directories
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Build artifacts
+node_modules/
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Misc
+.env

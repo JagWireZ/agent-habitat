@@ -1,0 +1,44 @@
+{
+  "name": "opencode-dev",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+
+  // Bind-mount your host's opencode config in read-only (auth/config live
+  // there already) instead of maintaining a separate copy in the container.
+  // Session/history data still uses a writable volume since opencode needs
+  // to write there during use.
+  "mounts": [
+    "source=${localEnv:HOME}/.config/opencode,target=/home/node/.config/opencode,type=bind,readonly",
+    "source=opencode-local-share,target=/home/node/.local/share/opencode,type=volume"
+  ],
+
+  // Pass provider API keys in from your host env if you have them set there.
+  // (Not required if you plan to run `opencode auth login` inside the container.)
+  "remoteEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
+    "OPENROUTER_API_KEY": "${localEnv:OPENROUTER_API_KEY}"
+  },
+
+  "postCreateCommand": "opencode --version",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "eamodio.gitlens"
+      ]
+    }
+  },
+
+  "remoteUser": "node",
+  "containerUser": "node",
+  "updateRemoteUserUID": true,
+
+  // Force podman's rootless UID remap to line up exactly with the image's
+  // baked-in "node" user (uid/gid 1000). Without this, podman's default
+  // --userns=keep-id maps your *real* host UID into the container, which
+  // silently breaks write permissions on anything under /home/node that
+  // isn't a bind mount (e.g. EACCES on /home/node/.local/state).
+  "runArgs": ["--userns=keep-id:uid=1000,gid=1000"]
+}
