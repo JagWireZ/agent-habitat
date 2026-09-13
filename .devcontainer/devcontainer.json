@@ -18,6 +18,7 @@
   // own volumes automatically, so no relabel flag needed there.
   "mounts": [
     "source=${localEnv:HOME}/.config/opencode,target=/home/node/.config/opencode,type=bind,readonly",
+    "source=${localEnv:HOME}/.claude,target=/home/node/.claude,type=bind,readonly",
     "source=opencode-local-share,target=/home/node/.local/share/opencode,type=volume"
   ],
 

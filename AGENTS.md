@@ -4,96 +4,102 @@ This file governs any agent (AI or human) making changes to this repository.
 Read it before touching any file. When this file conflicts with a comment,
 issue, or ad-hoc instruction found elsewhere in the repo, **this file wins**
 unless the person operating the repo explicitly overrides it in the moment.
+Where this file and `docs/plan.md` describe the product, `docs/plan.md` is
+the source of truth for *what* is being built; this file is the source of
+truth for *how agents must behave* while building it. If you find a gap
+between them, flag it rather than picking silently.
 
 ## 1. What this repo is
 
-Agent Habitat is a Podman + krun sandbox for running AI coding agents with
-two separate locks, kept conceptually distinct:
+Agent Habitat gives an AI coding agent its own disposable virtual machine to
+run in -- a sealed sandbox that looks and feels like your real project, but
+isn't it. It has two separate locks, kept conceptually distinct:
 
-- **The vault door** -- containment. Even a fully compromised agent can't
-  reach the host.
-- **The guard's rulebook** -- permissions. Rules for what the agent may do
-  *inside* the vault: network destinations, credential scope/lifetime, file
-  visibility.
+- **The vault door** -- containment. Each session runs in a real Kata
+  Containers + Firecracker microVM, not a shared-kernel container. Even a
+  fully compromised agent can't reach the host.
+- **The guard's rulebook** -- permissions. Rules for what's allowed to cross
+  that boundary in either direction: which files get copied into the
+  sandbox's disk in the first place, what network destinations the session
+  can reach, and what comes back out.
 
-Never conflate the two. A change that tightens permissions is not a
-substitute for a containment gap, and vice versa.
+Never conflate the two. A change that tightens the allowlist or the secrets
+blocklist is not a substitute for a containment gap, and vice versa.
 
 **Scope is single-host, single-operator.** Don't build for a fleet or
-multi-tenant use unless asked -- the flat secret store, lockfile-based
-concurrency, and single audit destination are deliberate single-host
-constructs, not placeholders waiting to be generalized.
+multi-tenant use unless asked -- the disposable-VM-per-session model, the
+two-point sync mechanism, and the single audit destination are deliberate
+single-host constructs, not placeholders waiting to be generalized.
+
+**v1 targets AlmaLinux.** Don't build Fedora- or Ubuntu-specific paths
+preemptively -- see Section 5.
 
 ## 2. Non-negotiable invariants
 
-These hold regardless of which phase or file you're touching. If a task
-seems to require violating one, stop and flag it rather than proceeding.
+These hold regardless of which part of the system you're touching. If a
+task seems to require violating one, stop and flag it rather than
+proceeding.
 
-1. **No live credential reinjection.** `podman secret create --replace`
-   does not propagate to running containers. Don't build a refresh daemon.
-   Sessions are bounded by credential TTL -- issue short, size the session
-   to fit, restart with a fresh credential if more time is needed.
-2. **No filename-based masking on an already-live mount.** Workspace
-   composition happens *before* the guest starts. If a path shouldn't be
-   visible to the guest, it's never bind-mounted -- it's not hidden after
-   the fact. This was tried once, rejected (fragile against symlinks, hard
-   links, mid-session writes, and `tmpcopyup`).
-3. **The diff is the authoritative change record -- never the agent's own
-   transcript.** The transcript is always labeled supplementary, wherever
-   it's referenced, logged, or displayed. A diff only counts as
-   authoritative when computed by trusted host-side code against a
-   snapshot that code itself took before the session started.
-4. **Commits/PRs are created host-side, under a separate scoped identity
-   from the sandbox's own credential** -- regardless of `include_git`.
-5. **Never write a credential into an environment variable.** Injection is
-   always via `--secret` (or the platform equivalent). No exceptions, not
-   even in test scripts or "just for debugging" code.
-6. **Every credential is scoped to the minimum reach needed** (one repo,
-   one branch, PR-open rather than repo-admin, etc.) and excluded from
-   admin/settings endpoints (branch protection, repo/CI secrets,
-   workflow-approval config, release config).
-7. **Egress enforcement happens at the point that actually carries guest
-   traffic** -- the `passt`/`pasta` socket handoff -- never only inside the
-   guest or in an assumed netns that might not be the one carrying traffic.
-8. **Deny rules for RFC1918/link-local/loopback/metadata-service addresses
-   are structurally guaranteed to load before any allow entry.** "We
-   commented that it loads first" is not sufficient -- the loading
-   mechanism itself must enforce the order.
-9. **sVirt confinement of `block‑device image` and the `.git*` exclusion are
-   independent mechanisms, both required.** Confinement stops a
-   compromised guest/`block‑device image` from reaching outside the mount.
-   Exclusion stops named git-control paths from being wired in at all,
-   even inside an otherwise fully writable mount. Neither substitutes for
-   the other; don't remove one because the other seems to cover it.
-10. **MCS category allocation must actively prevent collisions**, not just
-    log a warning if one occurs. A collision between two concurrent
-    sessions silently defeats confinement (each session's `block‑device image`
-    could read the other's files) and the launch gate has no way to
-    detect it after the fact -- so it must be prevented, not detected.
-11. **`include_git` is a profile-level YAML setting, default `false` --
-    never a per-invocation CLI flag.** The CLI must not accept a flag that
-    bypasses the profile file. Flipping it is a deliberate, logged,
-    reviewed change, same discipline as any other profile-grant change.
-12. **Ambiguous validator findings are flagged for review -- never silently
-    blocked and never silently passed.** This needs its own visible output
-    state, distinct from both "clean" and "hard reject."
-13. **The agent-facing CI pipeline and the human-approved CI pipeline are
-    separate files with no shared conditional secret-injection logic.** If
-    you find yourself writing an `if is_agent_pr:` branch that toggles
-    secret access inside one pipeline definition, stop and split the file.
-14. **Launch-gate failures are never silent.** On refusal: name the
-    specific check that failed, exit non-zero, log to the same journald
-    destination as session activity but tagged distinctly.
-15. **Local secret deletion at teardown is hygiene, not revocation.** Don't
-    write or review code/docs that conflate the two. A boot-time
-    reconciliation sweep produces a manual revocation-review list; it does
-    not itself revoke anything at the issuer.
-16. **The forwarded transcript pipeline is untrusted input, not just an
-    untrusted record.** No shell interpolation of log content, anywhere it
-    is parsed or displayed. Treat it like any other attacker-influenced
-    string.
-
-17. **All files must contain only ASCII characters; any non-ASCII Unicode characters are prohibited.**
+1. **No live, always-on file-sharing process between host and sandbox.**
+   Syncing happens only at two well-defined moments -- host to sandbox
+   before each prompt, sandbox to host after each tool call -- via the same
+   trusted patch mechanism used for final promotion. Don't build a
+   continuously-mounted live share; that reintroduces the background
+   bridging process this design deliberately avoids.
+2. **No filename-based masking applied after the sandbox's disk already
+   exists.** The secrets blocklist (`.env`, `*.pem`, `*.key`, `id_rsa*`,
+   cloud credential files, and similar) is applied *before* anything is
+   copied in, including the very first copy that builds the disk. If a
+   path shouldn't be visible to the guest, it's never included -- it's not
+   hidden after the fact.
+3. **The diff/patch produced by the trusted host-side sync mechanism is the
+   authoritative change record -- never the agent's own transcript.** The
+   transcript is always labeled supplementary, wherever it's referenced,
+   logged, or displayed.
+4. **The sandbox never commits or pushes to the user's real repository.**
+   Its changes only ever arrive as a patch applied to the real working
+   directory. Committing and pushing stay a manual, host-side action the
+   user takes on their own schedule -- there is no forced "end of session"
+   commit gate, and no code path where the agent's own git identity reaches
+   the user's real remote.
+5. **Never write a credential or provider API key into the guest as a
+   plaintext environment variable.** Use the actual secret-injection
+   mechanism for the chosen VM stack, not env vars, not baked into the
+   guest image, not passed as a CLI argument -- no exceptions, not even in
+   test scripts or "just for debugging" code.
+6. **Egress enforcement happens at the local proxy that actually carries
+   guest traffic** -- never only inside the guest, and never assumed to
+   hold for a network path that hasn't actually been shown to be the one
+   carrying it.
+7. **Default-deny egress.** Only the allowlist (AI provider APIs, standard
+   package registries) is reachable; everything else is blocked. Filter by
+   destination at connection setup (e.g. SNI), not by IP -- IPs rotate, and
+   fully intercepting traffic would break certificate verification in agent
+   tooling.
+8. **VM/kernel containment and the secrets blocklist are independent
+   mechanisms, both required.** Containment stops a compromised guest from
+   reaching outside the VM. The blocklist stops sensitive files from being
+   included in the sandbox's disk at all, even though everything else on
+   that disk is fully readable/writable by the agent. Neither substitutes
+   for the other; don't drop one because the other seems to cover it.
+9. **Git history exposure is an explicit, default-off toggle in the checked-
+   in config file** -- synthetic repo by default, real `.git` shared
+   read-only only when a project turns that on. Never silently expose real
+   history "to make git work better."
+10. **A patch that fails validation on arrival is flagged for review** --
+    never silently merged and never silently dropped. The same standard
+    applies to any other automated check whose result is genuinely
+    ambiguous: it needs its own visible state, distinct from both "clean"
+    and "hard reject."
+11. **Launch-time preflight checks fail closed and never silently.** On
+    refusal (e.g. hardware virtualization support isn't present), name the
+    specific check that failed, exit non-zero, and log it to the same audit
+    destination as normal session activity, tagged distinctly.
+12. **Audit/session logs are untrusted, attacker-influenced input, not just
+    a record.** No shell interpolation of log content anywhere it's parsed
+    or displayed -- treat it like any other attacker-influenced string.
+13. **All files must contain only ASCII characters; any non-ASCII Unicode
+    characters are prohibited.**
 
 ## 3. "Verify before trusting" -- a recurring discipline
 
@@ -101,26 +107,26 @@ Several parts of this system require a real verification step before
 anything downstream is allowed to depend on them. Don't skip these in favor
 of code that looks correct by inspection:
 
-- **Egress ruleset:** a concrete packet trace confirming allowed/blocked
-  connections are actually intercepted at the `passt` handoff, with
-  nftables counters incrementing where expected -- before trusting the
-  ruleset, and re-run after any change.
-- **sVirt confinement:** a cross-category access attempt must be shown to
-  actually fail before the confinement is trusted.
-- **MCS allocator:** refuse to start a session if the about-to-be-assigned
-  category pair is already marked in-use -- checked, not assumed.
-- **Nested-netns-under-a-pod (Phase 5):** Podman pods conventionally share
-  namespaces between members, which cuts against the isolation goal. Don't
-  trust the design until a verification script demonstrates sibling
-  containers' actual reachable surface matches their own rules, not the
-  pod's shared surface. If verification fails, say so and use the
-  documented standalone-container fallback -- don't paper over a failing
-  check to make a phase look done.
-- **Launch gate overall:** fail-closed across all checked domains (egress,
-  mount composition, sVirt confinement, teardown/reconciliation, logging).
-  Every check needs at least one deliberately-broken-precondition test
-  proving it actually blocks launch on failure, not just that it passes in
-  the happy path.
+- **VM/kernel containment:** a concrete escape attempt from inside the
+  guest (reaching host files, host processes, or the host network
+  namespace) must be shown to actually fail before containment is trusted.
+- **Egress ruleset:** a concrete connection trace confirming allowed and
+  blocked destinations are actually intercepted at the proxy hand-off --
+  before trusting the ruleset, and re-run after any change.
+- **Hardware virtualization preflight:** must be verified to actually
+  detect the absence of virtualization support, not just assumed present --
+  `docs/plan.md` notes this can be silently unavailable on some cloud
+  machines.
+- **Sync/patch validity:** a corrupted or unexpected patch must be
+  demonstrated to be flagged rather than silently applied, in both
+  directions of the sync.
+- **Sync performance at scale:** not yet validated for large monorepos or
+  large binary files (see `docs/plan.md` Known limitations) -- don't claim
+  this works at scale until it's actually been measured.
+- **The stack overall:** Kata Containers + Firecracker launched via
+  containerd/nerdctl is newer and less battle-tested than more common
+  setups. It needs real hands-on validation on real hardware before v1
+  ships, not just a configuration or design review.
 
 ## 4. Deferred items -- do not implement, note the trigger only
 
@@ -131,84 +137,74 @@ has actually occurred and someone explicitly asks for the build.
 
 | Item | Trigger to build |
 |---|---|
-| SNI-inspecting forward proxy | An actual DNS+ipset bypass observed in adversarial testing or real use |
-| Credential broker | TTL-forced-restart rate exceeds an agreed threshold (e.g. a defined % of `repo-pr` tasks) |
-| Real-time alerting layer | Sessions start running long/unattended enough that retrospective review stops being adequate |
-| Encryption-at-rest for the secret store | Expansion beyond single-host/single-tenant scope |
-| General SELinux confinement of the whole runtime process (beyond the narrow `block‑device image` domain) | Not currently triggered; revisit only with a concrete new justification |
-| eBPF-based auditing (beyond v1's auditd/vsock scope) | auditd's overhead or coverage proves insufficient in practice |
+| Full in-sandbox activity logging (beyond boundary-crossing audit) | Boundary-only audit proves insufficient for real incident review |
+| Agent proactively checking host files mid-task (outside the two sync points) | A demonstrated task pattern that materially needs it, once the two-point sync is shown insufficient in practice |
+| Optional live progress view into a running session | A real need to observe an in-progress session beyond post-hoc audit review |
+| Targeted secret injection (a single value instead of withholding a whole blocklisted file) | v1's all-or-nothing blocklist behavior is shown to block a genuinely necessary task |
+| GPU support | An actual project requiring GPU-backed agent work |
+| v1.1 -- Fedora support | v1 (AlmaLinux) has shipped and been validated end-to-end |
+| v2 -- Ubuntu support | v1 is proven out; Ubuntu needs its own security-model validation, not a port |
 
 Known accepted gaps (do not attempt to close without being asked):
-- DoH-range blocking doesn't fully close the bypass if an allowlisted
-  domain shares a CDN IP with a DoH-capable resolver.
-- `podman secret` is plaintext at rest at single-host scope.
-- krun/passt/KVM/host-kernel remain real attack surface; the accepted
-  mitigation is patch discipline (drift-check + CVE ingestion) and
-  blast-radius limitation (single-host scope), not a technical control.
+- Hardware virtualization isn't always available on cloud machines --
+  checked for up front, not papered over or assumed.
+- A second piece of host infrastructure (containerd) is required alongside
+  whatever a team already runs.
+- In-sandbox activity isn't logged in v1 -- only what crosses the
+  host/sandbox boundary (the VM process, the proxy, the sync mechanism).
+- No middle ground for blocked files -- if a task genuinely needs a
+  blocklisted file's contents, it's simply unavailable in v1.
 
-## 5. Phase order and dependency chain
+## 5. Roadmap and build order
 
-Phases are a hard dependency chain, not a priority ranking:
+Distro support is sequenced, not parallel:
 
 ```
-Phase 0 (Runtime Foundation)
-  -> Phase 1 (Harden Container/Host + Isolate Workspace)
-    -> Phase 2 (Restrict Egress Traffic)
-      -> Phase 3 (Isolate Credentials + Audit Activity)
-        -> Phase 4 (Gate Output Integration)
-      -> Phase 5 (Isolate Dependencies/Tools) -- gated on Phase 2 + real
-        MCP/tool usage, not a fixed date
-  -> Phase 6 (Capability Profiles) -- last; assembles everything above
+v1  -- AlmaLinux (full system, validated end-to-end on real hardware)
+  -> v1.1 -- Fedora (expected light lift, but still needs its own
+     validation pass -- don't assume it's free)
+    -> v2 -- Ubuntu (a different security model under the hood; waits
+       until v1 is proven, not built alongside it)
 ```
 
 Rules that follow from this:
 
-- **Don't build ahead of the chain.** If a task in a later phase needs an
-  artifact from an earlier phase that doesn't exist yet, create a clearly
-  marked minimal stub with an extension point -- don't build a parallel
-  mechanism, and don't silently skip the dependency.
-- **Extend stubs, don't replace them.** If a previous phase left a stub
-  (e.g. `cli/launch-gate/preflight-checks.py`,
-  `credentials/reconciliation/boot-time-sweep.py`), find it and extend it.
-  A second, competing implementation of the same mechanism is a defect.
-- **Phase 5 is conditional, not scheduled.** Don't build it preemptively;
-  build it once MCP/tool usage is actually in play.
-- **Phase 6 is an orchestrator, not a place to reimplement.** If `cli/habitat`
-  starts reimplementing credential issuance, mount composition, or
-  allowlist logic inline instead of calling out to the artifacts built in
-  Phases 1-3, that's wrong -- go wire to the existing artifact instead.
+- **Don't build ahead of the roadmap.** If a task seems to need something
+  from a later stage (e.g. Ubuntu-specific tooling) that doesn't exist yet,
+  flag it rather than building a one-off parallel mechanism for it now.
+- **v1 is AlmaLinux, full stop.** Distro-conditional branches for Fedora or
+  Ubuntu don't belong in the codebase until their own roadmap stage starts.
 
 ## 6. File structure conventions
 
-Follow `file-structure.md` exactly. Notes beyond what's there:
+Follow `file-structure.md` if present, and keep these conventions in mind
+regardless:
 
-- Config/policy that's shared across domains (e.g. SELinux policy used by
-  both runtime and workspace mounting) belongs in `security/`, not
-  duplicated into the consuming domain's directory.
+- Config/policy shared across domains (e.g. isolation and egress policy
+  used by both the VM launcher and the workspace/sync layer) belongs in a
+  shared location, not duplicated into each consuming domain's directory.
 - Anything under `docs/decisions/` is an ADR-style record, including
   deferred-item design notes (Section 4) -- these are real deliverables,
   not placeholders to skip.
-- Test locations mirror source locations: `tests/unit/` mirrors domain
-  folders, `tests/integration/` covers end-to-end launch->session->
-  teardown->reconciliation, `tests/adversarial/` cross-references
-  `network/adversarial-tests/` plus multi-session interference.
-- When Phase 2's `network/adversarial-tests/checklist.md` needs a new test
-  case (e.g. multi-session interference from Phase 5), **edit that file**
-  -- don't create a second checklist.
+- Test locations should mirror source locations: unit tests mirror domain
+  folders, integration tests cover end-to-end launch -> session ->
+  teardown, and adversarial tests cover egress bypass attempts and
+  containment-escape attempts together.
+- When an existing test checklist needs a new case, edit that file --
+  don't create a second, competing checklist covering the same ground.
 
 ## 7. Definition of "done"
 
 An artifact is done when:
 
-1. The file/script/policy exists at the path specified in
-   `file-structure.md`.
-2. Where the plan specifies a verification step (Section 3), that
-   verification has actually been run and passed -- not just written.
+1. The file/script/policy exists at its intended path.
+2. Where a verification step is called for (Section 3), that verification
+   has actually been run and passed -- not just written.
 3. Assertions that are supposed to be hard failures actually fail the
-   process/play/gate -- no "warning only" checks standing in for a stated
-   hard precondition.
-4. Idempotent artifacts (Ansible roles, config appliers) have been run
-   twice and confirmed to produce no changes on the second run.
+   process/gate -- no "warning only" checks standing in for a stated hard
+   precondition.
+4. Idempotent artifacts (config appliers, provisioning scripts) have been
+   run twice and confirmed to produce no changes on the second run.
 5. Deferred items have a design note, explicitly marked not implemented,
    with the trigger condition stated -- and nothing more.
 
@@ -219,23 +215,27 @@ depends on" is done.
 
 - Governance is consolidated into **one** file, `reviews/CHECKLIST.md`,
   reviewed on **one** quarterly cadence covering three things together:
-  the dependency/tool catalogue, profile-grant changes since the last
-  pass (including any `include_git` flips), and accumulated confinement
-  policy. Do not split this into separate tracked processes.
+  the dependency/tool catalogue, allowlist/blocklist changes since the
+  last pass (including any git-history-toggle flips), and accumulated
+  containment policy. Do not split this into separate tracked processes.
 - A real calendar-reminder/scheduling artifact triggers the review -- not
   an instruction relying on someone remembering.
-- Any profile-grant change -- including flipping `include_git` -- requires
-  a logged, reviewed entry (via the template under `cli/profiles/`)
-  *before* it takes effect. This applies even to changes that look small.
+- Any change that expands what a session can reach or see -- including
+  flipping the git-history toggle on for a project -- requires a logged,
+  reviewed entry *before* it takes effect. This applies even to changes
+  that look small.
 
 ## 9. When instructions are ambiguous or seem to require a shortcut
 
 - If a request would require violating Section 2's invariants, don't
   reinterpret the request to make it seem safe -- say so and propose the
-  compliant alternative (e.g. a stub + extension point, a design note
-  instead of an implementation).
-- If a mechanism from an earlier phase seems missing, look for it before
-  building a substitute. If it's genuinely absent, stub it minimally and
-  say so explicitly rather than quietly filling the gap with new logic.
+  compliant alternative (e.g. a design note instead of an implementation,
+  or a change to the config file instead of a code-level bypass).
+- If a mechanism seems missing, look for it before building a substitute.
+  If it's genuinely absent, stub it minimally and say so explicitly rather
+  than quietly filling the gap with new logic.
 - If asked to build a deferred item (Section 4) without the trigger having
   occurred, write the design note only and say why you stopped there.
+- If this file and `docs/plan.md` seem to disagree about the architecture,
+  stop and flag it rather than picking one silently -- see the note at the
+  top of Section 1.
