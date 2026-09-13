@@ -1,0 +1,8 @@
+[package]
+name = "habitat-install"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "habitat install + habitat run's preflight checks (Phase 1)."
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "habitat-policy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Shared config/policy schema and loader for the data under /policy and the checked-in config file."
+
+[dependencies]

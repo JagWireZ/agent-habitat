@@ -1,0 +1,16 @@
+[package]
+name = "habitat-cli"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "The `habitat` binary entrypoint: `habitat install` and `habitat run`."
+
+[[bin]]
+name = "habitat"
+path = "src/main.rs"
+
+[dependencies]
+# Phase 0: no logic yet, so no dependencies on the other domain crates are
+# wired up. Phase 7 assembles this into the real CLI, depending on
+# habitat-install, habitat-workspace, habitat-vm, habitat-egress,
+# habitat-audit, and habitat-policy.

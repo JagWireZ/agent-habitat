@@ -1,0 +1,8 @@
+[package]
+name = "habitat-workspace"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Secrets blocklist, disk-build pipeline, and two-point host/sandbox sync (Phases 2 & 4)."
+
+[dependencies]

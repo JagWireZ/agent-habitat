@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cli",
+    "crates/install",
+    "crates/workspace",
+    "crates/vm",
+    "crates/egress",
+    "crates/audit",
+    "crates/policy",
+]
+
+# Phase 0 scaffolding only -- no logic, no dependencies pinned yet beyond
+# what each crate's own Cargo.toml declares. See file-structure.md for what
+# each crate is responsible for.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+publish = false
+# No `license` set here: no LICENSE file exists in this repo yet and no
+# licensing decision has been made. Add it (and a matching ADR) when one is.

@@ -29,5 +29,8 @@ dist/
 *.egg-info/
 *.egg
 
+# Rust build artifacts
+target/
+
 # Misc
 .env

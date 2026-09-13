@@ -14,7 +14,9 @@ Three things make this safe in practice:
 
 Everything the agent does is logged, so there's always a clear record of what happened in a session.
 
-**v1 targets AlmaLinux**, with Fedora expected to follow easily and Ubuntu planned for later once the core is proven.
+**The host machine must be Linux in v1, and v1 specifically targets two host OS families in parallel: Fedora-based and Ubuntu-based distros** (covering the majority of rpm- and deb-based systems), with hardware virtualization available — not macOS or Windows. macOS and Windows host support is planned for later, once the Linux-host core is proven; it isn't scoped or designed yet.
+
+**The guest is a separate, fixed thing: a minimal Alpine Linux image inside the sandbox** (see Section 2.1). It doesn't change with host-OS-family support, and it isn't on a distro roadmap of its own.
 
 Here's how the pieces fit together:
 
@@ -114,6 +116,8 @@ There's one hardened setup, not a "fast but less safe" mode and a "slow but safe
 
 ## 4. Known limitations
 
+- **Linux host only in v1.** Firecracker needs KVM, which means no native macOS or Windows support yet — running inside a nested VM (e.g. Docker Desktop/WSL2's own Linux VM) is not a supported path today. macOS and Windows are future work, not a v1 gap being papered over.
+- **v1 validates two host distro families: Fedora-based and Ubuntu-based.** Other Linux distros (Arch, openSUSE, etc.) have the same underlying KVM/containerd/Kata requirements but aren't validated or officially supported until their own roadmap stage.
 - **Hardware virtualization is required** and isn't always available on cloud machines — we check for this up front rather than failing at runtime.
 - **A second piece of host infrastructure (containerd) is required**, alongside whatever a team already runs.
 - **In-sandbox activity isn't logged in v1** — only what crosses the boundary. A candidate follow-up.
@@ -125,7 +129,9 @@ There's one hardened setup, not a "fast but less safe" mode and a "slow but safe
 
 ## 5. Roadmap
 
-1. **v1 — AlmaLinux:** the full system described above, validated end-to-end on real hardware.
-2. **v1.1 — Fedora:** expected to be a light lift, given how closely it's related to AlmaLinux.
-3. **v2 — Ubuntu:** a different security model under the hood, so this waits until v1 is proven out.
-4. **Future additions:** full in-sandbox activity logging; the agent being able to check host files on demand; an optional live progress view; GPU support if it's ever needed.
+**Guest (inside the sandbox):** fixed at a minimal Alpine Linux image throughout -- no distro roadmap of its own; see Section 2.1.
+
+**Host OS family (the machine running `habitat`):**
+
+1. **v1 -- Fedora-based and Ubuntu-based Linux distros, in parallel:** the full system described above, validated end-to-end on real hardware for both -- not one first and the other later. Together they cover the RPM and DEB package families.
+2. **Future additions:** further host distro families (e.g. Arch, openSUSE) once both v1 host lines are proven out; macOS and Windows host support (a separate, later effort -- Firecracker/KVM needs a Linux kernel, so this needs its own isolation-model design, not just "more Linux distros"); full in-sandbox activity logging; the agent being able to check host files on demand; an optional live progress view; GPU support if it's ever needed.

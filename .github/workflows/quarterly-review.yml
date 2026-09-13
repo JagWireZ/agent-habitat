@@ -1,0 +1,73 @@
+name: Quarterly governance review trigger
+
+# Real scheduling artifact for AGENTS.md Section 8 / reviews/CHECKLIST.md.
+# Fires at 09:00 UTC on the 1st of Jan/Apr/Jul/Oct (quarterly) and opens a
+# tracking issue linking to reviews/CHECKLIST.md so the pass isn't relying
+# on someone remembering. Also runnable on demand via workflow_dispatch to
+# verify the trigger without waiting for the schedule.
+#
+# This workflow only opens the tracking issue -- it does not perform the
+# review itself. The review is done by a person working through
+# reviews/CHECKLIST.md and committing the filled-in entry (see that file).
+
+on:
+  schedule:
+    - cron: "0 9 1 1,4,7,10 *"
+  workflow_dispatch: {}
+
+permissions:
+  issues: write
+
+jobs:
+  open-tracking-issue:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute the current quarter label
+        id: quarter
+        run: |
+          year="$(date -u +%Y)"
+          month="$(date -u +%m)"
+          case "$month" in
+            01|02|03) q=Q1 ;;
+            04|05|06) q=Q2 ;;
+            07|08|09) q=Q3 ;;
+            *) q=Q4 ;;
+          esac
+          echo "label=${year}-${q}" >> "$GITHUB_OUTPUT"
+
+      - name: Open quarterly review tracking issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const label = "${{ steps.quarter.outputs.label }}";
+            const title = `Quarterly governance review: ${label}`;
+            const body = [
+              `This is the scheduled trigger for the ${label} quarterly review.`,
+              "",
+              "Work through `reviews/CHECKLIST.md` (dependency/tool catalogue, ",
+              "allowlist/blocklist change log, containment policy accumulation), ",
+              "append a filled-in dated entry to that file, and close this issue ",
+              "by linking the commit/PR that adds the entry.",
+              "",
+              "See AGENTS.md Section 8 for why this is the sole governance artifact.",
+            ].join("\n");
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "all",
+              labels: "governance-review",
+            });
+            const already = existing.data.find((i) => i.title === title);
+            if (already) {
+              core.info(`Issue already exists: ${already.html_url}`);
+              return;
+            }
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ["governance-review"],
+            });

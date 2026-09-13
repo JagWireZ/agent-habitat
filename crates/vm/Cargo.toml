@@ -1,0 +1,8 @@
+[package]
+name = "habitat-vm"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "VM launch via containerd/nerdctl + Kata/Firecracker, and session lifecycle (Phase 3)."
+
+[dependencies]

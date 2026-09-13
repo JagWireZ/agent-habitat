@@ -1,0 +1,8 @@
+[package]
+name = "habitat-audit"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Unified boundary-crossing audit log (Phase 6, sink established in Phase 1)."
+
+[dependencies]

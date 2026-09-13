@@ -31,8 +31,17 @@ multi-tenant use unless asked -- the disposable-VM-per-session model, the
 two-point sync mechanism, and the single audit destination are deliberate
 single-host constructs, not placeholders waiting to be generalized.
 
-**v1 targets AlmaLinux.** Don't build Fedora- or Ubuntu-specific paths
-preemptively -- see Section 5.
+**The host machine is Linux-only in v1, and v1 specifically targets two
+host OS families in parallel: Fedora-based (RPM/dnf) and Ubuntu-based
+(DEB/apt) distros.** Both ship together in v1, not one after the other --
+see Section 5. Don't build host-OS-detection branches, nested-VM
+workarounds, or "best effort" paths for macOS/Windows, or for any other
+Linux distro family (Arch, openSUSE, etc.), preemptively. macOS/Windows
+host support is future work, not yet designed -- see Section 5.
+
+**The guest inside the sandbox is fixed: a minimal Alpine Linux image.**
+This is separate from host-OS-family support above and does not have its
+own distro roadmap -- don't build guest-distro-selection logic.
 
 ## 2. Non-negotiable invariants
 
@@ -142,10 +151,12 @@ has actually occurred and someone explicitly asks for the build.
 | Optional live progress view into a running session | A real need to observe an in-progress session beyond post-hoc audit review |
 | Targeted secret injection (a single value instead of withholding a whole blocklisted file) | v1's all-or-nothing blocklist behavior is shown to block a genuinely necessary task |
 | GPU support | An actual project requiring GPU-backed agent work |
-| v1.1 -- Fedora support | v1 (AlmaLinux) has shipped and been validated end-to-end |
-| v2 -- Ubuntu support | v1 is proven out; Ubuntu needs its own security-model validation, not a port |
+| Additional host distro/family variants (e.g. Arch, openSUSE) | Both v1 host lines (Fedora-based, Ubuntu-based) have shipped and been validated end-to-end |
+| macOS / Windows host support | Linux-host v1 (both host families) has shipped and been validated; the host isolation model for a non-KVM host is designed and reviewed, not assumed |
 
 Known accepted gaps (do not attempt to close without being asked):
+- The host must be Linux -- Firecracker needs KVM. macOS and Windows host
+  support is future work, not yet designed.
 - Hardware virtualization isn't always available on cloud machines --
   checked for up front, not papered over or assumed.
 - A second piece of host infrastructure (containerd) is required alongside
@@ -157,23 +168,38 @@ Known accepted gaps (do not attempt to close without being asked):
 
 ## 5. Roadmap and build order
 
-Distro support is sequenced, not parallel:
+**Host OS is Linux-only through v1, v1.1, and v2.** macOS and Windows host
+support is a separate, later effort that hasn't been designed yet -- it is
+not part of the sequence below, and no code path should assume or
+special-case a non-Linux host in the meantime.
+
+Host-OS-family support within v1 is parallel (both lines ship together);
+the guest is fixed (minimal Alpine) throughout and has no roadmap stage of
+its own; everything beyond v1's two host families is sequenced after it,
+not alongside it:
 
 ```
-v1  -- AlmaLinux (full system, validated end-to-end on real hardware)
-  -> v1.1 -- Fedora (expected light lift, but still needs its own
-     validation pass -- don't assume it's free)
-    -> v2 -- Ubuntu (a different security model under the hood; waits
-       until v1 is proven, not built alongside it)
+v1  -- Fedora-based AND Ubuntu-based Linux hosts, together
+        (full system validated end-to-end on real hardware for both
+        host families before v1 ships -- neither is "first";
+        guest stays minimal Alpine throughout)
+  -> (later, undesigned) further host distro families
+     (e.g. Arch, openSUSE)
+    -> (later, undesigned) macOS / Windows host support
 ```
 
 Rules that follow from this:
 
 - **Don't build ahead of the roadmap.** If a task seems to need something
-  from a later stage (e.g. Ubuntu-specific tooling) that doesn't exist yet,
-  flag it rather than building a one-off parallel mechanism for it now.
-- **v1 is AlmaLinux, full stop.** Distro-conditional branches for Fedora or
-  Ubuntu don't belong in the codebase until their own roadmap stage starts.
+  from a later stage (e.g. an Arch or openSUSE host path, or any
+  macOS/Windows host path) that doesn't exist yet, flag it rather than
+  building a one-off parallel mechanism for it now.
+- **v1 is Fedora-based + Ubuntu-based hosts, with a fixed Alpine guest,
+  full stop.** Distro-conditional branches for any other host distro
+  family, and any host-OS branches beyond Linux, don't belong in the
+  codebase until their own roadmap stage starts. Within v1, both host
+  families are in scope together -- there is no "ship Fedora first"
+  shortcut. The guest never gets its own distro-selection logic.
 
 ## 6. File structure conventions
 
