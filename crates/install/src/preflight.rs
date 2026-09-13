@@ -1,0 +1,285 @@
+//! Assembles the individual checks in `checks.rs` into the two
+//! operator-facing entry points:
+//!
+//! - [`run_install_checks`] -- what `habitat install` runs: host-OS gate,
+//!   containerd/nerdctl, Kata/Firecracker. Verify-only, no mutation.
+//! - [`run_preflight`] -- what `habitat run` runs at the start of every
+//!   session: host-OS gate, KVM/hardware-virtualization, then the same
+//!   containerd/nerdctl and Kata/Firecracker checks `habitat install`
+//!   uses (one implementation, reused -- not re-derived).
+//!
+//! Both stop at the first failing check (fail-closed and deterministic:
+//! an operator fixes one problem at a time rather than triaging a wall of
+//! failures that may be masking each other) and log exactly one
+//! `preflight-failure` / `install-failure` audit event naming that check
+//! before returning.
+
+use crate::checks::{self, CheckFailure};
+use crate::environment::Environment;
+use habitat_audit::{AuditEvent, AuditSink, EventKind};
+use std::fmt;
+
+/// Returned by both entry points: the check that failed, already logged to
+/// the audit sink by the time the caller sees it.
+#[derive(Debug, Clone)]
+pub struct PreflightError(pub CheckFailure);
+
+impl fmt::Display for PreflightError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "preflight check failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for PreflightError {}
+
+fn log_and_wrap(
+    audit: &dyn AuditSink,
+    event_kind: EventKind,
+    failure: CheckFailure,
+) -> PreflightError {
+    let event = AuditEvent::now(
+        event_kind,
+        Some(failure.check.name()),
+        failure.message.clone(),
+    );
+    // The audit sink itself can fail (e.g. disk full, unwritable path).
+    // That must never suppress or soften the check failure it was trying
+    // to log -- the check result already fails closed regardless of
+    // whether the log write succeeded.
+    let _ = audit.record(&event);
+    PreflightError(failure)
+}
+
+/// One check's outcome for status-report display (`habitat install`'s and
+/// `habitat run`'s checklist), as opposed to `run_install_checks`'s /
+/// `run_preflight`'s gating return value. Carries the same [`CheckResult`]
+/// so a caller can render exactly the same failure message the gate would
+/// report -- no separate wording to keep in sync.
+#[derive(Debug, Clone)]
+pub struct CheckStatus {
+    pub check: checks::CheckId,
+    pub result: checks::CheckResult,
+}
+
+impl CheckStatus {
+    pub fn passed(&self) -> bool {
+        self.result.is_ok()
+    }
+}
+
+/// Runs every check `habitat install` cares about and reports a status for
+/// each, rather than stopping at the first failure -- so an operator can
+/// see every prerequisite's state in one pass ("this is present, this
+/// isn't") instead of fixing them one at a time through repeated runs.
+///
+/// This is a read-only, unaudited companion to [`run_install_checks`]: it
+/// logs nothing (the single-audited-failure-per-run invariant stays
+/// [`run_install_checks`]'s job) and never mutates anything, same as the
+/// checks themselves.
+///
+/// The host-OS gate is the one exception to "run everything": if it
+/// fails, every other check's assumptions (about *this* host being Linux)
+/// are meaningless, so they're left unreported rather than actually run.
+pub fn install_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
+    let host_os = checks::host_os(env);
+    let host_os_failed = host_os.is_err();
+    let mut statuses = vec![CheckStatus {
+        check: checks::CheckId::HostOs,
+        result: host_os,
+    }];
+    if host_os_failed {
+        return statuses;
+    }
+    statuses.push(CheckStatus {
+        check: checks::CheckId::ContainerdNerdctl,
+        result: checks::containerd_nerdctl(env),
+    });
+    statuses.push(CheckStatus {
+        check: checks::CheckId::KataFirecracker,
+        result: checks::kata_firecracker(env),
+    });
+    statuses
+}
+
+/// The same idea as [`install_report`], but over the checks `habitat run`'s
+/// preflight uses (adds the `kvm` check `habitat install` doesn't run).
+pub fn preflight_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
+    let host_os = checks::host_os(env);
+    let host_os_failed = host_os.is_err();
+    let mut statuses = vec![CheckStatus {
+        check: checks::CheckId::HostOs,
+        result: host_os,
+    }];
+    if host_os_failed {
+        return statuses;
+    }
+    statuses.push(CheckStatus {
+        check: checks::CheckId::Kvm,
+        result: checks::kvm(env),
+    });
+    statuses.push(CheckStatus {
+        check: checks::CheckId::ContainerdNerdctl,
+        result: checks::containerd_nerdctl(env),
+    });
+    statuses.push(CheckStatus {
+        check: checks::CheckId::KataFirecracker,
+        result: checks::kata_firecracker(env),
+    });
+    statuses
+}
+
+/// `habitat install`'s verification sequence. Order matters: the host-OS
+/// gate is cheapest and most fundamental, so it runs first and pre-empts
+/// checks that would be meaningless on a refused host.
+pub fn run_install_checks<E: Environment>(
+    env: &E,
+    audit: &dyn AuditSink,
+) -> Result<(), PreflightError> {
+    checks::host_os(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
+    checks::containerd_nerdctl(env)
+        .map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
+    checks::kata_firecracker(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
+    Ok(())
+}
+
+/// `habitat run`'s preflight subroutine, executed at the start of every
+/// session before any disk-build/VM-launch logic (Phases 2/3 hook in
+/// after this returns `Ok`, never around it).
+pub fn run_preflight<E: Environment>(env: &E, audit: &dyn AuditSink) -> Result<(), PreflightError> {
+    checks::host_os(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    checks::kvm(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    checks::containerd_nerdctl(env)
+        .map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    checks::kata_firecracker(env)
+        .map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::testing::FakeEnvironment;
+    use habitat_audit::MemoryAuditSink;
+
+    #[test]
+    fn install_checks_stop_at_first_failure_and_log_it() {
+        let env = FakeEnvironment {
+            os_family: "windows".to_string(),
+            ..Default::default()
+        };
+        let audit = MemoryAuditSink::default();
+        let err = run_install_checks(&env, &audit).unwrap_err();
+        assert_eq!(err.0.check.name(), "host-os");
+
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.tag(), "install-failure");
+        assert_eq!(events[0].check.as_deref(), Some("host-os"));
+    }
+
+    #[test]
+    fn install_checks_pass_end_to_end_when_everything_is_present() {
+        let env = FakeEnvironment::linux()
+            .with_existing_path("/run/containerd/containerd.sock")
+            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
+            .with_command_ok("nerdctl info", "Server: ...")
+            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
+            .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+        let audit = MemoryAuditSink::default();
+        assert!(run_install_checks(&env, &audit).is_ok());
+        assert!(audit.events.lock().unwrap().is_empty());
+    }
+
+    // The no-KVM exit-gate scenario through this full entry point lives
+    // under `tests/unit/install/` (file-structure.md: contract-with-the-
+    // rest-of-the-system tests, not pure internal logic, belong there).
+
+    #[test]
+    fn preflight_passes_end_to_end_when_everything_is_present() {
+        let env = FakeEnvironment::linux()
+            .with_existing_path("/dev/kvm")
+            .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
+            .with_existing_path("/run/containerd/containerd.sock")
+            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
+            .with_command_ok("nerdctl info", "Server: ...")
+            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
+            .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+        let audit = MemoryAuditSink::default();
+        assert!(run_preflight(&env, &audit).is_ok());
+        assert!(audit.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn install_report_lists_every_check_even_after_a_failure() {
+        // containerd/nerdctl missing, but that must not hide the
+        // kata-firecracker result -- unlike the gate, the report doesn't
+        // stop at the first failure.
+        let env = FakeEnvironment::linux();
+        let report = install_report(&env);
+        assert_eq!(report.len(), 3, "host-os, containerd-nerdctl, kata-firecracker");
+        assert_eq!(report[0].check.name(), "host-os");
+        assert!(report[0].passed());
+        assert_eq!(report[1].check.name(), "containerd-nerdctl");
+        assert!(!report[1].passed());
+        assert_eq!(report[2].check.name(), "kata-firecracker");
+        assert!(!report[2].passed());
+    }
+
+    #[test]
+    fn install_report_stops_at_host_os_when_not_linux() {
+        let env = FakeEnvironment {
+            os_family: "windows".to_string(),
+            ..Default::default()
+        };
+        let report = install_report(&env);
+        assert_eq!(
+            report.len(),
+            1,
+            "no other check's assumptions hold on a refused host"
+        );
+        assert!(!report[0].passed());
+    }
+
+    #[test]
+    fn install_report_all_pass_when_everything_present() {
+        let env = FakeEnvironment::linux()
+            .with_existing_path("/run/containerd/containerd.sock")
+            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
+            .with_command_ok("nerdctl info", "Server: ...")
+            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
+            .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+        let report = install_report(&env);
+        assert!(report.iter().all(CheckStatus::passed));
+    }
+
+    #[test]
+    fn preflight_report_includes_kvm() {
+        let env = FakeEnvironment::linux();
+        let report = preflight_report(&env);
+        assert_eq!(
+            report.len(),
+            4,
+            "host-os, kvm, containerd-nerdctl, kata-firecracker"
+        );
+        assert_eq!(report[1].check.name(), "kvm");
+        assert!(!report[1].passed());
+    }
+
+    /// Audit-sink failures (e.g. an unwritable log path) must not soften
+    /// or suppress the underlying check failure.
+    #[test]
+    fn audit_sink_failure_does_not_mask_check_failure() {
+        struct FailingSink;
+        impl AuditSink for FailingSink {
+            fn record(&self, _event: &AuditEvent) -> std::io::Result<()> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "disk full"))
+            }
+        }
+        let env = FakeEnvironment {
+            os_family: "windows".to_string(),
+            ..Default::default()
+        };
+        let err = run_install_checks(&env, &FailingSink).unwrap_err();
+        assert_eq!(err.0.check.name(), "host-os");
+    }
+}

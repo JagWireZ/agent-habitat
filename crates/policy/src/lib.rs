@@ -16,4 +16,70 @@
 //!   containment, blocklist enforcement, or patch validation (AGENTS.md
 //!   Section 2; `docs/plan.md` Section 2.5's "one hardened setup" rule).
 //!
-//! No logic yet -- Phase 0 scaffolding only.
+//! Phase 1 slice: just the audit-log destination default, needed by
+//! `habitat-install` so preflight/install failures have somewhere to log
+//! to before the rest of the policy loader exists. Blocklist/allowlist/
+//! resource-limit schema and loading land in Phases 2, 5, and 7
+//! respectively -- this file intentionally does not get ahead of them.
+
+use std::path::PathBuf;
+
+/// Default location for the boundary audit log, absent any `--config`
+/// override (Phase 7 wires the override; this is just the built-in
+/// default). Resolution order mirrors the XDG base-directory spec:
+/// `$XDG_STATE_HOME/habitat/audit.log`, falling back to
+/// `$HOME/.local/state/habitat/audit.log`, falling back to a relative path
+/// in the current directory if neither environment variable is set (e.g.
+/// a minimal/non-interactive shell) -- the fallback still gives every
+/// caller *a* writable path rather than failing to resolve one at all.
+pub fn default_audit_log_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("habitat").join("audit.log");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("habitat")
+                .join("audit.log");
+        }
+    }
+    PathBuf::from("habitat-audit.log")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // `std::env::set_var`/`remove_var` are process-global, and cargo runs
+    // tests for one crate in multiple threads of the same process by
+    // default. Serialize the two env-dependent tests below so they can't
+    // interleave and read each other's mutated state.
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn prefers_xdg_state_home_when_set() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::set_var("XDG_STATE_HOME", "/tmp/xdg-state-test");
+        let path = default_audit_log_path();
+        std::env::remove_var("XDG_STATE_HOME");
+        assert_eq!(path, PathBuf::from("/tmp/xdg-state-test/habitat/audit.log"));
+    }
+
+    #[test]
+    fn falls_back_to_home_when_xdg_state_home_unset() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::set_var("HOME", "/tmp/home-test");
+        let path = default_audit_log_path();
+        std::env::remove_var("HOME");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/home-test/.local/state/habitat/audit.log")
+        );
+    }
+}

@@ -6,3 +6,14 @@ publish.workspace = true
 description = "habitat install + habitat run's preflight checks (Phase 1)."
 
 [dependencies]
+habitat-audit = { path = "../audit" }
+habitat-policy = { path = "../policy" }
+
+# Exit-gate tests live under the top-level tests/unit/install/ (mirroring
+# the source tree, per file-structure.md) rather than as inline
+# #[cfg(test)] modules, since they cover this crate's contract with the
+# rest of the system rather than pure internal logic. This [[test]] target
+# points cargo at that file without duplicating it under crates/install/.
+[[test]]
+name = "exit_gate"
+path = "../../tests/unit/install/exit_gate.rs"

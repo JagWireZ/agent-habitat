@@ -10,7 +10,10 @@ name = "habitat"
 path = "src/main.rs"
 
 [dependencies]
-# Phase 0: no logic yet, so no dependencies on the other domain crates are
-# wired up. Phase 7 assembles this into the real CLI, depending on
-# habitat-install, habitat-workspace, habitat-vm, habitat-egress,
-# habitat-audit, and habitat-policy.
+# Phase 1 wires up `habitat install` and `habitat run`'s preflight
+# subroutine only. Phase 7 finishes assembling the real CLI, adding
+# habitat-workspace, habitat-vm, and habitat-egress for the rest of
+# `run`'s session lifecycle.
+habitat-install = { path = "../install" }
+habitat-audit = { path = "../audit" }
+habitat-policy = { path = "../policy" }
