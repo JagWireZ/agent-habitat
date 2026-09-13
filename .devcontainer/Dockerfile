@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         zsh \
     && rm -rf /var/lib/apt/lists/*
 
+RUN ln -s $(which fdfind) /usr/local/bin/fd
+
 # Pre-create and own the whole ~/.local tree as the "node" user *before*
 # anything mounts a volume under it. Otherwise podman auto-creates the
 # mount-point parent directories as root at container start, which then

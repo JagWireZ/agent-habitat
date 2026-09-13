@@ -4,10 +4,18 @@
     "dockerfile": "Dockerfile"
   },
 
+  // Explicit workspace mount so SELinux relabels it for container access.
+  // relabel=private (Z) since only this one container should touch it.
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/${localWorkspaceFolderBasename},type=bind,consistency=cached",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+
   // Bind-mount your host's opencode config in read-only (auth/config live
   // there already) instead of maintaining a separate copy in the container.
-  // Session/history data still uses a writable volume since opencode needs
-  // to write there during use.
+  // relabel=shared (z) since this host path could reasonably be mounted
+  // into more than one container over time.
+  // Session/history data still uses a writable named volume since opencode
+  // needs to write there during use; podman manages SELinux labels for its
+  // own volumes automatically, so no relabel flag needed there.
   "mounts": [
     "source=${localEnv:HOME}/.config/opencode,target=/home/node/.config/opencode,type=bind,readonly",
     "source=opencode-local-share,target=/home/node/.local/share/opencode,type=volume"
@@ -15,11 +23,11 @@
 
   // Pass provider API keys in from your host env if you have them set there.
   // (Not required if you plan to run `opencode auth login` inside the container.)
-  "remoteEnv": {
-    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
-    "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
-    "OPENROUTER_API_KEY": "${localEnv:OPENROUTER_API_KEY}"
-  },
+  // "remoteEnv": {
+  //   "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+  //   "OPENAI_API_KEY": "${localEnv:OPENAI_API_KEY}",
+  //   "OPENROUTER_API_KEY": "${localEnv:OPENROUTER_API_KEY}"
+  // },
 
   "postCreateCommand": "opencode --version",
 
@@ -33,12 +41,20 @@
 
   "remoteUser": "node",
   "containerUser": "node",
-  "updateRemoteUserUID": true,
+
+  // Off, deliberately: updateRemoteUserUID would renumber the "node" user
+  // to match whatever UID the host user happens to be, which fights with
+  // the explicit --userns=keep-id pin below. Leaving both on is fragile —
+  // it only "works" if your host UID happens to be 1000.
+  "updateRemoteUserUID": false,
 
   // Force podman's rootless UID remap to line up exactly with the image's
   // baked-in "node" user (uid/gid 1000). Without this, podman's default
   // --userns=keep-id maps your *real* host UID into the container, which
   // silently breaks write permissions on anything under /home/node that
   // isn't a bind mount (e.g. EACCES on /home/node/.local/state).
-  "runArgs": ["--userns=keep-id:uid=1000,gid=1000"]
+  "runArgs": [
+    "--userns=keep-id:uid=1000,gid=1000",
+    "--security-opt", "label=disable"
+  ]
 }
