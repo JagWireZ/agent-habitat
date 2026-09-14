@@ -30,7 +30,9 @@ implements, and `docs/plan.md` for what each domain is responsible for.
 |-- tests/
 |   |-- unit/<domain>/      # mirrors crates/<domain>/, one dir per crate above
 |   |-- integration/        # end-to-end: launch -> session -> teardown
-|   `-- adversarial/        # containment-escape + egress-bypass tests, together
+|   |-- adversarial/        # containment-escape + egress-bypass tests, together
+|   `-- manual/             # host-dependent runbooks a human runs deliberately
+|                            # (real hardware, real sudo) -- not automated, not CI
 `-- .github/
     `-- workflows/          # CI + the quarterly-review scheduling trigger
 ```
@@ -50,6 +52,11 @@ implements, and `docs/plan.md` for what each domain is responsible for.
   expects a corresponding directory at `tests/unit/egress/`. Integration
   and adversarial tests are cross-cutting by nature, so they live in their
   own top-level test directories rather than under a single domain.
+  `tests/manual/` is the exception to "automated" rather than to
+  "mirrors the source tree": it holds runbooks that need a specific real
+  host and a human's go-ahead (revoking real device access, removing a
+  real package) to exercise something no fake environment or CI runner
+  can stand in for.
 - **One governance file.** `reviews/CHECKLIST.md` is the sole tracked
   governance artifact -- do not create a second checklist, tracker, or
   process doc that covers the same ground (dependency/tool catalogue,

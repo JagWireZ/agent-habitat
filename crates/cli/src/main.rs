@@ -32,7 +32,7 @@ mod output;
 
 use habitat_install::{
     detect_package_family, install_missing, install_report, preflight_report, run_install_checks,
-    run_preflight, CheckId, CheckStatus, InstallAttempt, SystemEnvironment,
+    run_preflight, CheckId, CheckStatus, InstallAttempt, PackageFamily, SystemEnvironment,
 };
 use output::style;
 use std::process::ExitCode;
@@ -150,7 +150,7 @@ fn technical_detail(check: CheckId) -> &'static str {
             "Install podman and confirm it works rootless for this user (`podman info` succeeds without a daemon or elevated privileges)."
         }
         CheckId::KrunRuntime => {
-            "Install the `crun-krun` package so `crun-krun` (the OCI runtime binary Podman exec's, with libkrun linked directly into it) is resolvable on PATH -- there is no separate hypervisor binary to install alongside it."
+            "Install the `crun-krun` package so `krun` (the OCI runtime binary Podman exec's, with libkrun linked directly into it -- note the package and binary are named differently) is resolvable on PATH -- there is no separate hypervisor binary to install alongside it."
         }
     }
 }
@@ -295,6 +295,25 @@ fn print_install_attempts(attempts: &[InstallAttempt], s: output::Style) {
     println!();
 }
 
+/// What happens once the operator has agreed to auto-install: either a
+/// recognized package-manager family to actually run installs through, or
+/// an explicit "nothing to run" -- decided once, up front, so `cmd_install`
+/// is a straight match on this rather than interleaving detection with
+/// the printing/execution that follows. Kept as its own function (over
+/// `crates/install`'s own `Environment` seam) so this decision is
+/// unit-testable without going through stdin/stdout at all.
+enum AutoInstallPlan {
+    Run(PackageFamily),
+    NoFamilyDetected,
+}
+
+fn plan_auto_install<E: habitat_install::Environment>(env: &E) -> AutoInstallPlan {
+    match detect_package_family(env) {
+        Some(family) => AutoInstallPlan::Run(family),
+        None => AutoInstallPlan::NoFamilyDetected,
+    }
+}
+
 fn cmd_install(verbose: bool) -> ExitCode {
     let env = SystemEnvironment;
     let audit = audit_sink();
@@ -313,8 +332,8 @@ fn cmd_install(verbose: bool) -> ExitCode {
         && prompt_yes_no("Would you like Agent Habitat to install the missing pieces now? This runs `sudo` commands.")
     {
         println!();
-        match detect_package_family(&env) {
-            Some(family) => {
+        match plan_auto_install(&env) {
+            AutoInstallPlan::Run(family) => {
                 let attempts = install_missing(&env, &audit, family, &fixable_failed);
                 print_install_attempts(&attempts, s);
                 // Re-run the checks from scratch rather than trusting the
@@ -323,7 +342,7 @@ fn cmd_install(verbose: bool) -> ExitCode {
                 statuses = install_report(&env);
                 print_checklist(&statuses);
             }
-            None => {
+            AutoInstallPlan::NoFamilyDetected => {
                 println!(
                     "{}",
                     s.dim("Couldn't automatically recognize this Linux distribution's package manager -- install the missing pieces manually (see below).")
@@ -407,5 +426,48 @@ fn print_detail_pointer(s: &output::Style, audit: &habitat_audit::FileAuditSink,
             "{}",
             s.dim("(Run with --verbose to see the technical details here instead.)")
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use habitat_install::testing::FakeEnvironment;
+
+    /// The fallback path (`§6` in `tmp/wip/phase-1-tasks.md`): a host whose
+    /// package-manager family can't be recognized (or whose
+    /// `/etc/os-release` is missing/unreadable) must resolve to
+    /// `NoFamilyDetected` -- never a guessed family, and never `Run`, which
+    /// is the only variant `cmd_install` will actually invoke
+    /// `install_missing` for.
+    #[test]
+    fn unrecognized_distro_plans_no_auto_install() {
+        let env = FakeEnvironment::linux()
+            .with_file("/etc/os-release", "NAME=\"Arch Linux\"\nID=arch\n");
+        assert!(matches!(
+            plan_auto_install(&env),
+            AutoInstallPlan::NoFamilyDetected
+        ));
+    }
+
+    #[test]
+    fn missing_os_release_plans_no_auto_install() {
+        let env = FakeEnvironment::linux();
+        assert!(matches!(
+            plan_auto_install(&env),
+            AutoInstallPlan::NoFamilyDetected
+        ));
+    }
+
+    /// The recognized-family counterpart, so this test only fails for the
+    /// right reason (a real regression) rather than `AutoInstallPlan`
+    /// always resolving to `NoFamilyDetected` regardless of input.
+    #[test]
+    fn recognized_distro_plans_to_run_on_its_family() {
+        let env = FakeEnvironment::linux().with_file("/etc/os-release", "ID=ubuntu\n");
+        assert!(matches!(
+            plan_auto_install(&env),
+            AutoInstallPlan::Run(PackageFamily::Apt)
+        ));
     }
 }

@@ -179,7 +179,7 @@ mod tests {
         let env = FakeEnvironment::linux()
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
-            .with_command_ok("crun-krun --version", "crun-krun 1.14");
+            .with_command_ok("krun --version", "krun 1.14");
         let audit = MemoryAuditSink::default();
         assert!(run_install_checks(&env, &audit).is_ok());
         assert!(audit.events.lock().unwrap().is_empty());
@@ -196,7 +196,7 @@ mod tests {
             .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
-            .with_command_ok("crun-krun --version", "crun-krun 1.14");
+            .with_command_ok("krun --version", "krun 1.14");
         let audit = MemoryAuditSink::default();
         assert!(run_preflight(&env, &audit).is_ok());
         assert!(audit.events.lock().unwrap().is_empty());
@@ -237,7 +237,7 @@ mod tests {
         let env = FakeEnvironment::linux()
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
-            .with_command_ok("crun-krun --version", "crun-krun 1.14");
+            .with_command_ok("krun --version", "krun 1.14");
         let report = install_report(&env);
         assert!(report.iter().all(CheckStatus::passed));
     }

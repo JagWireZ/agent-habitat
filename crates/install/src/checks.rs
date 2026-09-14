@@ -165,25 +165,33 @@ pub fn podman<E: Environment>(env: &E) -> CheckResult {
     }
 }
 
-/// The `krun` OCI runtime (`crun-krun` package, backed by libkrun)
-/// availability: `crun-krun` is what Podman actually exec's to launch the
-/// session's microVM, so its absence means a session can't start
-/// regardless of what podman's own config claims. There is no separate
-/// Firecracker-style second binary to check -- libkrun is linked directly
-/// into `crun-krun` (`docs/plan.md` Section 2.1).
+/// The `krun` OCI runtime (shipped by the `crun-krun` package, backed by
+/// libkrun) availability: `krun` is the binary Podman actually exec's to
+/// launch the session's microVM, so its absence means a session can't
+/// start regardless of what podman's own config claims. There is no
+/// separate Firecracker-style second binary to check -- libkrun is linked
+/// directly into `krun` (`docs/plan.md` Section 2.1).
+///
+/// **The package name and the binary name are not the same** -- confirmed
+/// against real Fedora hardware (`rpm -ql crun-krun` lists `/usr/bin/krun`,
+/// not `/usr/bin/crun-krun`; see `tmp/wip/phase-1-tasks.md`'s real-hardware
+/// notes). An earlier version of this check ran `crun-krun --version`,
+/// which fails closed even on a correctly-installed host -- the package
+/// name belongs in `package_manager.rs`'s dnf/apt commands, never in the
+/// command this check actually runs.
 pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
-    match env.run_command("crun-krun", &["--version"]) {
+    match env.run_command("krun", &["--version"]) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => fail(
             CheckId::KrunRuntime,
             format!(
-                "crun-krun --version exited non-zero: {}",
+                "krun --version exited non-zero: {}",
                 String::from_utf8_lossy(&output.stderr)
             ),
         ),
         Err(e) => fail(
             CheckId::KrunRuntime,
-            format!("crun-krun not runnable (is the crun-krun package installed?): {e}"),
+            format!("krun not runnable (is the crun-krun package installed?): {e}"),
         ),
     }
 }
@@ -280,7 +288,7 @@ mod tests {
 
     #[test]
     fn krun_runtime_passes_when_present() {
-        let env = FakeEnvironment::linux().with_command_ok("crun-krun --version", "crun-krun 1.14");
+        let env = FakeEnvironment::linux().with_command_ok("krun --version", "krun 1.14");
         assert!(krun_runtime(&env).is_ok());
     }
 

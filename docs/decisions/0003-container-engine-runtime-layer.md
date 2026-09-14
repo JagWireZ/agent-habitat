@@ -37,8 +37,14 @@ Concretely:
 - No containerd, no nerdctl, and no separate Firecracker binary are
   required or checked for. `habitat install` and `habitat run`'s
   preflight instead verify Podman (present, usable rootless -- `podman
-  info` succeeds without a daemon) and the `krun` runtime (`crun-krun`
-  runnable on PATH).
+  info` succeeds without a daemon) and the `krun` runtime (the `krun`
+  binary, shipped by the `crun-krun` package, runnable on PATH --
+  **Amendment (2026-09-14):** confirmed against real Fedora hardware that
+  the package name and binary name differ; `checks::krun_runtime` runs
+  `krun --version`, not `crun-krun --version`, and only
+  `package_manager.rs`'s install commands ever reference the package name
+  `crun-krun`. An earlier version of this check ran the wrong command
+  name and failed closed even on a correctly-installed host).
 - Nothing about launching a session requires root or any other elevated
   host privilege. The only host-side prerequisite beyond the two packages
   above is the launching user's one-time membership in the `kvm` group, a

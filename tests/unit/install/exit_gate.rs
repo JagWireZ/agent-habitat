@@ -26,7 +26,7 @@ fn preflight_reports_missing_kvm_not_a_false_positive() {
     let env = FakeEnvironment::linux()
         .with_command_ok("podman --version", "podman version 5.0.0")
         .with_command_ok("podman info", "host: ...")
-        .with_command_ok("crun-krun --version", "crun-krun 1.14");
+        .with_command_ok("krun --version", "krun 1.14");
     // Deliberately no `/dev/kvm` and no /proc/cpuinfo virt flag registered.
 
     let audit = MemoryAuditSink::default();
@@ -64,7 +64,7 @@ fn broken_krun_runtime_install_fails_closed_with_distinct_tag() {
         .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
         .with_command_ok("podman --version", "podman version 5.0.0")
         .with_command_ok("podman info", "host: ...")
-        .with_command_failure("crun-krun --version", "error: no such runtime handler");
+        .with_command_failure("krun --version", "error: no such runtime handler");
 
     let audit = MemoryAuditSink::default();
     let err = run_preflight(&env, &audit)
@@ -107,7 +107,7 @@ fn install_run_twice_on_already_correct_host_makes_no_changes() {
     let env = FakeEnvironment::linux()
         .with_command_ok("podman --version", "podman version 5.0.0")
         .with_command_ok("podman info", "host: ...")
-        .with_command_ok("crun-krun --version", "crun-krun 1.14");
+        .with_command_ok("krun --version", "krun 1.14");
 
     let first_audit = MemoryAuditSink::default();
     let first = run_install_checks(&env, &first_audit);
