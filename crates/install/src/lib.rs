@@ -3,7 +3,7 @@
 //! Phase 1 responsibility (see `tmp/wip/implementation-plan.md`):
 //! - `habitat install`: detect/verify Podman, verify the `krun` runtime
 //!   (`crun-krun`, backed by libkrun) is available, refuse explicitly on
-//!   non-Linux hosts (see `docs/decisions/0005-rootless-podman-krun-virtualization-stack.md`).
+//!   non-Linux hosts (see `docs/decisions/0003-container-engine-runtime-layer.md`).
 //! - `habitat run`'s preflight subroutine: real KVM/hardware-virtualization
 //!   capability probe, Podman/krun-runtime reachability check. Every check
 //!   fails closed -- names the specific failed check, exits non-zero, logs

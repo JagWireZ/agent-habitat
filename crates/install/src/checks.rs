@@ -61,7 +61,7 @@ fn fail(check: CheckId, message: impl Into<String>) -> CheckResult {
 /// Explicit refusal on any non-Linux host. This runs first, before any
 /// other check, in both `habitat install` and `habitat run`'s preflight
 /// subroutine (AGENTS.md host-Linux-only decision,
-/// `docs/decisions/0001-linux-only-host-in-v1.md`) -- "explicitly refuses,
+/// `docs/decisions/0001-host-os-layer.md`) -- "explicitly refuses,
 /// not best effort".
 pub fn host_os<E: Environment>(env: &E) -> CheckResult {
     let os = env.os_family();

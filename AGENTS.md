@@ -35,7 +35,7 @@ single-host constructs, not placeholders waiting to be generalized.
 **The host machine is Linux-only, and the platform roadmap is a single
 sequential line: v1 targets AlmaLinux, v1.1 Fedora, v2 Ubuntu** -- not
 two host families validated in parallel with a separately fixed guest
-(see Section 5, and `docs/decisions/0006-sequential-platform-roadmap.md`).
+(see Section 5, and `docs/decisions/0001-host-os-layer.md`).
 There is no separate guest-distro axis to track: the guest image is built
 from whichever platform the current roadmap stage targets. Don't build
 host-OS-detection branches, nested-VM workarounds, or "best effort" paths
@@ -48,7 +48,7 @@ designed -- see Section 5.
 (libkrun), not containerd + Kata Containers + Firecracker.** No daemon,
 no elevated launcher process -- Podman runs as the calling user, with
 one-time `kvm` group membership as the only host-side setup step (see
-`docs/decisions/0005-rootless-podman-krun-virtualization-stack.md`).
+`docs/decisions/0003-container-engine-runtime-layer.md`).
 
 ## 2. Non-negotiable invariants
 
@@ -186,7 +186,8 @@ designed yet -- it is not part of the sequence below, and no code path
 should assume or special-case a non-Linux host in the meantime.
 
 The platform roadmap is a single sequential line, not a host-family-
-parallel / guest-fixed split (`docs/decisions/0006-sequential-platform-roadmap.md`).
+parallel / guest-fixed split (`docs/decisions/0001-host-os-layer.md`,
+`docs/decisions/0002-guest-os-layer.md`).
 Each stage covers both what `habitat` runs on and what the guest image is
 built from -- there's no separate guest-distro axis to track:
 
