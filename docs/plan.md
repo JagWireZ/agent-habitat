@@ -14,9 +14,7 @@ Three things make this safe in practice:
 
 Everything the agent does is logged, so there's always a clear record of what happened in a session.
 
-**The host machine must be Linux in v1, and v1 specifically targets two host OS families in parallel: Fedora-based and Ubuntu-based distros** (covering the majority of rpm- and deb-based systems), with hardware virtualization available — not macOS or Windows. macOS and Windows host support is planned for later, once the Linux-host core is proven; it isn't scoped or designed yet.
-
-**The guest is a separate, fixed thing: a minimal Alpine Linux image inside the sandbox** (see Section 2.1). It doesn't change with host-OS-family support, and it isn't on a distro roadmap of its own.
+**v1 targets AlmaLinux**, with Fedora expected to follow easily and Ubuntu planned for later once the core is proven.
 
 Here's how the pieces fit together:
 
@@ -44,17 +42,17 @@ The rest of this document goes into the technical details behind each part.
 
 ### 2.1 The sandbox itself: a real virtual machine, not a shared-kernel container
 
-Each session gets its own lightweight virtual machine (via Kata Containers + Firecracker), not just a Linux container. That matters because containers share a kernel with the host — a real VM boundary, backed by hardware virtualization, is a much harder wall to break through.
+Each session gets its own lightweight virtual machine (via Podman's `krun` runtime, backed by libkrun), not just a Linux container. That matters because containers share a kernel with the host — a real VM boundary, backed by hardware virtualization, is a much harder wall to break through.
 
-- The guest runs a minimal Alpine Linux image — small, fast to boot (~125ms), and with little for an attacker to work with even if something went wrong inside it.
-- Firecracker (the VM engine) intentionally supports very little hardware emulation, which keeps its exposed surface small.
-- Launching a session runs with elevated host privileges, which sounds alarming but is standard practice for this kind of infrastructure (it's how Kubernetes nodes work too) — the actual security boundary comes from the VM/kernel isolation, not from how the launcher itself is run.
-- **Two things need to be true on your machine first:** hardware virtualization support (this can be silently unavailable on some cloud VMs — we'll check for it up front) and a second piece of infrastructure (containerd) installed alongside whatever you already use.
-- This exact combination of technologies is newer and less battle-tested than more common setups, so it needs real hands-on validation before launch, not just a configuration change.
+- The guest runs a minimal Linux image — small, fast to boot, and with little for an attacker to work with even if something went wrong inside it.
+- libkrun intentionally supports very little hardware emulation, which keeps its exposed surface small.
+- **Nothing about launching a session requires root or any other elevated host privilege.** Podman runs entirely in rootless mode; the only host-side prerequisite is the launching user belonging to the `kvm` group, which is a one-time setup step, not a per-session elevation. This is a deliberately narrower privilege footprint than typical container/VM launchers — Agent Habitat has no other need to touch the host system, so there's no reason for it to run as anything other than the calling user.
+- **Two things need to be true on your machine first:** hardware virtualization support (this can be silently unavailable on some cloud VMs — we'll check for it up front) and `podman` with the `crun-krun` package installed. No separate daemon or second piece of host infrastructure is required — on Fedora and AlmaLinux both, this is a single package on top of tooling most teams already have.
+- This exact combination — rootless Podman, the `krun` runtime, block-device-backed storage, and `passt` networking (see 2.3) — doesn't have a well-trodden public reference to follow end to end, so it needs real hands-on validation before launch, not just a configuration change.
 
 ### 2.2 The workspace: how files move in, out, and back
 
-**Storage.** Each session gets its own disposable virtual disk — never a direct link to your real folder. The agent works against that disk, and only that disk.
+**Storage.** Each session gets its own disposable raw disk image, attached to the guest as a `virtio-blk` block device — never a live share or direct link to your real folder. The guest's own kernel mounts it. This needs no privileged host-side mount step (no loop device, no root-owned mountpoint), which keeps it consistent with the rootless launch model in 2.1. The agent works against that disk, and only that disk.
 
 **Git history — your choice (Goal 6).** By default, the agent gets a brand-new, "synthetic" git repo seeded with just the current state of your files — so it can use git normally (diff, log, its own commits) without ever seeing your project's real history. If you'd rather it see the real history too, that's a toggle — the real `.git` gets shared in read-only.
 
@@ -78,9 +76,13 @@ Ending the session is a separate, explicit action from committing: when you're d
 
 ### 2.3 Internet access: locked down by default
 
-All outbound traffic from the sandbox is routed through a local proxy, so the agent can't route around it. Filtering happens at the point where a secure connection is being negotiated — meaning it can tell *where* a connection is going without having to intercept and inspect the traffic itself, so tools that verify certificates still work normally.
+The guest's network is provided by `passt`, which gives it a real virtual network interface (unlike libkrun's default TSI networking, which proxies socket calls directly and isn't visible to normal host firewall rules — that mode was considered and ruled out for this reason). Because the interface is real, we can go further than filtering traffic after it's sent: the guest's network configuration is set up so that the local proxy is the *only* address it can reach at all. There's no route to anything else to filter in the first place, which is a stronger form of "the agent can't route around it" than intercepting-and-redirecting traffic after the fact.
+
+Filtering at the proxy itself still happens at the point where a secure connection is being negotiated — meaning it can tell *where* a connection is going without having to intercept and inspect the traffic itself, so tools that verify certificates still work normally.
 
 By default, only major AI provider APIs and standard package registries (PyPI, npm, crates.io, etc.) are reachable. Anything else is blocked. This is extendable per project.
+
+**Open item:** DNS resolution inside the guest needs to be pinned to the proxy path too — a leftover default resolver would be a way for this containment to quietly leak, and it's one of the things called out for hands-on validation before launch.
 
 ### 2.4 Auditing: a clear record of what crossed the line
 
@@ -105,23 +107,20 @@ There's one hardened setup, not a "fast but less safe" mode and a "slow but safe
 
 | Decision | Chosen | Why |
 |---|---|---|
-| Virtual machine engine | Firecracker | No need for a live shared filesystem, so Firecracker's minimal hardware emulation is a straightforward security win; fast boot also suits short, disposable sessions. |
-| Launch tooling | containerd + nerdctl (elevated privileges) | The alternatives (podman in various forms) either don't support this kind of VM launch on our target Linux distribution, or are actively broken upstream. This is the one fully-supported option, and matches how production infrastructure like Kubernetes already runs. |
+| Virtual machine engine | libkrun, via Podman's `krun` runtime | No need for a live shared filesystem, so libkrun's minimal hardware emulation is a straightforward security win; fast boot also suits short, disposable sessions. Packaged (`crun-krun`) on both our v1 (AlmaLinux) and v1.1 (Fedora) targets. |
+| Launch tooling | Podman, fully rootless | Agent Habitat has no host-system needs beyond running the sandbox itself, so there's no reason to require root: no daemon, no elevated launcher, just the calling user's own privileges plus one-time `kvm` group membership. Removes the need for a second piece of host infrastructure entirely. |
 | File sharing | A disposable virtual disk per session | Avoids a live, always-on file-sharing process between host and sandbox — removing that as a way to break out. Trade-off: no simultaneous live access, handled instead by the sync mechanism above. |
 | Git history | Synthetic repo by default | The agent gets normal git tools without seeing real history; changes are reviewed either way before they reach you. |
 | Syncing | Event-triggered, only when something changed | Reuses the same trusted patch mechanism as the final promotion step, instead of building a second one; keeps every sync as a clear, auditable event. |
 | Secrets filtering | Separate blocklist, applied before anything leaves your machine | `.gitignore` answers a version-control question, not a security one — the two lists diverge in practice. Filtering has to happen before transfer, or the secret has already left. |
 | Isolation model | One hardened setup | Easier to reason about and test than offering multiple security tiers. |
-| Internet filtering | Filter by destination during connection setup | IP-based filtering breaks against services that rotate IPs; fully intercepting traffic would break certificate verification in agent tooling. |
+| Internet filtering | Restrict what's reachable at the network level (`passt`), then filter by destination at the proxy during connection setup | Reachability restriction removes the need to catch and redirect stray traffic after the fact; destination-based filtering at the proxy avoids the pitfalls of IP-based filtering against services that rotate IPs, and avoids fully intercepting traffic, which would break certificate verification in agent tooling. |
 
 ## 4. Known limitations
 
-- **Linux host only in v1.** Firecracker needs KVM, which means no native macOS or Windows support yet — running inside a nested VM (e.g. Docker Desktop/WSL2's own Linux VM) is not a supported path today. macOS and Windows are future work, not a v1 gap being papered over.
-- **v1 validates two host distro families: Fedora-based and Ubuntu-based.** Other Linux distros (Arch, openSUSE, etc.) have the same underlying KVM/containerd/Kata requirements but aren't validated or officially supported until their own roadmap stage.
-- **Hardware virtualization is required** and isn't always available on cloud machines — we check for this up front rather than failing at runtime.
-- **A second piece of host infrastructure (containerd) is required**, alongside whatever a team already runs.
+- **Hardware virtualization is required** and isn't always available on cloud machines — we check for this up front rather than failing at runtime. One-time `kvm` group membership is also required for rootless launch.
 - **In-sandbox activity isn't logged in v1** — only what crosses the boundary. A candidate follow-up.
-- **This exact technology combination is newer and less proven** — it needs real validation on real hardware before v1 ships.
+- **This exact technology combination is newer and less proven** — rootless Podman + `krun` + block-device storage + `passt` networking doesn't have a well-trodden public reference to follow end to end, and needs real validation on real hardware before v1 ships. DNS containment under `passt` specifically needs to be verified so it doesn't leak a path around the network restriction in 2.3.
 - **The agent can't proactively check your files mid-task** — only at the two sync points described above.
 - **Sync performance at large scale (huge monorepos, big binary files) isn't yet validated** — worth checking before v1 ships.
 - **No middle ground for blocked files** — if a task needs a secret, it's simply unavailable in v1. A more targeted way to inject specific secrets is a likely future addition.
@@ -129,9 +128,7 @@ There's one hardened setup, not a "fast but less safe" mode and a "slow but safe
 
 ## 5. Roadmap
 
-**Guest (inside the sandbox):** fixed at a minimal Alpine Linux image throughout -- no distro roadmap of its own; see Section 2.1.
-
-**Host OS family (the machine running `habitat`):**
-
-1. **v1 -- Fedora-based and Ubuntu-based Linux distros, in parallel:** the full system described above, validated end-to-end on real hardware for both -- not one first and the other later. Together they cover the RPM and DEB package families.
-2. **Future additions:** further host distro families (e.g. Arch, openSUSE) once both v1 host lines are proven out; macOS and Windows host support (a separate, later effort -- Firecracker/KVM needs a Linux kernel, so this needs its own isolation-model design, not just "more Linux distros"); full in-sandbox activity logging; the agent being able to check host files on demand; an optional live progress view; GPU support if it's ever needed.
+1. **v1 — AlmaLinux:** the full system described above, validated end-to-end on real hardware.
+2. **v1.1 — Fedora:** expected to be a light lift, given how closely it's related to AlmaLinux.
+3. **v2 — Ubuntu:** a different security model under the hood, so this waits until v1 is proven out.
+4. **Future additions:** full in-sandbox activity logging; the agent being able to check host files on demand; an optional live progress view; GPU support if it's ever needed.
