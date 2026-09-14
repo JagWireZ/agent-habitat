@@ -8,20 +8,38 @@
 //!
 //! No arg-parsing dependency is taken here: with no dependency-fetch
 //! access in this environment (see Phase 1 implementation notes) and only
-//! two subcommands to recognize, hand-rolled parsing is simpler and has
-//! fewer moving parts than pulling in a framework for it.
+//! two subcommands and one flag (`--verbose`/`-v`) to recognize, hand-rolled
+//! parsing is simpler and has fewer moving parts than pulling in a
+//! framework for it.
+//!
+//! Default output is written for a general audience (think Docker
+//! Desktop's or Homebrew's `doctor` output): a plain-English pass/fail
+//! checklist first, then -- only if something's missing -- a separate
+//! "here's what to do" section listing one concrete fix per failed item,
+//! so the checklist itself stays scannable instead of interleaving status
+//! and remediation prose line by line.
+//! Internal component names (containerd, nerdctl, Kata, Firecracker, the
+//! containerd socket path, ...) are reserved for `--verbose`/`-v` -- shown
+//! as a dimmed line under each fix -- and for the audit log, which always
+//! gets the full technical detail regardless of this flag.
+
+mod output;
 
 use habitat_install::{
-    install_report, preflight_report, run_install_checks, run_preflight, CheckStatus,
+    install_report, preflight_report, run_install_checks, run_preflight, CheckId, CheckStatus,
     SystemEnvironment,
 };
+use output::style;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("install") => cmd_install(),
-        Some("run") => cmd_run(),
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let verbose = args
+        .iter()
+        .any(|a| a == "--verbose" || a == "-v");
+    match args.iter().find(|a| !a.starts_with('-')).map(String::as_str) {
+        Some("install") => cmd_install(verbose),
+        Some("run") => cmd_run(verbose),
         Some(other) => {
             eprintln!("habitat: unknown subcommand '{other}' (expected 'install' or 'run')");
             ExitCode::FAILURE
@@ -37,63 +55,278 @@ fn audit_sink() -> habitat_audit::FileAuditSink {
     habitat_audit::FileAuditSink::new(habitat_policy::default_audit_log_path())
 }
 
-/// Prints one line per check: found or missing, with the same message the
-/// gate would report on failure. `habitat install` is still verify-only --
-/// this only changes what's displayed, not what's on the host -- so the
-/// checklist is safe to print even when the run is ultimately going to
-/// fail.
+/// Short, jargon-free banner printed before the checklist: what's being
+/// checked and why, in the terms a non-expert would use, not the internal
+/// component names (those live behind `--verbose` and in the audit log).
+fn print_intro(heading: &str) {
+    let s = style();
+    println!("{}", s.bold(heading));
+    println!("We're checking that your computer can run isolated sandboxes to keep each session separate and secure.");
+    println!();
+}
+
+/// Plain-English display name for a check -- what a non-expert would call
+/// the thing being verified, not its internal component name.
+fn friendly_name(check: CheckId) -> &'static str {
+    match check {
+        CheckId::HostOs => "Operating system",
+        CheckId::Kvm => "Hardware virtualization",
+        CheckId::ContainerdNerdctl => "Container runtime",
+        CheckId::KataFirecracker => "Sandbox isolation layer",
+    }
+}
+
+/// Short plain-English status word for a failed check (paired with the
+/// friendly fix suggestion right underneath it).
+fn friendly_status(check: CheckId) -> &'static str {
+    match check {
+        CheckId::HostOs => "Not supported",
+        CheckId::Kvm => "Not available",
+        CheckId::ContainerdNerdctl => "Not found",
+        CheckId::KataFirecracker => "Not found",
+    }
+}
+
+/// A failed check's fix, split into a one-line "what/why" and, separately,
+/// the exact commands to run -- so the two never run together mid-sentence
+/// (naming the actual thing to install, e.g. "containerd", since "install
+/// the container runtime" is meaningless to someone who doesn't already
+/// know that's what it means). Deeper internals (the socket path, the
+/// exact shim binary name, PATH resolution) still live in
+/// [`technical_detail`], shown only under `--verbose`.
+///
+/// Not every check has a runnable command -- a BIOS setting or "there is
+/// no fix" can't be copy-pasted into a terminal, so `commands` is empty
+/// rather than faking one. And not every fixable check can be reduced to
+/// a short command block: [`CheckId::KataFirecracker`] is a several-step
+/// download-and-link process, not a single package install, so its
+/// `commands` is just a pointer to the full walkthrough, and `reason`
+/// says so explicitly instead of silently handing over a bare link.
+struct Fix {
+    reason: &'static str,
+    commands: &'static [&'static str],
+}
+
+fn fix_for(check: CheckId) -> Fix {
+    match check {
+        CheckId::HostOs => Fix {
+            reason: "Agent Habitat only runs on Linux machines right now, so there isn't a fix available on this computer.",
+            commands: &[],
+        },
+        CheckId::Kvm => Fix {
+            reason: "Turn on virtualization support (VT-x on Intel, AMD-V on AMD) in your computer's BIOS/UEFI settings, then reboot -- this is a firmware setting, not something a command can turn on. If this is a cloud VM, ask your provider to enable nested virtualization instead.",
+            commands: &[],
+        },
+        CheckId::ContainerdNerdctl => Fix {
+            reason: "Installs containerd, the container engine Agent Habitat runs sandboxes on, and nerdctl, its command-line tool.",
+            commands: &[
+                "sudo apt install containerd   # Debian/Ubuntu",
+                "sudo dnf install containerd   # Fedora",
+                "sudo systemctl enable --now containerd",
+                "",
+                "# nerdctl is packaged for Ubuntu (\"sudo apt install nerdctl\");",
+                "# Fedora doesn't package it yet -- grab a release tarball instead:",
+                "#   https://github.com/containerd/nerdctl/releases",
+            ],
+        },
+        CheckId::KataFirecracker => Fix {
+            reason: "Runs each session in its own hardware-isolated Firecracker microVM. This isn't a single package install -- it's a short multi-step download-and-link process -- so follow the full walkthrough instead of copy-pasting commands here:",
+            commands: &["https://github.com/jagwirez/agent-habitat/blob/master/docs/setup/kata-firecracker.md"],
+        },
+    }
+}
+
+/// The jargon-bearing detail for a failed check: the internal component
+/// names, the exact error, and what to actually install/configure in
+/// toolchain terms. Reserved for `--verbose` output and the audit log --
+/// never shown by default (per the "no jargon in default output" rule).
+fn technical_detail(check: CheckId) -> &'static str {
+    match check {
+        CheckId::HostOs => {
+            "Agent Habitat's isolation model (containerd + Kata/Firecracker microVMs) is Linux-only."
+        }
+        CheckId::Kvm => {
+            "Enable VT-x/AMD-V virtualization extensions in firmware, confirm /dev/kvm is present, and add the current user to the `kvm` group (or otherwise grant it read+write on the device node)."
+        }
+        CheckId::ContainerdNerdctl => {
+            "Install containerd and start its daemon (e.g. `systemctl enable --now containerd`), then install nerdctl so it can drive the containerd socket over the CRI/OCI runtime interface."
+        }
+        CheckId::KataFirecracker => {
+            "Install Kata Containers configured with the Firecracker hypervisor backend so `containerd-shim-kata-v2` (the shim containerd exec's to launch the microVM runtime) and the `firecracker` binary are both resolvable on PATH."
+        }
+    }
+}
+
+/// Prints one line per check in plain English -- just the status, nothing
+/// else -- so the whole list stays scannable at a glance. `habitat
+/// install` is still verify-only -- this only changes what's displayed,
+/// not what's on the host -- so the checklist is safe to print even when
+/// the run is ultimately going to fail.
+///
+/// Passes get a green check mark, failures a red X (colors auto-disabled
+/// when stdout isn't a terminal, or `NO_COLOR` is set -- see `output.rs`).
+/// What to do about a failure lives in [`print_required_steps`], printed
+/// as its own section after the full list rather than interleaved here.
 fn print_checklist(statuses: &[CheckStatus]) {
-    println!("Host prerequisite check:");
+    let s = style();
+    println!("{}", s.bold("Checking your system..."));
     for status in statuses {
         match &status.result {
-            Ok(()) => println!("  [ ok ] {:<18} found", status.check.name()),
-            Err(f) => println!("  [MISSING] {:<14} {}", status.check.name(), f.message),
+            Ok(()) => println!(
+                "  {} {:<26} Looks good",
+                s.green_bold("\u{2714}"),
+                friendly_name(status.check)
+            ),
+            Err(_) => println!(
+                "  {} {:<26} {}",
+                s.red_bold("\u{2718}"),
+                friendly_name(status.check),
+                friendly_status(status.check)
+            ),
         }
     }
     println!();
 }
 
-fn cmd_install() -> ExitCode {
+/// Printed after the checklist, only when at least one check failed: one
+/// numbered step per failed item, each in the same shape -- a bold
+/// "Step X of N -- <name>" heading, a one-line reason, a blank line, then
+/// the exact commands (if any) as a clearly offset, copy-pasteable block,
+/// never embedded mid-sentence. The steps' failed checks don't depend on
+/// each other today (each is a standalone binary/socket presence check),
+/// so the section says so up front rather than implying a required order.
+///
+/// With `verbose`, each step also gets a dimmed line with the raw
+/// technical error and the jargon-bearing fix -- the audit log always has
+/// this detail regardless of the flag.
+fn print_required_steps(statuses: &[CheckStatus], verbose: bool) {
+    let s = style();
+    let failed: Vec<_> = statuses
+        .iter()
+        .filter_map(|st| st.result.as_ref().err().map(|f| (st.check, f)))
+        .collect();
+    let total = failed.len();
+    if total == 0 {
+        return;
+    }
+    println!("{}", s.bold("Here's what to do:"));
+    if total > 1 {
+        println!("(These don't depend on each other -- do them in any order.)");
+    }
+    println!();
+    for (i, (check, failure)) in failed.into_iter().enumerate() {
+        let fix = fix_for(check);
+        println!(
+            "{}",
+            s.bold(&format!(
+                "Step {} of {total} \u{2014} {}",
+                i + 1,
+                friendly_name(check)
+            ))
+        );
+        println!("{}", fix.reason);
+        if !fix.commands.is_empty() {
+            println!();
+            for line in fix.commands {
+                if line.is_empty() {
+                    println!();
+                } else {
+                    println!("    {line}");
+                }
+            }
+        }
+        if verbose {
+            println!();
+            println!(
+                "    {}",
+                s.dim(&format!("technical detail: {}", failure.message))
+            );
+            println!(
+                "    {}",
+                s.dim(&format!("technical fix: {}", technical_detail(check)))
+            );
+        }
+        println!();
+    }
+}
+
+fn cmd_install(verbose: bool) -> ExitCode {
     let env = SystemEnvironment;
     let audit = audit_sink();
-    print_checklist(&install_report(&env));
+    print_intro("Setting up Agent Habitat");
+    let statuses = install_report(&env);
+    print_checklist(&statuses);
+    let s = style();
     match run_install_checks(&env, &audit) {
         Ok(()) => {
-            println!("habitat install: all checks passed.");
+            println!("{}", s.green_bold("All set! Everything Agent Habitat needs is installed."));
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("habitat install: {e}");
+        Err(_) => {
+            // The required-steps section below already says what to do
+            // about each failure -- don't repeat it as a second,
+            // error-shaped line; just close out and point at where the
+            // full technical detail lives.
+            print_required_steps(&statuses, verbose);
             eprintln!(
-                "see the audit log at {} for details",
-                audit.path().display()
+                "{}",
+                s.red_bold("Setup isn't finished yet -- a couple of things need to be installed first (see above).")
             );
+            print_detail_pointer(&s, &audit, verbose);
             ExitCode::FAILURE
         }
     }
 }
 
-fn cmd_run() -> ExitCode {
+fn cmd_run(verbose: bool) -> ExitCode {
     let env = SystemEnvironment;
     let audit = audit_sink();
-    print_checklist(&preflight_report(&env));
+    print_intro("Getting your session ready");
+    let statuses = preflight_report(&env);
+    print_checklist(&statuses);
+    let s = style();
     match run_preflight(&env, &audit) {
         Ok(()) => {
             // Phase 1 stops here. Phases 2-6 (disk build, VM launch,
             // two-point sync, egress, full audit) are assembled behind
             // this point in Phase 7.
             eprintln!(
-                "habitat run: preflight passed; session lifecycle not yet implemented (Phase 7)."
+                "{}",
+                s.green_bold(
+                    "Everything looks good, but starting a session isn't supported yet (still being built)."
+                )
             );
             ExitCode::FAILURE
         }
-        Err(e) => {
-            eprintln!("habitat run: {e}");
+        Err(_) => {
+            // Same reasoning as cmd_install: the required-steps section
+            // below already says what to do about each failure.
+            print_required_steps(&statuses, verbose);
             eprintln!(
-                "see the audit log at {} for details",
-                audit.path().display()
+                "{}",
+                s.red_bold("Your session can't start yet -- a couple of things need to be installed first (see above).")
             );
+            print_detail_pointer(&s, &audit, verbose);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Points at the audit log for full technical detail, phrased for a
+/// reader who doesn't necessarily know what an audit log is. Nudges
+/// towards `--verbose` unless the caller already used it.
+fn print_detail_pointer(s: &output::Style, audit: &habitat_audit::FileAuditSink, verbose: bool) {
+    eprintln!(
+        "{}",
+        s.dim(&format!(
+            "For full technical details, see the log at {}",
+            audit.path().display()
+        ))
+    );
+    if !verbose {
+        eprintln!(
+            "{}",
+            s.dim("(Run with --verbose to see the technical details here instead.)")
+        );
     }
 }
