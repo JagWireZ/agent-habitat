@@ -1,0 +1,48 @@
+# Default secrets blocklist -- Agent Habitat, Phase 2.
+#
+# One pattern per line. Blank lines and lines starting with "#" are
+# ignored. A pattern with no "/" matches against a file's basename
+# anywhere in the project tree; a pattern with one or more "/" matches
+# against that many trailing path components (see
+# `habitat_policy::blocklist` for the exact matching rule). "*" matches
+# any run of characters (including none); there is no other wildcard.
+#
+# This list ships with Agent Habitat itself and is baked into the binary
+# (see `blocklist.rs`'s `include_str!`) -- it is not read from disk at
+# runtime. A project's own additions come from that project's checked-in
+# config file instead (`habitat_policy::config`), and are always additive:
+# nothing here can be removed or overridden per-project.
+#
+# Deliberately NOT derived from, merged with, or informed by any
+# project's `.gitignore` -- `.gitignore` answers a version-control
+# question, not a security one, and the two lists diverge in practice
+# (`docs/plan.md` Section 2.2 / Key decisions table; AGENTS.md Section 2
+# invariant 2).
+
+# Generic env / dotenv files
+.env
+.env.*
+
+# Private keys and certificates
+*.pem
+*.key
+*.pfx
+*.p12
+*.der
+*.jks
+id_rsa*
+id_ed25519*
+id_ecdsa*
+
+# Cloud provider credential files
+.aws/credentials
+.aws/config
+credentials.json
+service-account*.json
+
+# Misc credential stores
+.netrc
+.npmrc
+.pypirc
+.git-credentials
+kube/config

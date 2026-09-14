@@ -21,6 +21,17 @@
 //! to before the rest of the policy loader exists. Blocklist/allowlist/
 //! resource-limit schema and loading land in Phases 2, 5, and 7
 //! respectively -- this file intentionally does not get ahead of them.
+//!
+//! Phase 2 adds: the secrets blocklist ([`blocklist`], defaults plus the
+//! per-project extension mechanism), the git-history toggle
+//! ([`git_history`], default off, hard-fails closed without a logged
+//! approval), and the Phase 2 slice of the checked-in project config
+//! ([`config`]) that carries both. Allowlist (Phase 5) and the rest of
+//! the operator config schema (Phase 7) are still to come.
+
+pub mod blocklist;
+pub mod config;
+pub mod git_history;
 
 use std::path::PathBuf;
 

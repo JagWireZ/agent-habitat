@@ -6,3 +6,18 @@ publish.workspace = true
 description = "Secrets blocklist, disk-build pipeline, and two-point host/sandbox sync (Phases 2 & 4)."
 
 [dependencies]
+habitat-policy = { path = "../policy" }
+
+# Exit-gate and adversarial tests live under the top-level tests/unit/
+# and tests/adversarial/ (mirroring the source tree, per
+# file-structure.md) rather than as inline #[cfg(test)] modules, since
+# they cover this crate's contract with the rest of the system rather
+# than pure internal logic. These [[test]] targets point cargo at those
+# files without duplicating them under crates/workspace/.
+[[test]]
+name = "exit_gate"
+path = "../../tests/unit/workspace/exit_gate.rs"
+
+[[test]]
+name = "blocklist_disk_image"
+path = "../../tests/adversarial/blocklist_disk_image.rs"
