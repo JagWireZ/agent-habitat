@@ -1,6 +1,6 @@
 //! Seam between the checks in this crate and the real machine, so every
 //! check in `checks.rs` can be exercised in a unit test against a fake
-//! machine state (no KVM, a broken containerd install, a non-Linux OS)
+//! machine state (no KVM, a broken podman/krun install, a non-Linux OS)
 //! without needing that hardware/software actually present in CI.
 
 use std::io;

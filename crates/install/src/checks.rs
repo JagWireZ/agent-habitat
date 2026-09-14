@@ -14,8 +14,8 @@ use std::path::Path;
 pub enum CheckId {
     HostOs,
     Kvm,
-    ContainerdNerdctl,
-    KataFirecracker,
+    Podman,
+    KrunRuntime,
 }
 
 impl CheckId {
@@ -23,8 +23,8 @@ impl CheckId {
         match self {
             CheckId::HostOs => "host-os",
             CheckId::Kvm => "kvm",
-            CheckId::ContainerdNerdctl => "containerd-nerdctl",
-            CheckId::KataFirecracker => "kata-firecracker",
+            CheckId::Podman => "podman",
+            CheckId::KrunRuntime => "krun-runtime",
         }
     }
 }
@@ -77,9 +77,12 @@ pub fn host_os<E: Environment>(env: &E) -> CheckResult {
 
 /// Real KVM / hardware-virtualization capability probe: `/dev/kvm` must be
 /// openable for read+write (existence alone is not enough -- a device node
-/// can exist while permission is denied), and the CPU must advertise a
-/// virtualization extension flag in `/proc/cpuinfo`. Any error reading
-/// either signal fails the check closed rather than assuming success.
+/// can exist while permission is denied, e.g. the current user isn't in the
+/// `kvm` group yet -- the one-time, non-elevated setup step rootless Podman
+/// launch relies on, `docs/plan.md` Section 2.1), and the CPU must
+/// advertise a virtualization extension flag in `/proc/cpuinfo`. Any error
+/// reading either signal fails the check closed rather than assuming
+/// success.
 pub fn kvm<E: Environment>(env: &E) -> CheckResult {
     let kvm_path = Path::new("/dev/kvm");
     if !env.path_exists(kvm_path) {
@@ -122,100 +125,65 @@ pub fn kvm<E: Environment>(env: &E) -> CheckResult {
     Ok(())
 }
 
-/// containerd reachable + nerdctl present and able to talk to it. Shared
-/// by `habitat install` and `habitat run`'s preflight subroutine -- one
-/// implementation, not a re-derived duplicate per file-structure.md's
-/// "shared, not per-domain" rule (applied here to check logic, not just
-/// policy data).
-pub fn containerd_nerdctl<E: Environment>(env: &E) -> CheckResult {
-    let socket_candidates = [
-        "/run/containerd/containerd.sock",
-        "/var/run/containerd/containerd.sock",
-    ];
-    let socket_present = socket_candidates
-        .iter()
-        .any(|p| env.path_exists(Path::new(p)));
-    if !socket_present {
-        return fail(
-            CheckId::ContainerdNerdctl,
-            "containerd socket not found at /run/containerd/containerd.sock (or /var/run equivalent) -- is containerd installed and running?",
-        );
-    }
-
-    match env.run_command("nerdctl", &["--version"]) {
+/// Podman present and actually able to run rootless, i.e. without any
+/// daemon/socket prerequisite (`docs/plan.md` Section 2.1 -- rootless
+/// Podman is the whole point, so this check must never assume a system
+/// service is running). Shared by `habitat install` and `habitat run`'s
+/// preflight subroutine -- one implementation, not a re-derived duplicate
+/// per file-structure.md's "shared, not per-domain" rule (applied here to
+/// check logic, not just policy data).
+pub fn podman<E: Environment>(env: &E) -> CheckResult {
+    match env.run_command("podman", &["--version"]) {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
             return fail(
-                CheckId::ContainerdNerdctl,
+                CheckId::Podman,
                 format!(
-                    "`nerdctl --version` exited non-zero: {}",
+                    "`podman --version` exited non-zero: {}",
                     String::from_utf8_lossy(&output.stderr)
                 ),
             )
         }
         Err(e) => {
             return fail(
-                CheckId::ContainerdNerdctl,
-                format!("could not run `nerdctl --version` (is nerdctl on PATH?): {e}"),
+                CheckId::Podman,
+                format!("could not run `podman --version` (is podman on PATH?): {e}"),
             )
         }
     }
 
-    match env.run_command("nerdctl", &["info"]) {
+    match env.run_command("podman", &["info"]) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => fail(
-            CheckId::ContainerdNerdctl,
+            CheckId::Podman,
             format!(
-                "nerdctl could not reach containerd (`nerdctl info` failed): {}",
+                "`podman info` failed -- podman isn't usable in rootless mode for this user: {}",
                 String::from_utf8_lossy(&output.stderr)
             ),
         ),
-        Err(e) => fail(
-            CheckId::ContainerdNerdctl,
-            format!("could not run `nerdctl info`: {e}"),
-        ),
+        Err(e) => fail(CheckId::Podman, format!("could not run `podman info`: {e}")),
     }
 }
 
-/// Kata Containers + Firecracker availability: the Kata v2 shim binary
-/// must be on PATH (this is what containerd actually exec's when a
-/// container is launched with the kata runtime, so its absence means the
-/// runtime cannot start regardless of what containerd's config claims),
-/// and the Firecracker binary must be present and runnable.
-pub fn kata_firecracker<E: Environment>(env: &E) -> CheckResult {
-    match env.run_command("containerd-shim-kata-v2", &["--version"]) {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            return fail(
-                CheckId::KataFirecracker,
-                format!(
-                    "containerd-shim-kata-v2 --version exited non-zero: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            )
-        }
-        Err(e) => {
-            return fail(
-                CheckId::KataFirecracker,
-                format!(
-                    "containerd-shim-kata-v2 not runnable (is Kata Containers installed?): {e}"
-                ),
-            )
-        }
-    }
-
-    match env.run_command("firecracker", &["--version"]) {
+/// The `krun` OCI runtime (`crun-krun` package, backed by libkrun)
+/// availability: `crun-krun` is what Podman actually exec's to launch the
+/// session's microVM, so its absence means a session can't start
+/// regardless of what podman's own config claims. There is no separate
+/// Firecracker-style second binary to check -- libkrun is linked directly
+/// into `crun-krun` (`docs/plan.md` Section 2.1).
+pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
+    match env.run_command("crun-krun", &["--version"]) {
         Ok(output) if output.status.success() => Ok(()),
         Ok(output) => fail(
-            CheckId::KataFirecracker,
+            CheckId::KrunRuntime,
             format!(
-                "firecracker --version exited non-zero: {}",
+                "crun-krun --version exited non-zero: {}",
                 String::from_utf8_lossy(&output.stderr)
             ),
         ),
         Err(e) => fail(
-            CheckId::KataFirecracker,
-            format!("firecracker not runnable (is it installed and on PATH?): {e}"),
+            CheckId::KrunRuntime,
+            format!("crun-krun not runnable (is the crun-krun package installed?): {e}"),
         ),
     }
 }
@@ -279,62 +247,42 @@ mod tests {
     }
 
     #[test]
-    fn containerd_nerdctl_fails_when_socket_absent() {
+    fn podman_fails_when_missing() {
         let env = FakeEnvironment::linux();
-        let err = containerd_nerdctl(&env).unwrap_err();
-        assert_eq!(err.check, CheckId::ContainerdNerdctl);
-        assert!(err.message.contains("socket"));
+        let err = podman(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::Podman);
     }
 
     #[test]
-    fn containerd_nerdctl_fails_when_nerdctl_missing() {
-        let env = FakeEnvironment::linux().with_existing_path("/run/containerd/containerd.sock");
-        let err = containerd_nerdctl(&env).unwrap_err();
-        assert_eq!(err.check, CheckId::ContainerdNerdctl);
-    }
-
-    #[test]
-    fn containerd_nerdctl_fails_when_info_unreachable() {
+    fn podman_fails_when_info_unreachable() {
         let env = FakeEnvironment::linux()
-            .with_existing_path("/run/containerd/containerd.sock")
-            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-            .with_command_failure("nerdctl info", "failed to dial containerd socket");
-        let err = containerd_nerdctl(&env).unwrap_err();
-        assert_eq!(err.check, CheckId::ContainerdNerdctl);
-        assert!(err.message.contains("containerd"));
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_failure("podman info", "cannot re-exec process");
+        let err = podman(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::Podman);
+        assert!(err.message.contains("rootless"));
     }
 
     #[test]
-    fn containerd_nerdctl_passes_when_fully_reachable() {
+    fn podman_passes_when_fully_reachable() {
         let env = FakeEnvironment::linux()
-            .with_existing_path("/run/containerd/containerd.sock")
-            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-            .with_command_ok("nerdctl info", "Server: ...");
-        assert!(containerd_nerdctl(&env).is_ok());
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_ok("podman info", "host: ...");
+        assert!(podman(&env).is_ok());
     }
 
     #[test]
-    fn kata_firecracker_fails_when_shim_missing() {
+    fn krun_runtime_fails_when_missing() {
         let env = FakeEnvironment::linux();
-        let err = kata_firecracker(&env).unwrap_err();
-        assert_eq!(err.check, CheckId::KataFirecracker);
+        let err = krun_runtime(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::KrunRuntime);
     }
 
     #[test]
-    fn kata_firecracker_fails_when_shim_present_but_firecracker_missing() {
-        let env = FakeEnvironment::linux()
-            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0");
-        let err = kata_firecracker(&env).unwrap_err();
-        assert_eq!(err.check, CheckId::KataFirecracker);
-        assert!(err.message.contains("firecracker"));
-    }
-
-    #[test]
-    fn kata_firecracker_passes_when_both_present() {
-        let env = FakeEnvironment::linux()
-            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
-            .with_command_ok("firecracker --version", "Firecracker v1.7.0");
-        assert!(kata_firecracker(&env).is_ok());
+    fn krun_runtime_passes_when_present() {
+        let env =
+            FakeEnvironment::linux().with_command_ok("crun-krun --version", "crun-krun 1.14");
+        assert!(krun_runtime(&env).is_ok());
     }
 
     // The Phase 1 exit-gate scenarios (KVM-absent reported not-false-positive,

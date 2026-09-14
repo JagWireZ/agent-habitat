@@ -1,7 +1,19 @@
 # 0001. Host machine is Linux-only in v1
 
-Status: accepted
+Status: superseded by 0005
 Date: 2026-09-13
+
+> Superseded 2026-09-14: the virtualization stack this decision was framed
+> around (Kata Containers + Firecracker, launched via containerd/nerdctl)
+> was replaced by rootless Podman + the `krun` runtime (libkrun) -- see
+> `0005-rootless-podman-krun-virtualization-stack.md`. The underlying
+> conclusion here (host must be Linux, with hardware virtualization
+> available) still holds under the new stack for the same fundamental
+> reason (libkrun still needs KVM, which is still Linux-only), but the
+> elevated-launcher-privilege and containerd-as-second-infrastructure
+> reasoning below no longer applies -- rootless Podman needs neither.
+> Kept here, unmodified below, as the historical record of the decision
+> it replaces; see `0005` for the current reasoning.
 
 ## Context
 

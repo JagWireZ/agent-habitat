@@ -2,11 +2,11 @@
 //! operator-facing entry points:
 //!
 //! - [`run_install_checks`] -- what `habitat install` runs: host-OS gate,
-//!   containerd/nerdctl, Kata/Firecracker. Verify-only, no mutation.
+//!   Podman, the `krun` runtime. Verify-only, no mutation.
 //! - [`run_preflight`] -- what `habitat run` runs at the start of every
 //!   session: host-OS gate, KVM/hardware-virtualization, then the same
-//!   containerd/nerdctl and Kata/Firecracker checks `habitat install`
-//!   uses (one implementation, reused -- not re-derived).
+//!   Podman and `krun`-runtime checks `habitat install` uses (one
+//!   implementation, reused -- not re-derived).
 //!
 //! Both stop at the first failing check (fail-closed and deterministic:
 //! an operator fixes one problem at a time rather than triaging a wall of
@@ -91,12 +91,12 @@ pub fn install_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
         return statuses;
     }
     statuses.push(CheckStatus {
-        check: checks::CheckId::ContainerdNerdctl,
-        result: checks::containerd_nerdctl(env),
+        check: checks::CheckId::Podman,
+        result: checks::podman(env),
     });
     statuses.push(CheckStatus {
-        check: checks::CheckId::KataFirecracker,
-        result: checks::kata_firecracker(env),
+        check: checks::CheckId::KrunRuntime,
+        result: checks::krun_runtime(env),
     });
     statuses
 }
@@ -118,12 +118,12 @@ pub fn preflight_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
         result: checks::kvm(env),
     });
     statuses.push(CheckStatus {
-        check: checks::CheckId::ContainerdNerdctl,
-        result: checks::containerd_nerdctl(env),
+        check: checks::CheckId::Podman,
+        result: checks::podman(env),
     });
     statuses.push(CheckStatus {
-        check: checks::CheckId::KataFirecracker,
-        result: checks::kata_firecracker(env),
+        check: checks::CheckId::KrunRuntime,
+        result: checks::krun_runtime(env),
     });
     statuses
 }
@@ -136,9 +136,8 @@ pub fn run_install_checks<E: Environment>(
     audit: &dyn AuditSink,
 ) -> Result<(), PreflightError> {
     checks::host_os(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
-    checks::containerd_nerdctl(env)
-        .map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
-    checks::kata_firecracker(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
+    checks::podman(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
+    checks::krun_runtime(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
     Ok(())
 }
 
@@ -148,10 +147,8 @@ pub fn run_install_checks<E: Environment>(
 pub fn run_preflight<E: Environment>(env: &E, audit: &dyn AuditSink) -> Result<(), PreflightError> {
     checks::host_os(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     checks::kvm(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
-    checks::containerd_nerdctl(env)
-        .map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
-    checks::kata_firecracker(env)
-        .map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    checks::podman(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    checks::krun_runtime(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     Ok(())
 }
 
@@ -180,11 +177,9 @@ mod tests {
     #[test]
     fn install_checks_pass_end_to_end_when_everything_is_present() {
         let env = FakeEnvironment::linux()
-            .with_existing_path("/run/containerd/containerd.sock")
-            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-            .with_command_ok("nerdctl info", "Server: ...")
-            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
-            .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_ok("podman info", "host: ...")
+            .with_command_ok("crun-krun --version", "crun-krun 1.14");
         let audit = MemoryAuditSink::default();
         assert!(run_install_checks(&env, &audit).is_ok());
         assert!(audit.events.lock().unwrap().is_empty());
@@ -199,11 +194,9 @@ mod tests {
         let env = FakeEnvironment::linux()
             .with_existing_path("/dev/kvm")
             .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
-            .with_existing_path("/run/containerd/containerd.sock")
-            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-            .with_command_ok("nerdctl info", "Server: ...")
-            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
-            .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_ok("podman info", "host: ...")
+            .with_command_ok("crun-krun --version", "crun-krun 1.14");
         let audit = MemoryAuditSink::default();
         assert!(run_preflight(&env, &audit).is_ok());
         assert!(audit.events.lock().unwrap().is_empty());
@@ -211,17 +204,16 @@ mod tests {
 
     #[test]
     fn install_report_lists_every_check_even_after_a_failure() {
-        // containerd/nerdctl missing, but that must not hide the
-        // kata-firecracker result -- unlike the gate, the report doesn't
-        // stop at the first failure.
+        // podman missing, but that must not hide the krun-runtime result --
+        // unlike the gate, the report doesn't stop at the first failure.
         let env = FakeEnvironment::linux();
         let report = install_report(&env);
-        assert_eq!(report.len(), 3, "host-os, containerd-nerdctl, kata-firecracker");
+        assert_eq!(report.len(), 3, "host-os, podman, krun-runtime");
         assert_eq!(report[0].check.name(), "host-os");
         assert!(report[0].passed());
-        assert_eq!(report[1].check.name(), "containerd-nerdctl");
+        assert_eq!(report[1].check.name(), "podman");
         assert!(!report[1].passed());
-        assert_eq!(report[2].check.name(), "kata-firecracker");
+        assert_eq!(report[2].check.name(), "krun-runtime");
         assert!(!report[2].passed());
     }
 
@@ -243,11 +235,9 @@ mod tests {
     #[test]
     fn install_report_all_pass_when_everything_present() {
         let env = FakeEnvironment::linux()
-            .with_existing_path("/run/containerd/containerd.sock")
-            .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-            .with_command_ok("nerdctl info", "Server: ...")
-            .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
-            .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_ok("podman info", "host: ...")
+            .with_command_ok("crun-krun --version", "crun-krun 1.14");
         let report = install_report(&env);
         assert!(report.iter().all(CheckStatus::passed));
     }
@@ -256,11 +246,7 @@ mod tests {
     fn preflight_report_includes_kvm() {
         let env = FakeEnvironment::linux();
         let report = preflight_report(&env);
-        assert_eq!(
-            report.len(),
-            4,
-            "host-os, kvm, containerd-nerdctl, kata-firecracker"
-        );
+        assert_eq!(report.len(), 4, "host-os, kvm, podman, krun-runtime");
         assert_eq!(report[1].check.name(), "kvm");
         assert!(!report[1].passed());
     }

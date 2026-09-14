@@ -61,7 +61,7 @@ pub struct AuditEvent {
     pub ts_unix_ms: u128,
     pub kind: EventKind,
     /// Name of the specific check that produced this event, if any
-    /// (e.g. "kvm", "containerd-nerdctl"). Distinct from `kind`'s tag --
+    /// (e.g. "kvm", "podman"). Distinct from `kind`'s tag --
     /// `kind` says *what class* of event this is, `check` says *which
     /// check* within that class.
     pub check: Option<String>,

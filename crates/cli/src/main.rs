@@ -18,10 +18,10 @@
 //! "here's what to do" section listing one concrete fix per failed item,
 //! so the checklist itself stays scannable instead of interleaving status
 //! and remediation prose line by line.
-//! Internal component names (containerd, nerdctl, Kata, Firecracker, the
-//! containerd socket path, ...) are reserved for `--verbose`/`-v` -- shown
-//! as a dimmed line under each fix -- and for the audit log, which always
-//! gets the full technical detail regardless of this flag.
+//! Internal component names (Podman, crun-krun, libkrun, ...) are reserved
+//! for `--verbose`/`-v` -- shown as a dimmed line under each fix -- and for
+//! the audit log, which always gets the full technical detail regardless
+//! of this flag.
 
 mod output;
 
@@ -71,8 +71,8 @@ fn friendly_name(check: CheckId) -> &'static str {
     match check {
         CheckId::HostOs => "Operating system",
         CheckId::Kvm => "Hardware virtualization",
-        CheckId::ContainerdNerdctl => "Container runtime",
-        CheckId::KataFirecracker => "Sandbox isolation layer",
+        CheckId::Podman => "Container runtime",
+        CheckId::KrunRuntime => "Sandbox isolation layer",
     }
 }
 
@@ -82,26 +82,22 @@ fn friendly_status(check: CheckId) -> &'static str {
     match check {
         CheckId::HostOs => "Not supported",
         CheckId::Kvm => "Not available",
-        CheckId::ContainerdNerdctl => "Not found",
-        CheckId::KataFirecracker => "Not found",
+        CheckId::Podman => "Not found",
+        CheckId::KrunRuntime => "Not found",
     }
 }
 
 /// A failed check's fix, split into a one-line "what/why" and, separately,
 /// the exact commands to run -- so the two never run together mid-sentence
-/// (naming the actual thing to install, e.g. "containerd", since "install
-/// the container runtime" is meaningless to someone who doesn't already
-/// know that's what it means). Deeper internals (the socket path, the
-/// exact shim binary name, PATH resolution) still live in
-/// [`technical_detail`], shown only under `--verbose`.
+/// (naming the actual thing to install, e.g. "podman", since "install the
+/// container runtime" is meaningless to someone who doesn't already know
+/// that's what it means). Deeper internals (exact error text, PATH
+/// resolution) still live in [`technical_detail`], shown only under
+/// `--verbose`.
 ///
 /// Not every check has a runnable command -- a BIOS setting or "there is
 /// no fix" can't be copy-pasted into a terminal, so `commands` is empty
-/// rather than faking one. And not every fixable check can be reduced to
-/// a short command block: [`CheckId::KataFirecracker`] is a several-step
-/// download-and-link process, not a single package install, so its
-/// `commands` is just a pointer to the full walkthrough, and `reason`
-/// says so explicitly instead of silently handing over a bare link.
+/// rather than faking one.
 struct Fix {
     reason: &'static str,
     commands: &'static [&'static str],
@@ -114,24 +110,19 @@ fn fix_for(check: CheckId) -> Fix {
             commands: &[],
         },
         CheckId::Kvm => Fix {
-            reason: "Turn on virtualization support (VT-x on Intel, AMD-V on AMD) in your computer's BIOS/UEFI settings, then reboot -- this is a firmware setting, not something a command can turn on. If this is a cloud VM, ask your provider to enable nested virtualization instead.",
-            commands: &[],
+            reason: "Turn on virtualization support (VT-x on Intel, AMD-V on AMD) in your computer's BIOS/UEFI settings, then reboot -- this is a firmware setting, not something a command can turn on. If this is a cloud VM, ask your provider to enable nested virtualization instead. If /dev/kvm exists but this still fails, add your user to the kvm group and log back in.",
+            commands: &["sudo usermod -aG kvm $USER   # then log out and back in"],
         },
-        CheckId::ContainerdNerdctl => Fix {
-            reason: "Installs containerd, the container engine Agent Habitat runs sandboxes on, and nerdctl, its command-line tool.",
+        CheckId::Podman => Fix {
+            reason: "Installs Podman, the rootless container/VM engine Agent Habitat launches sandboxes through -- no daemon or elevated privileges required.",
             commands: &[
-                "sudo apt install containerd   # Debian/Ubuntu",
-                "sudo dnf install containerd   # Fedora",
-                "sudo systemctl enable --now containerd",
-                "",
-                "# nerdctl is packaged for Ubuntu (\"sudo apt install nerdctl\");",
-                "# Fedora doesn't package it yet -- grab a release tarball instead:",
-                "#   https://github.com/containerd/nerdctl/releases",
+                "sudo dnf install podman   # AlmaLinux/Fedora",
+                "sudo apt install podman   # Ubuntu (later host target)",
             ],
         },
-        CheckId::KataFirecracker => Fix {
-            reason: "Runs each session in its own hardware-isolated Firecracker microVM. This isn't a single package install -- it's a short multi-step download-and-link process -- so follow the full walkthrough instead of copy-pasting commands here:",
-            commands: &["https://github.com/jagwirez/agent-habitat/blob/master/docs/setup/kata-firecracker.md"],
+        CheckId::KrunRuntime => Fix {
+            reason: "Installs crun-krun, the OCI runtime (backed by libkrun) Podman uses to launch each session in its own microVM instead of a shared-kernel container.",
+            commands: &["sudo dnf install crun-krun   # AlmaLinux/Fedora"],
         },
     }
 }
@@ -143,16 +134,16 @@ fn fix_for(check: CheckId) -> Fix {
 fn technical_detail(check: CheckId) -> &'static str {
     match check {
         CheckId::HostOs => {
-            "Agent Habitat's isolation model (containerd + Kata/Firecracker microVMs) is Linux-only."
+            "Agent Habitat's isolation model (rootless Podman + the krun runtime, backed by libkrun) is Linux-only."
         }
         CheckId::Kvm => {
-            "Enable VT-x/AMD-V virtualization extensions in firmware, confirm /dev/kvm is present, and add the current user to the `kvm` group (or otherwise grant it read+write on the device node)."
+            "Enable VT-x/AMD-V virtualization extensions in firmware, confirm /dev/kvm is present, and add the current user to the `kvm` group (or otherwise grant it read+write on the device node) -- rootless launch needs no further elevation beyond that."
         }
-        CheckId::ContainerdNerdctl => {
-            "Install containerd and start its daemon (e.g. `systemctl enable --now containerd`), then install nerdctl so it can drive the containerd socket over the CRI/OCI runtime interface."
+        CheckId::Podman => {
+            "Install podman and confirm it works rootless for this user (`podman info` succeeds without a daemon or elevated privileges)."
         }
-        CheckId::KataFirecracker => {
-            "Install Kata Containers configured with the Firecracker hypervisor backend so `containerd-shim-kata-v2` (the shim containerd exec's to launch the microVM runtime) and the `firecracker` binary are both resolvable on PATH."
+        CheckId::KrunRuntime => {
+            "Install the `crun-krun` package so `crun-krun` (the OCI runtime binary Podman exec's, with libkrun linked directly into it) is resolvable on PATH -- there is no separate hypervisor binary to install alongside it."
         }
     }
 }

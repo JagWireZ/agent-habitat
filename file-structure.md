@@ -14,7 +14,7 @@ implements, and `docs/plan.md` for what each domain is responsible for.
 |   |-- cli/                # habitat-cli   -- the `habitat` binary entrypoint
 |   |-- install/            # habitat-install -- `habitat install` + preflight checks
 |   |-- workspace/          # habitat-workspace -- secrets blocklist, disk-build, two-point sync
-|   |-- vm/                 # habitat-vm    -- containerd/nerdctl launch, Kata/Firecracker, session lifecycle
+|   |-- vm/                 # habitat-vm    -- rootless Podman + krun runtime launch, session lifecycle
 |   |-- egress/             # habitat-egress -- local proxy, default-deny allowlist enforcement
 |   |-- audit/              # habitat-audit -- unified boundary audit log
 |   `-- policy/             # habitat-policy -- shared config/policy schema types + loader (code)
@@ -62,11 +62,11 @@ implements, and `docs/plan.md` for what each domain is responsible for.
 - Use `docs/decisions/template.md` as the starting structure (Status,
   Context, Decision, Consequences).
 - Status is one of: `proposed`, `accepted`, `superseded by NNNN`. Roadmap
-  decisions that are foundational to v1 (e.g. host OS family is
-  Fedora-based + Ubuntu-based in parallel, guest is fixed at a minimal
-  Alpine image) are recorded as `accepted` from the start, per
-  `docs/plan.md` and `AGENTS.md` Section 5. A decision that later changes
-  is marked superseded, never edited in place or deleted.
+  decisions that are foundational to v1 (e.g. the sequential platform
+  roadmap -- AlmaLinux, then Fedora, then Ubuntu -- and the rootless
+  Podman + krun virtualization stack) are recorded as `accepted` from the
+  start, per `docs/plan.md` and `AGENTS.md` Section 5. A decision that
+  later changes is marked superseded, never edited in place or deleted.
 
 ## 4. What does NOT belong at the top level
 

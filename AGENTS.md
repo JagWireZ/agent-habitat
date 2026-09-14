@@ -15,9 +15,10 @@ Agent Habitat gives an AI coding agent its own disposable virtual machine to
 run in -- a sealed sandbox that looks and feels like your real project, but
 isn't it. It has two separate locks, kept conceptually distinct:
 
-- **The vault door** -- containment. Each session runs in a real Kata
-  Containers + Firecracker microVM, not a shared-kernel container. Even a
-  fully compromised agent can't reach the host.
+- **The vault door** -- containment. Each session runs in a real microVM,
+  launched by rootless Podman through the `krun` runtime (libkrun), not a
+  shared-kernel container. Even a fully compromised agent can't reach the
+  host.
 - **The guard's rulebook** -- permissions. Rules for what's allowed to cross
   that boundary in either direction: which files get copied into the
   sandbox's disk in the first place, what network destinations the session
@@ -31,17 +32,23 @@ multi-tenant use unless asked -- the disposable-VM-per-session model, the
 two-point sync mechanism, and the single audit destination are deliberate
 single-host constructs, not placeholders waiting to be generalized.
 
-**The host machine is Linux-only in v1, and v1 specifically targets two
-host OS families in parallel: Fedora-based (RPM/dnf) and Ubuntu-based
-(DEB/apt) distros.** Both ship together in v1, not one after the other --
-see Section 5. Don't build host-OS-detection branches, nested-VM
-workarounds, or "best effort" paths for macOS/Windows, or for any other
-Linux distro family (Arch, openSUSE, etc.), preemptively. macOS/Windows
-host support is future work, not yet designed -- see Section 5.
+**The host machine is Linux-only, and the platform roadmap is a single
+sequential line: v1 targets AlmaLinux, v1.1 Fedora, v2 Ubuntu** -- not
+two host families validated in parallel with a separately fixed guest
+(see Section 5, and `docs/decisions/0006-sequential-platform-roadmap.md`).
+There is no separate guest-distro axis to track: the guest image is built
+from whichever platform the current roadmap stage targets. Don't build
+host-OS-detection branches, nested-VM workarounds, or "best effort" paths
+for macOS/Windows, or for any other Linux distro family (Arch, openSUSE,
+etc.), or for Fedora/Ubuntu ahead of their own roadmap stage,
+preemptively. macOS/Windows host support is future work, not yet
+designed -- see Section 5.
 
-**The guest inside the sandbox is fixed: a minimal Alpine Linux image.**
-This is separate from host-OS-family support above and does not have its
-own distro roadmap -- don't build guest-distro-selection logic.
+**The virtualization stack is rootless Podman + the `krun` runtime
+(libkrun), not containerd + Kata Containers + Firecracker.** No daemon,
+no elevated launcher process -- Podman runs as the calling user, with
+one-time `kvm` group membership as the only host-side setup step (see
+`docs/decisions/0005-rootless-podman-krun-virtualization-stack.md`).
 
 ## 2. Non-negotiable invariants
 
@@ -132,10 +139,16 @@ of code that looks correct by inspection:
 - **Sync performance at scale:** not yet validated for large monorepos or
   large binary files (see `docs/plan.md` Known limitations) -- don't claim
   this works at scale until it's actually been measured.
-- **The stack overall:** Kata Containers + Firecracker launched via
-  containerd/nerdctl is newer and less battle-tested than more common
-  setups. It needs real hands-on validation on real hardware before v1
-  ships, not just a configuration or design review.
+- **The stack overall:** rootless Podman + the `krun` runtime (libkrun) +
+  block-device-backed storage + `passt` networking is newer and less
+  battle-tested than more common setups, and doesn't have a well-trodden
+  public reference to follow end to end. It needs real hands-on
+  validation on real hardware before v1 ships, not just a configuration
+  or design review.
+- **DNS containment under `passt`:** a leftover default resolver inside
+  the guest would be a way for the network restriction in Section 2,
+  invariant 7 to quietly leak -- must be verified pinned to the proxy
+  path, not assumed.
 
 ## 4. Deferred items -- do not implement, note the trigger only
 
@@ -151,16 +164,15 @@ has actually occurred and someone explicitly asks for the build.
 | Optional live progress view into a running session | A real need to observe an in-progress session beyond post-hoc audit review |
 | Targeted secret injection (a single value instead of withholding a whole blocklisted file) | v1's all-or-nothing blocklist behavior is shown to block a genuinely necessary task |
 | GPU support | An actual project requiring GPU-backed agent work |
-| Additional host distro/family variants (e.g. Arch, openSUSE) | Both v1 host lines (Fedora-based, Ubuntu-based) have shipped and been validated end-to-end |
-| macOS / Windows host support | Linux-host v1 (both host families) has shipped and been validated; the host isolation model for a non-KVM host is designed and reviewed, not assumed |
+| Additional host distro/family variants (e.g. Arch, openSUSE) | v1.1 (Fedora) and v2 (Ubuntu) have both shipped and been validated end-to-end |
+| macOS / Windows host support | The full sequential platform roadmap (v1 AlmaLinux, v1.1 Fedora, v2 Ubuntu) has shipped and been validated; the host isolation model for a non-KVM host is designed and reviewed, not assumed |
 
 Known accepted gaps (do not attempt to close without being asked):
-- The host must be Linux -- Firecracker needs KVM. macOS and Windows host
+- The host must be Linux -- libkrun needs KVM. macOS and Windows host
   support is future work, not yet designed.
 - Hardware virtualization isn't always available on cloud machines --
-  checked for up front, not papered over or assumed.
-- A second piece of host infrastructure (containerd) is required alongside
-  whatever a team already runs.
+  checked for up front, not papered over or assumed. One-time `kvm` group
+  membership is also required for rootless launch.
 - In-sandbox activity isn't logged in v1 -- only what crosses the
   host/sandbox boundary (the VM process, the proxy, the sync mechanism).
 - No middle ground for blocked files -- if a task genuinely needs a
@@ -168,38 +180,40 @@ Known accepted gaps (do not attempt to close without being asked):
 
 ## 5. Roadmap and build order
 
-**Host OS is Linux-only through v1, v1.1, and v2.** macOS and Windows host
-support is a separate, later effort that hasn't been designed yet -- it is
-not part of the sequence below, and no code path should assume or
-special-case a non-Linux host in the meantime.
+**Host OS is Linux-only throughout the platform roadmap.** macOS and
+Windows host support is a separate, later effort that hasn't been
+designed yet -- it is not part of the sequence below, and no code path
+should assume or special-case a non-Linux host in the meantime.
 
-Host-OS-family support within v1 is parallel (both lines ship together);
-the guest is fixed (minimal Alpine) throughout and has no roadmap stage of
-its own; everything beyond v1's two host families is sequenced after it,
-not alongside it:
+The platform roadmap is a single sequential line, not a host-family-
+parallel / guest-fixed split (`docs/decisions/0006-sequential-platform-roadmap.md`).
+Each stage covers both what `habitat` runs on and what the guest image is
+built from -- there's no separate guest-distro axis to track:
 
 ```
-v1  -- Fedora-based AND Ubuntu-based Linux hosts, together
-        (full system validated end-to-end on real hardware for both
-        host families before v1 ships -- neither is "first";
-        guest stays minimal Alpine throughout)
-  -> (later, undesigned) further host distro families
-     (e.g. Arch, openSUSE)
-    -> (later, undesigned) macOS / Windows host support
+v1   -- AlmaLinux
+         (full system validated end-to-end on real hardware)
+  -> v1.1 -- Fedora
+             (expected light lift given closeness to AlmaLinux,
+             still requires its own validation pass)
+    -> v2 -- Ubuntu
+              (different security model under the hood -- waits
+              until v1 is proven out, not shipped in parallel)
+      -> (later, undesigned) further platform families
+         (e.g. Arch, openSUSE)
+        -> (later, undesigned) macOS / Windows host support
 ```
 
 Rules that follow from this:
 
 - **Don't build ahead of the roadmap.** If a task seems to need something
-  from a later stage (e.g. an Arch or openSUSE host path, or any
-  macOS/Windows host path) that doesn't exist yet, flag it rather than
-  building a one-off parallel mechanism for it now.
-- **v1 is Fedora-based + Ubuntu-based hosts, with a fixed Alpine guest,
-  full stop.** Distro-conditional branches for any other host distro
-  family, and any host-OS branches beyond Linux, don't belong in the
-  codebase until their own roadmap stage starts. Within v1, both host
-  families are in scope together -- there is no "ship Fedora first"
-  shortcut. The guest never gets its own distro-selection logic.
+  from a later stage (e.g. a Fedora- or Ubuntu-specific path, an Arch or
+  openSUSE path, or any macOS/Windows host path) that doesn't exist yet,
+  flag it rather than building a one-off parallel mechanism for it now.
+- **v1 is AlmaLinux, full stop.** Distro-conditional branches for Fedora,
+  Ubuntu, or any other platform, and any host-OS branches beyond Linux,
+  don't belong in the codebase until their own roadmap stage starts --
+  there is no "ship the next stage early" shortcut.
 
 ## 6. File structure conventions
 

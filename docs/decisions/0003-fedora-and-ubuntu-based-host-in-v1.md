@@ -1,7 +1,19 @@
 # 0003. Host OS family is Fedora-based and Ubuntu-based, in parallel, in v1
 
-Status: accepted
+Status: superseded by 0006
 Date: 2026-09-13
+
+> Superseded 2026-09-14: the host/guest split this decision rested on (a
+> fixed, separate minimal-Alpine guest, independent of host distro family)
+> no longer applies once the virtualization stack moved to rootless
+> Podman + the `krun` runtime
+> (`0005-rootless-podman-krun-virtualization-stack.md`), which removes the
+> reason to keep host and guest platform choices distinct. The roadmap is
+> now a single sequential line -- AlmaLinux, then Fedora, then Ubuntu --
+> instead of two host families validated together with a permanently
+> fixed guest. See `0006-sequential-platform-roadmap.md` for the current
+> decision. Kept here, unmodified below, as the historical record of the
+> decision it replaces.
 
 ## Context
 

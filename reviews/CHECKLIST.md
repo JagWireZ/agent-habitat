@@ -37,10 +37,9 @@ Date: YYYY-MM-DD
 
 #### 1. Dependency / tool catalogue
 
-- [ ] containerd version in use, and whether a newer stable release exists
-- [ ] nerdctl version in use
-- [ ] Kata Containers version in use
-- [ ] Firecracker version in use
+- [ ] Podman version in use, and whether a newer stable release exists
+- [ ] crun-krun / libkrun version in use
+- [ ] passt version in use
 - [ ] Rust toolchain / crate dependency audit (e.g. `cargo audit` output)
 - [ ] Any dependency with a known CVE since the last pass, and its status
 

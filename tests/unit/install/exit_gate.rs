@@ -24,11 +24,9 @@ use habitat_install::{run_install_checks, run_preflight};
 #[test]
 fn preflight_reports_missing_kvm_not_a_false_positive() {
     let env = FakeEnvironment::linux()
-        .with_existing_path("/run/containerd/containerd.sock")
-        .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-        .with_command_ok("nerdctl info", "Server: ...")
-        .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
-        .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+        .with_command_ok("podman --version", "podman version 5.0.0")
+        .with_command_ok("podman info", "host: ...")
+        .with_command_ok("crun-krun --version", "crun-krun 1.14");
     // Deliberately no `/dev/kvm` and no /proc/cpuinfo virt flag registered.
 
     let audit = MemoryAuditSink::default();
@@ -52,29 +50,26 @@ fn preflight_reports_missing_kvm_not_a_false_positive() {
 }
 
 /// Exit gate: "an intentionally-broken containerd/Kata install fails
-/// closed with a non-zero exit and a distinctly-tagged log entry."
+/// closed with a non-zero exit and a distinctly-tagged log entry" --
+/// carried over to the current stack as: an intentionally-broken
+/// Podman/krun install fails closed the same way.
 ///
-/// `containerd-shim-kata-v2` is present-but-broken (analogous to a
-/// misconfigured shim that fails to report its version) -- everything
-/// upstream of it (host OS, KVM, containerd/nerdctl reachability) is
-/// otherwise healthy.
+/// `crun-krun` is present-but-broken (analogous to a misconfigured OCI
+/// runtime that fails to report its version) -- everything upstream of it
+/// (host OS, KVM, podman reachability) is otherwise healthy.
 #[test]
-fn broken_kata_install_fails_closed_with_distinct_tag() {
+fn broken_krun_runtime_install_fails_closed_with_distinct_tag() {
     let env = FakeEnvironment::linux()
         .with_existing_path("/dev/kvm")
         .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
-        .with_existing_path("/run/containerd/containerd.sock")
-        .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-        .with_command_ok("nerdctl info", "Server: ...")
-        .with_command_failure(
-            "containerd-shim-kata-v2 --version",
-            "error: no such runtime handler",
-        );
+        .with_command_ok("podman --version", "podman version 5.0.0")
+        .with_command_ok("podman info", "host: ...")
+        .with_command_failure("crun-krun --version", "error: no such runtime handler");
 
     let audit = MemoryAuditSink::default();
     let err = run_preflight(&env, &audit)
-        .expect_err("a broken Kata install must fail closed, not be treated as available");
-    assert_eq!(err.0.check.name(), "kata-firecracker");
+        .expect_err("a broken krun-runtime install must fail closed, not be treated as available");
+    assert_eq!(err.0.check.name(), "krun-runtime");
 
     let events = audit.events.lock().unwrap();
     assert_eq!(events.len(), 1);
@@ -83,15 +78,15 @@ fn broken_kata_install_fails_closed_with_distinct_tag() {
         "preflight-failure",
         "distinctly tagged -- not lumped in with an ordinary event"
     );
-    assert_eq!(events[0].check.as_deref(), Some("kata-firecracker"));
+    assert_eq!(events[0].check.as_deref(), Some("krun-runtime"));
 
     // Also exercised via `habitat install` directly (host-os check first,
-    // so use a fully Linux+containerd-healthy env to reach the same
-    // Kata failure through that entry point too).
+    // so use a fully Linux+podman-healthy env to reach the same
+    // krun-runtime failure through that entry point too).
     let install_audit = MemoryAuditSink::default();
     let install_err = run_install_checks(&env, &install_audit)
-        .expect_err("`habitat install` must also fail closed on a broken Kata install");
-    assert_eq!(install_err.0.check.name(), "kata-firecracker");
+        .expect_err("`habitat install` must also fail closed on a broken krun-runtime install");
+    assert_eq!(install_err.0.check.name(), "krun-runtime");
     let install_events = install_audit.events.lock().unwrap();
     assert_eq!(install_events[0].kind.tag(), "install-failure");
 }
@@ -110,11 +105,9 @@ fn broken_kata_install_fails_closed_with_distinct_tag() {
 #[test]
 fn install_run_twice_on_already_correct_host_makes_no_changes() {
     let env = FakeEnvironment::linux()
-        .with_existing_path("/run/containerd/containerd.sock")
-        .with_command_ok("nerdctl --version", "nerdctl 1.7.0")
-        .with_command_ok("nerdctl info", "Server: ...")
-        .with_command_ok("containerd-shim-kata-v2 --version", "kata-shim v2.0.0")
-        .with_command_ok("firecracker --version", "Firecracker v1.7.0");
+        .with_command_ok("podman --version", "podman version 5.0.0")
+        .with_command_ok("podman info", "host: ...")
+        .with_command_ok("crun-krun --version", "crun-krun 1.14");
 
     let first_audit = MemoryAuditSink::default();
     let first = run_install_checks(&env, &first_audit);
