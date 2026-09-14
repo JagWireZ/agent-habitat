@@ -1,7 +1,12 @@
 //! `habitat` -- the operator-facing CLI entrypoint.
 //!
 //! Phase 1 wires up two subcommands against the Phase 0 skeleton:
-//! - `habitat install` -- runs `habitat-install::run_install_checks`.
+//! - `habitat install` -- runs `habitat-install::run_install_checks`. If
+//!   anything's missing, it offers to install it: on "yes", detects the
+//!   host's dnf/apt package-manager family
+//!   (`docs/decisions/0001-host-os-layer.md`'s 2026-09-14 amendment) and
+//!   runs the actual `sudo <pkg-mgr> install` command for each fixable
+//!   check, then re-verifies before reporting the final result.
 //! - `habitat run` -- runs `habitat-install::run_preflight` and then stops;
 //!   the rest of the session lifecycle (disk build, VM launch, prompt
 //!   loop, teardown) is assembled in Phase 7 from Phases 2-6.
@@ -26,18 +31,20 @@
 mod output;
 
 use habitat_install::{
-    install_report, preflight_report, run_install_checks, run_preflight, CheckId, CheckStatus,
-    SystemEnvironment,
+    detect_package_family, install_missing, install_report, preflight_report, run_install_checks,
+    run_preflight, CheckId, CheckStatus, InstallAttempt, SystemEnvironment,
 };
 use output::style;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let verbose = args
+    let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
+    match args
         .iter()
-        .any(|a| a == "--verbose" || a == "-v");
-    match args.iter().find(|a| !a.starts_with('-')).map(String::as_str) {
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
+    {
         Some("install") => cmd_install(verbose),
         Some("run") => cmd_run(verbose),
         Some(other) => {
@@ -114,15 +121,15 @@ fn fix_for(check: CheckId) -> Fix {
             commands: &["sudo usermod -aG kvm $USER   # then log out and back in"],
         },
         CheckId::Podman => Fix {
-            reason: "Installs Podman, the rootless container/VM engine Agent Habitat launches sandboxes through -- no daemon or elevated privileges required.",
+            reason: "Installs Podman, the rootless container/VM engine Agent Habitat launches sandboxes through -- no daemon or elevated privileges required. (`habitat install` can run this for you -- see the prompt above.)",
             commands: &[
-                "sudo dnf install podman   # AlmaLinux/Fedora",
-                "sudo apt install podman   # Ubuntu (later host target)",
+                "sudo dnf install -y podman      # AlmaLinux/Fedora/RHEL-family",
+                "sudo apt-get install -y podman  # Debian/Ubuntu-family",
             ],
         },
         CheckId::KrunRuntime => Fix {
-            reason: "Installs crun-krun, the OCI runtime (backed by libkrun) Podman uses to launch each session in its own microVM instead of a shared-kernel container.",
-            commands: &["sudo dnf install crun-krun   # AlmaLinux/Fedora"],
+            reason: "Installs crun-krun, the OCI runtime (backed by libkrun) Podman uses to launch each session in its own microVM instead of a shared-kernel container. Not yet packaged for Debian/Ubuntu-family hosts.",
+            commands: &["sudo dnf install -y crun-krun   # AlmaLinux/Fedora/RHEL-family"],
         },
     }
 }
@@ -241,16 +248,97 @@ fn print_required_steps(statuses: &[CheckStatus], verbose: bool) {
     }
 }
 
+/// Checks with a real package-manager fix -- the only ones the
+/// auto-install step ever offers to run something for. `HostOs` (no fix
+/// on this host at all) and `Kvm` (a firmware setting, not a package) are
+/// never included.
+fn is_installable(check: CheckId) -> bool {
+    matches!(check, CheckId::Podman | CheckId::KrunRuntime)
+}
+
+/// Reads a yes/no answer from stdin, defaulting to "no" on anything else
+/// (including EOF/a piped-empty stdin) -- an ambiguous answer must never
+/// be treated as consent to run `sudo` commands.
+fn prompt_yes_no(question: &str) -> bool {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// Prints the outcome of each auto-install attempt, in the same
+/// plain-English register as [`print_checklist`].
+fn print_install_attempts(attempts: &[InstallAttempt], s: output::Style) {
+    for attempt in attempts {
+        match attempt {
+            InstallAttempt::Succeeded { check, package } => println!(
+                "  {} Installed {package} ({})",
+                s.green_bold("\u{2714}"),
+                friendly_name(*check)
+            ),
+            InstallAttempt::Failed { check, package } => println!(
+                "  {} Couldn't install {package} ({}) -- see the output above",
+                s.red_bold("\u{2718}"),
+                friendly_name(*check)
+            ),
+            InstallAttempt::NotAvailable { check } => println!(
+                "  {} No automatic install is available yet for {} on this Linux distribution",
+                s.dim("\u{2014}"),
+                friendly_name(*check)
+            ),
+        }
+    }
+    println!();
+}
+
 fn cmd_install(verbose: bool) -> ExitCode {
     let env = SystemEnvironment;
     let audit = audit_sink();
     print_intro("Setting up Agent Habitat");
-    let statuses = install_report(&env);
+    let mut statuses = install_report(&env);
     print_checklist(&statuses);
     let s = style();
+
+    let fixable_failed: Vec<CheckId> = statuses
+        .iter()
+        .filter(|st| !st.passed() && is_installable(st.check))
+        .map(|st| st.check)
+        .collect();
+
+    if !fixable_failed.is_empty()
+        && prompt_yes_no("Would you like Agent Habitat to install the missing pieces now? This runs `sudo` commands.")
+    {
+        println!();
+        match detect_package_family(&env) {
+            Some(family) => {
+                let attempts = install_missing(&env, &audit, family, &fixable_failed);
+                print_install_attempts(&attempts, s);
+                // Re-run the checks from scratch rather than trusting the
+                // install commands' own exit codes -- the same fail-closed
+                // posture as everything else in this crate.
+                statuses = install_report(&env);
+                print_checklist(&statuses);
+            }
+            None => {
+                println!(
+                    "{}",
+                    s.dim("Couldn't automatically recognize this Linux distribution's package manager -- install the missing pieces manually (see below).")
+                );
+                println!();
+            }
+        }
+    }
+
     match run_install_checks(&env, &audit) {
         Ok(()) => {
-            println!("{}", s.green_bold("All set! Everything Agent Habitat needs is installed."));
+            println!(
+                "{}",
+                s.green_bold("All set! Everything Agent Habitat needs is installed.")
+            );
             ExitCode::SUCCESS
         }
         Err(_) => {

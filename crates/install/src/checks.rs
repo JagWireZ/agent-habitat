@@ -280,8 +280,7 @@ mod tests {
 
     #[test]
     fn krun_runtime_passes_when_present() {
-        let env =
-            FakeEnvironment::linux().with_command_ok("crun-krun --version", "crun-krun 1.14");
+        let env = FakeEnvironment::linux().with_command_ok("crun-krun --version", "crun-krun 1.14");
         assert!(krun_runtime(&env).is_ok());
     }
 

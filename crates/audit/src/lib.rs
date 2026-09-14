@@ -36,6 +36,11 @@ pub enum EventKind {
     PreflightFailure,
     /// `habitat install` refused to proceed.
     InstallFailure,
+    /// `habitat install`'s optional auto-install step ran (or tried to
+    /// run) a privileged package-manager command. Logged for every
+    /// attempt, not just failures -- running `sudo` on the operator's
+    /// behalf is security-relevant regardless of outcome.
+    InstallAction,
 }
 
 impl EventKind {
@@ -43,6 +48,7 @@ impl EventKind {
         match self {
             EventKind::PreflightFailure => "preflight-failure",
             EventKind::InstallFailure => "install-failure",
+            EventKind::InstallAction => "install-action",
         }
     }
 }
@@ -183,8 +189,13 @@ mod tests {
     fn event_kinds_have_distinct_tags() {
         assert_eq!(EventKind::PreflightFailure.tag(), "preflight-failure");
         assert_eq!(EventKind::InstallFailure.tag(), "install-failure");
+        assert_eq!(EventKind::InstallAction.tag(), "install-action");
         assert_ne!(
             EventKind::PreflightFailure.tag(),
+            EventKind::InstallFailure.tag()
+        );
+        assert_ne!(
+            EventKind::InstallAction.tag(),
             EventKind::InstallFailure.tag()
         );
     }

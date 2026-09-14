@@ -1,0 +1,175 @@
+//! Host package-manager family detection, used only to pick the right
+//! remediation command for `habitat install`'s optional auto-install step
+//! (`installer.rs`) once a check has already failed. This never
+//! influences whether a check passes or fails -- `checks.rs` stays
+//! exactly as it was -- it only decides how the auto-install step talks
+//! to the package manager, if the operator asks it to.
+//!
+//! Scope note (`docs/decisions/0001-host-os-layer.md`'s 2026-09-14
+//! amendment): detecting the package-manager family is not the same as
+//! claiming full end-to-end validation on that family -- v1 sign-off
+//! still runs against AlmaLinux alone. This module only lets `habitat
+//! install` offer a real install command on Fedora/RHEL-family and
+//! Debian/Ubuntu-family hosts instead of silently doing nothing there.
+
+use crate::checks::CheckId;
+use crate::environment::Environment;
+use std::path::Path;
+
+/// A family of Linux distros that share a package manager. Not a distro
+/// identity in its own right -- AlmaLinux, Fedora, RHEL, Rocky, and
+/// CentOS are all `Dnf`; Debian and Ubuntu are both `Apt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageFamily {
+    Dnf,
+    Apt,
+}
+
+/// Classifies the host by reading `ID` and `ID_LIKE` out of
+/// `/etc/os-release`. Returns `None` on any host this can't confidently
+/// classify (file missing, or an `ID`/`ID_LIKE` this doesn't recognize)
+/// -- callers must treat that as "no auto-install available here," never
+/// guess a default family.
+pub fn detect_package_family<E: Environment>(env: &E) -> Option<PackageFamily> {
+    let contents = env.read_to_string(Path::new("/etc/os-release")).ok()?;
+    classify(&contents)
+}
+
+fn classify(os_release: &str) -> Option<PackageFamily> {
+    let mut id = String::new();
+    let mut id_like = String::new();
+    for line in os_release.lines() {
+        if let Some(v) = line.strip_prefix("ID=") {
+            id = unquote(v);
+        } else if let Some(v) = line.strip_prefix("ID_LIKE=") {
+            id_like = unquote(v);
+        }
+    }
+    let haystack = format!("{id} {id_like}").to_lowercase();
+    let tokens: Vec<&str> = haystack.split_whitespace().collect();
+    if tokens
+        .iter()
+        .any(|t| matches!(*t, "fedora" | "rhel" | "almalinux" | "rocky" | "centos"))
+    {
+        Some(PackageFamily::Dnf)
+    } else if tokens.iter().any(|t| matches!(*t, "debian" | "ubuntu")) {
+        Some(PackageFamily::Apt)
+    } else {
+        None
+    }
+}
+
+fn unquote(v: &str) -> String {
+    v.trim().trim_matches('"').to_string()
+}
+
+/// The package to install for a failed `check` on `family` -- `None` when
+/// there's no package-manager fix at all on this host (`HostOs`/`Kvm`: a
+/// package manager can't fix a firmware setting or an unsupported OS) or
+/// the package doesn't exist for this family yet (`KrunRuntime` on `Apt`:
+/// `crun-krun` has no `.deb` until Ubuntu's own v2 roadmap stage --
+/// `docs/decisions/0006-distribution-packaging-layer.md`).
+pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str> {
+    match (check, family) {
+        (CheckId::Podman, PackageFamily::Dnf) => Some("podman"),
+        (CheckId::Podman, PackageFamily::Apt) => Some("podman"),
+        (CheckId::KrunRuntime, PackageFamily::Dnf) => Some("crun-krun"),
+        (CheckId::KrunRuntime, PackageFamily::Apt) => None,
+        (CheckId::HostOs, _) | (CheckId::Kvm, _) => None,
+    }
+}
+
+/// The command (program + args) that installs `package` as root on
+/// `family`. Always non-interactive on the package manager's own prompts
+/// (`-y`) -- `habitat install` already got the operator's confirmation
+/// before calling this; `sudo` still prompts for a password itself, which
+/// is why this runs through `Environment::run_command_inherited` rather
+/// than the captured `run_command`.
+pub fn install_command(family: PackageFamily, package: &str) -> (&'static str, Vec<String>) {
+    match family {
+        PackageFamily::Dnf => (
+            "sudo",
+            vec![
+                "dnf".to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                package.to_string(),
+            ],
+        ),
+        PackageFamily::Apt => (
+            "sudo",
+            vec![
+                "apt-get".to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                package.to_string(),
+            ],
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::testing::FakeEnvironment;
+
+    #[test]
+    fn detects_almalinux_as_dnf_family() {
+        let env = FakeEnvironment::linux().with_file(
+            "/etc/os-release",
+            "NAME=\"AlmaLinux\"\nID=\"almalinux\"\nID_LIKE=\"rhel centos fedora\"\n",
+        );
+        assert_eq!(detect_package_family(&env), Some(PackageFamily::Dnf));
+    }
+
+    #[test]
+    fn detects_fedora_as_dnf_family() {
+        let env = FakeEnvironment::linux().with_file("/etc/os-release", "NAME=Fedora\nID=fedora\n");
+        assert_eq!(detect_package_family(&env), Some(PackageFamily::Dnf));
+    }
+
+    #[test]
+    fn detects_ubuntu_as_apt_family() {
+        let env = FakeEnvironment::linux().with_file(
+            "/etc/os-release",
+            "NAME=\"Ubuntu\"\nID=ubuntu\nID_LIKE=debian\n",
+        );
+        assert_eq!(detect_package_family(&env), Some(PackageFamily::Apt));
+    }
+
+    #[test]
+    fn detects_debian_as_apt_family() {
+        let env = FakeEnvironment::linux().with_file("/etc/os-release", "ID=debian\n");
+        assert_eq!(detect_package_family(&env), Some(PackageFamily::Apt));
+    }
+
+    #[test]
+    fn unrecognized_distro_returns_none_not_a_guess() {
+        let env =
+            FakeEnvironment::linux().with_file("/etc/os-release", "NAME=\"Arch Linux\"\nID=arch\n");
+        assert_eq!(detect_package_family(&env), None);
+    }
+
+    #[test]
+    fn missing_os_release_returns_none() {
+        let env = FakeEnvironment::linux();
+        assert_eq!(detect_package_family(&env), None);
+    }
+
+    #[test]
+    fn krun_runtime_has_no_apt_package_yet() {
+        assert_eq!(package_for(CheckId::KrunRuntime, PackageFamily::Apt), None);
+        assert_eq!(
+            package_for(CheckId::KrunRuntime, PackageFamily::Dnf),
+            Some("crun-krun")
+        );
+    }
+
+    #[test]
+    fn host_os_and_kvm_have_no_package_fix_on_any_family() {
+        for family in [PackageFamily::Dnf, PackageFamily::Apt] {
+            assert_eq!(package_for(CheckId::HostOs, family), None);
+            assert_eq!(package_for(CheckId::Kvm, family), None);
+        }
+    }
+}

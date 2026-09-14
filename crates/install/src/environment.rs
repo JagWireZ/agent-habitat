@@ -2,6 +2,13 @@
 //! check in `checks.rs` can be exercised in a unit test against a fake
 //! machine state (no KVM, a broken podman/krun install, a non-Linux OS)
 //! without needing that hardware/software actually present in CI.
+//!
+//! Every method the checks themselves use (`os_family`, `path_exists`,
+//! `can_open_read_write`, `read_to_string`, `run_command`) is read-only --
+//! that's what lets `run_install_checks`/`run_preflight` promise they
+//! never mutate the host. `run_command_inherited` is the one exception:
+//! it exists solely for `installer.rs`'s explicit, opt-in auto-install
+//! step, which no check calls.
 
 use std::io;
 use std::path::Path;
@@ -31,6 +38,17 @@ pub trait Environment {
     /// found on `PATH`); a nonzero exit is still `Ok(Output)` with
     /// `status.success() == false`, which callers must check.
     fn run_command(&self, program: &str, args: &[&str]) -> io::Result<Output>;
+
+    /// Run an external command with the child's stdin/stdout/stderr
+    /// inherited from this process, rather than captured -- used only by
+    /// `habitat install`'s explicit, opt-in auto-install step
+    /// (`installer.rs`), never by the read-only checks in `checks.rs`.
+    /// A package-manager install run as `sudo` needs the operator to see
+    /// (and, for the password prompt, respond to) its live output; a
+    /// captured/silent transcript would hide that. Returns `Ok(true)` on
+    /// a zero exit, `Ok(false)` on non-zero, `Err` only if the program
+    /// itself couldn't be started.
+    fn run_command_inherited(&self, program: &str, args: &[&str]) -> io::Result<bool>;
 }
 
 /// The real, unmocked view of the current machine.
@@ -60,6 +78,13 @@ impl Environment for SystemEnvironment {
     fn run_command(&self, program: &str, args: &[&str]) -> io::Result<Output> {
         std::process::Command::new(program).args(args).output()
     }
+
+    fn run_command_inherited(&self, program: &str, args: &[&str]) -> io::Result<bool> {
+        std::process::Command::new(program)
+            .args(args)
+            .status()
+            .map(|status| status.success())
+    }
 }
 
 pub mod testing {
@@ -86,6 +111,16 @@ pub mod testing {
         pub file_contents: HashMap<String, String>,
         /// Canned command results, keyed by `"program arg1 arg2"`.
         pub command_results: HashMap<String, FakeCommandResult>,
+        /// Canned success/failure for `run_command_inherited`, keyed the
+        /// same way as `command_results`. Separate map because the two
+        /// methods serve different callers (probes vs. the auto-install
+        /// step) and a test should be able to configure one without
+        /// implying anything about the other.
+        pub inherited_command_results: HashMap<String, bool>,
+        /// Every invocation passed to `run_command_inherited`, in order --
+        /// lets a test assert the auto-install step actually ran (or
+        /// didn't run) the commands it claims to.
+        pub inherited_invocations: std::cell::RefCell<Vec<String>>,
     }
 
     #[derive(Clone)]
@@ -145,6 +180,18 @@ pub mod testing {
             self
         }
 
+        pub fn with_inherited_command_ok(mut self, invocation: &str) -> Self {
+            self.inherited_command_results
+                .insert(invocation.to_string(), true);
+            self
+        }
+
+        pub fn with_inherited_command_failure(mut self, invocation: &str) -> Self {
+            self.inherited_command_results
+                .insert(invocation.to_string(), false);
+            self
+        }
+
         fn invocation_key(program: &str, args: &[&str]) -> String {
             let mut key = program.to_string();
             for a in args {
@@ -200,6 +247,20 @@ pub mod testing {
                     format!("fake: command not configured: {key}"),
                 )),
             }
+        }
+
+        fn run_command_inherited(&self, program: &str, args: &[&str]) -> io::Result<bool> {
+            let key = Self::invocation_key(program, args);
+            self.inherited_invocations.borrow_mut().push(key.clone());
+            self.inherited_command_results
+                .get(&key)
+                .copied()
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("fake: inherited command not configured: {key}"),
+                    )
+                })
         }
     }
 }

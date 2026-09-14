@@ -6,7 +6,8 @@ current, standalone decision for its layer.
 
 - [`0001-host-os-layer.md`](0001-host-os-layer.md) -- Linux-only host with
   hardware virtualization required; sequential distro roadmap (AlmaLinux
-  -> Fedora -> Ubuntu).
+  -> Fedora -> Ubuntu); `habitat install`'s auto-install step detects the
+  dnf/apt package-manager family as a narrow, amended exception.
 - [`0002-guest-os-layer.md`](0002-guest-os-layer.md) -- guest image mirrors
   whichever platform the host roadmap currently targets; no separate
   guest-distro axis.

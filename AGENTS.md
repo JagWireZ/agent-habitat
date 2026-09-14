@@ -42,7 +42,11 @@ host-OS-detection branches, nested-VM workarounds, or "best effort" paths
 for macOS/Windows, or for any other Linux distro family (Arch, openSUSE,
 etc.), or for Fedora/Ubuntu ahead of their own roadmap stage,
 preemptively. macOS/Windows host support is future work, not yet
-designed -- see Section 5.
+designed -- see Section 5. The one carved-out exception is `habitat
+install`'s optional auto-install step, which detects the host's
+package-manager family (dnf vs apt) to run the right install command --
+see `docs/decisions/0001-host-os-layer.md`'s 2026-09-14 amendment; it
+does not change the sequential validation roadmap itself.
 
 **The virtualization stack is rootless Podman + the `krun` runtime
 (libkrun), not containerd + Kata Containers + Firecracker.** No daemon,

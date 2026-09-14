@@ -59,13 +59,32 @@ multiple families validated in parallel:
    than shipping in parallel with an rpm-based family.
 
 No distro-conditional code paths for Fedora or Ubuntu belong in the
-codebase before their respective roadmap stage starts.
+codebase before their respective roadmap stage starts, with one
+exception: `habitat install`'s optional auto-install step. It offers to
+run the actual package-manager install command once a check has already
+failed, rather than only printing instructions, and doing that usefully
+requires knowing which package manager it's talking to. **Amendment
+(2026-09-14):** `habitat install` detects the host's package-manager
+family (dnf/rpm -- AlmaLinux, Fedora, RHEL, Rocky, CentOS; apt/dpkg --
+Debian, Ubuntu) via `/etc/os-release` and, on confirmation, runs `sudo
+dnf install` or `sudo apt-get install` for whichever of Podman/crun-krun
+is missing. This is narrower than "Fedora/Ubuntu support": it does not
+change the sequential *validation* roadmap below -- v1 sign-off still
+runs end-to-end against AlmaLinux alone, and a package that isn't
+packaged for a family yet (`crun-krun` has no `.deb` until Ubuntu's v2
+stage -- `0006-distribution-packaging-layer.md`) is reported as
+unavailable there rather than guessed at. It only means the installer
+itself can bootstrap prerequisites on a wider set of hosts than the
+system as a whole is validated on.
 
 ## Consequences
 
 - No host-OS-detection branches, nested-VM workarounds, or "best effort"
   code paths for macOS/Windows are to be built preemptively (AGENTS.md
-  Section 1).
+  Section 1). The package-manager-family detection carved out above is
+  narrowly scoped to `habitat install`'s auto-install step and does not
+  reopen this for macOS/Windows or for other Linux families (Arch,
+  openSUSE, etc.).
 - macOS and Windows host support remains future work, explicitly not yet
   designed. Per AGENTS.md Section 4, it is deferred until the full
   sequential platform roadmap (v1 AlmaLinux, v1.1 Fedora, v2 Ubuntu) has
