@@ -16,12 +16,20 @@
 //! hardware. Confirming (and, if it differs, correcting) that annotation
 //! key is explicitly part of Phase 3's real-hardware runbook
 //! (`tests/manual/validate-vm-launch.sh`), not something to assume
-//! correct by inspection (`AGENTS.md` Section 3). The same caveat now
-//! also applies to [`guest_address`]'s `podman inspect` format string --
-//! confirmed for real on real hardware to genuinely need `podman exec`
-//! (`the handler does not support exec`), so this launcher no longer
-//! assumes that mechanism works at all (`docs/decisions/
-//! 0008-guest-exec-channel.md`).
+//! correct by inspection (`AGENTS.md` Section 3).
+//!
+//! **Guest reachability under `pasta` is by published port, not by a
+//! distinct guest IP** (`docs/decisions/0008-guest-exec-channel.md`,
+//! second correction): a real run confirmed `podman exec` doesn't work
+//! against `krun` at all, and a *second* real run confirmed the initial
+//! SSH fix's own assumption was also wrong -- `podman inspect`'s
+//! `NetworkSettings` fields (`IPAddress`, `Gateway`, everything) all come
+//! back empty for a `pasta`-backed container, because `pasta` is a
+//! user-mode translator with no Podman-tracked container-side IP for
+//! `inspect` to report in the first place. Reachability instead goes
+//! through an explicit `--publish` port (bound to `127.0.0.1` only --
+//! this exec channel must never be reachable from outside the host
+//! machine), resolved after launch via [`guest_ssh_port`].
 
 use crate::command_runner::CommandRunner;
 use crate::session::{LaunchRequest, LaunchedSession};
@@ -48,17 +56,16 @@ pub const WORKSPACE_DISK_ANNOTATION: &str = "io.habitat.vm.workspace-disk";
 /// forbids one for credentials/API keys.
 pub const AUTHORIZED_KEY_ENV: &str = "HABITAT_AUTHORIZED_KEY";
 
-/// The `podman inspect` Go-template format string this launcher uses to
-/// resolve a launched session's guest address.
-///
-/// **Real-hardware caveat, same shape as [`WORKSPACE_DISK_ANNOTATION`]:**
-/// whether this is actually the right field for a `pasta`-backed `krun`
-/// guest's reachable address is this launcher's current best
-/// understanding, not yet confirmed against real crun-krun --
-/// `tests/manual/validate-vm-launch.sh` is where that gets confirmed or
-/// corrected, the same "confirmed wrong on real hardware, then fixed"
-/// pattern Phase 1 hit with the crun-krun package/binary name split.
-const GUEST_ADDRESS_INSPECT_FORMAT: &str = "{{.NetworkSettings.IPAddress}}";
+/// The guest-side port `sshd` listens on (`guest/Containerfile`) --
+/// ordinary SSH, never chosen per session.
+const GUEST_SSH_PORT: u16 = 22;
+
+/// The host address the guest's SSH port is published to
+/// (`build_run_args`'s `--publish`). Always loopback -- this exec
+/// channel is a host<->guest control path, never something another
+/// machine on the network should be able to reach, so this is `127.0.0.1`
+/// unconditionally, never `0.0.0.0` or left to Podman's default.
+pub const GUEST_SSH_HOST: &str = "127.0.0.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchError {
@@ -129,17 +136,29 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
         ),
         "--env".to_string(),
         format!("{AUTHORIZED_KEY_ENV}={}", request.guest_ssh_public_key),
+        // Publish the guest's sshd port to an ephemeral host port,
+        // loopback-only -- the guest exec channel
+        // (docs/decisions/0008-guest-exec-channel.md). `pasta` gives no
+        // separate, `podman inspect`-visible guest IP to dial directly
+        // (confirmed on real hardware: NetworkSettings comes back empty
+        // for every field), so reachability is by published port, the
+        // same mechanism any other Podman networking mode uses for
+        // host<->container reachability. Leaving the host port
+        // unspecified (`::22`) means Podman assigns one, resolved after
+        // launch by `guest_ssh_port`.
+        "--publish".to_string(),
+        format!("{GUEST_SSH_HOST}::{GUEST_SSH_PORT}/tcp"),
         request.guest_image.clone(),
     ]);
     args
 }
 
 /// Launches one session: runs `podman run` (detached) with the argv from
-/// [`build_run_args`], resolves the guest's address ([`guest_address`]),
-/// and returns a [`LaunchedSession`] handle. Fails closed on anything but
-/// a clean, successful launch -- a non-zero exit, an unstartable `podman`
-/// binary, or a failure resolving the guest's address is `Err`, never a
-/// "probably fine" partial success.
+/// [`build_run_args`], resolves the guest's published SSH port
+/// ([`guest_ssh_port`]), and returns a [`LaunchedSession`] handle. Fails
+/// closed on anything but a clean, successful launch -- a non-zero exit,
+/// an unstartable `podman` binary, or a failure resolving the published
+/// port is `Err`, never a "probably fine" partial success.
 pub fn launch<R: CommandRunner>(
     request: &LaunchRequest,
     runner: &R,
@@ -158,53 +177,50 @@ pub fn launch<R: CommandRunner>(
         )));
     }
 
-    let guest_addr = guest_address(&request.session_id, runner)?;
+    let guest_ssh_port = guest_ssh_port(&request.session_id, runner)?;
 
     Ok(LaunchedSession {
         session_id: request.session_id.clone(),
         workspace_disk_path: request.workspace_disk_path.clone(),
-        guest_addr,
+        guest_ssh_host: GUEST_SSH_HOST.to_string(),
+        guest_ssh_port,
         guest_ssh_private_key_path: request.guest_ssh_private_key_path.clone(),
     })
 }
 
-/// Resolves a launched session's guest address via `podman inspect` --
-/// see [`GUEST_ADDRESS_INSPECT_FORMAT`]'s doc comment for the
-/// real-hardware caveat on whether this is the right field. Fails closed
-/// (never falls back to a guess like `localhost` or an empty string) if
-/// `podman inspect` fails or reports nothing -- an unreachable guest
-/// exec channel is a launch failure, not a "sync just won't work this
-/// time" degradation.
-pub fn guest_address<R: CommandRunner>(
+/// Resolves the host port a launched session's guest SSH port was
+/// published to, via `podman port <name> <container-port>/tcp`. That
+/// command's normal output shape is one line, `<host>:<port>` (e.g.
+/// `127.0.0.1:34567`) -- this takes the substring after the last `:` and
+/// parses it as a port number. Fails closed (never falls back to a guess
+/// like the container port itself, or an unparsed string) if `podman
+/// port` fails, reports nothing, or its output doesn't parse as
+/// `host:port` -- an unreachable guest exec channel is a launch failure,
+/// not a "sync just won't work this time" degradation.
+pub fn guest_ssh_port<R: CommandRunner>(
     session_id: &crate::session::SessionId,
     runner: &R,
-) -> Result<String, LaunchError> {
+) -> Result<u16, LaunchError> {
     let name = session_id.to_string();
+    let container_port = format!("{GUEST_SSH_PORT}/tcp");
     let output = runner
-        .run(
-            "podman",
-            &["inspect", "--format", GUEST_ADDRESS_INSPECT_FORMAT, &name],
-        )
-        .map_err(|e| {
-            err(format!(
-                "could not run `podman inspect` (is it on PATH?): {e}"
-            ))
-        })?;
+        .run("podman", &["port", &name, &container_port])
+        .map_err(|e| err(format!("could not run `podman port` (is it on PATH?): {e}")))?;
     if !output.status.success() {
         return Err(err(format!(
-            "`podman inspect` exited non-zero: {}",
+            "`podman port` exited non-zero: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let addr = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if addr.is_empty() {
-        return Err(err(
-            "`podman inspect` returned an empty guest address -- the pasta network setup may \
-             not have completed, or the format string doesn't match crun-krun's actual output \
-             shape (see this module's real-hardware caveat)",
-        ));
-    }
-    Ok(addr)
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let port_str = raw.rsplit(':').next().unwrap_or("");
+    port_str.parse::<u16>().map_err(|_| {
+        err(format!(
+            "`podman port` output {raw:?} did not parse as \"host:port\" -- the pasta port-\
+             publish setup may not have completed, or this command's output shape differs from \
+             what this function expects (see this module's real-hardware caveat)"
+        ))
+    })
 }
 
 /// Tears a session down: force-removes the podman container (even though
@@ -354,6 +370,16 @@ mod tests {
         );
     }
 
+    /// The guest exec channel is a host<->guest control path, never
+    /// something another machine on the network should reach -- so the
+    /// published port must always bind loopback only.
+    #[test]
+    fn build_run_args_publishes_the_ssh_port_to_loopback_only() {
+        let args = build_run_args(&sample_request());
+        let pub_idx = args.iter().position(|a| a == "--publish").unwrap();
+        assert_eq!(args[pub_idx + 1], "127.0.0.1::22/tcp");
+    }
+
     #[test]
     fn launch_fails_closed_when_podman_exits_non_zero() {
         let request = sample_request();
@@ -367,23 +393,27 @@ mod tests {
         assert!(err.message.contains("non-zero"));
     }
 
-    fn inspect_invocation(session_name: &str) -> String {
-        format!("podman inspect --format {GUEST_ADDRESS_INSPECT_FORMAT} {session_name}")
+    fn port_invocation(session_name: &str) -> String {
+        format!("podman port {session_name} {GUEST_SSH_PORT}/tcp")
     }
 
     #[test]
-    fn launch_succeeds_and_resolves_the_guest_address_when_podman_reports_success() {
+    fn launch_succeeds_and_resolves_the_guest_ssh_port_when_podman_reports_success() {
         let request = sample_request();
         let args = build_run_args(&request);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let invocation = format!("podman {}", arg_refs.join(" "));
         let runner = FakeCommandRunner::default()
             .with_ok(&invocation, "abc123containerid\n")
-            .with_ok(&inspect_invocation("habitat-test-session"), "10.0.2.5\n");
+            .with_ok(
+                &port_invocation("habitat-test-session"),
+                "127.0.0.1:34567\n",
+            );
 
         let launched = launch(&request, &runner).unwrap();
         assert_eq!(launched.session_id, request.session_id);
-        assert_eq!(launched.guest_addr, "10.0.2.5");
+        assert_eq!(launched.guest_ssh_host, GUEST_SSH_HOST);
+        assert_eq!(launched.guest_ssh_port, 34567);
         assert_eq!(
             launched.guest_ssh_private_key_path,
             request.guest_ssh_private_key_path
@@ -391,17 +421,17 @@ mod tests {
     }
 
     #[test]
-    fn launch_fails_closed_when_the_guest_address_cannot_be_resolved() {
+    fn launch_fails_closed_when_the_guest_ssh_port_cannot_be_resolved() {
         let request = sample_request();
         let args = build_run_args(&request);
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let invocation = format!("podman {}", arg_refs.join(" "));
         let runner = FakeCommandRunner::default()
             .with_ok(&invocation, "abc123containerid\n")
-            .with_ok(&inspect_invocation("habitat-test-session"), ""); // empty address
+            .with_ok(&port_invocation("habitat-test-session"), ""); // empty output
 
         let err = launch(&request, &runner).unwrap_err();
-        assert!(err.message.contains("empty guest address"));
+        assert!(err.message.contains("did not parse"));
     }
 
     #[test]
@@ -418,7 +448,8 @@ mod tests {
         crate::session::LaunchedSession {
             session_id: SessionId::from_name("habitat-teardown-session").unwrap(),
             workspace_disk_path: image_path,
-            guest_addr: "10.0.2.5".to_string(),
+            guest_ssh_host: GUEST_SSH_HOST.to_string(),
+            guest_ssh_port: 34567,
             guest_ssh_private_key_path: key_path,
         }
     }

@@ -45,8 +45,8 @@ fn resource_limits_from_config_reach_the_launch_command() {
     let runner = FakeCommandRunner::default()
         .with_ok(&invocation, "containerid123\n")
         .with_ok(
-            "podman inspect --format {{.NetworkSettings.IPAddress}} habitat-exit-gate-session",
-            "10.0.2.5\n",
+            "podman port habitat-exit-gate-session 22/tcp",
+            "127.0.0.1:34567\n",
         );
 
     let launched = launcher::launch(&request, &runner).expect("launch must succeed");
@@ -80,7 +80,8 @@ fn teardown_leaves_no_residual_disk_image_or_container() {
     let session = LaunchedSession {
         session_id: SessionId::from_name("habitat-exit-gate-teardown").unwrap(),
         workspace_disk_path: image_path.clone(),
-        guest_addr: "10.0.2.5".to_string(),
+        guest_ssh_host: "127.0.0.1".to_string(),
+        guest_ssh_port: 34567,
         guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-exit-gate-teardown-key"),
     };
     let runner = FakeCommandRunner::default().with_ok(
@@ -115,7 +116,8 @@ fn teardown_run_twice_makes_no_further_changes() {
     let session = LaunchedSession {
         session_id: SessionId::from_name("habitat-exit-gate-idempotent").unwrap(),
         workspace_disk_path: PathBuf::from("/tmp/habitat-exit-gate-idempotent-gone.img"),
-        guest_addr: "10.0.2.5".to_string(),
+        guest_ssh_host: "127.0.0.1".to_string(),
+        guest_ssh_port: 34567,
         guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-exit-gate-idempotent-gone-key"),
     };
     let runner = FakeCommandRunner::default().with_ok(

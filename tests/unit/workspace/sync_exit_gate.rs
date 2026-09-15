@@ -34,12 +34,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const GUEST_ADDR: &str = "10.0.2.5";
+const GUEST_HOST: &str = "127.0.0.1";
+const GUEST_PORT: u16 = 34567;
 const GUEST_KEY_PATH: &str = "/tmp/habitat-sync-exit-gate-key";
 
 fn guest_endpoint() -> GuestEndpoint<'static> {
     GuestEndpoint {
-        addr: GUEST_ADDR,
+        host: GUEST_HOST,
+        port: GUEST_PORT,
         private_key_path: Path::new(GUEST_KEY_PATH),
     }
 }

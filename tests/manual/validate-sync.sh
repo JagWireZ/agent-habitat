@@ -21,11 +21,14 @@
 # sync_sandbox_to_host) actually running when they're supposed to and
 # nothing running in between.
 #
-# **Guest exec channel is SSH, not `podman exec`**
-# (docs/decisions/0008-guest-exec-channel.md): a real run against
-# `validate-vm-launch.sh` confirmed `podman exec` does not work against
-# the `krun` runtime at all. This script generates its own throwaway
-# session keypair, exactly as `habitat_vm::launcher` does.
+# **Guest exec channel is SSH, not `podman exec`, reached by published
+# port, not a distinct guest IP** (docs/decisions/0008-guest-exec-channel.md):
+# a real run against `validate-vm-launch.sh` confirmed `podman exec` does
+# not work against the `krun` runtime at all, and that `pasta` gives no
+# separate, `podman inspect`-visible guest IP either -- reachability is
+# an explicitly published port on `127.0.0.1`, resolved via `podman
+# port`. This script generates its own throwaway session keypair and
+# resolves the published port, exactly as `habitat_vm::launcher` does.
 #
 # Requires: an AlmaLinux/Fedora host (dnf-family) with Podman + crun-krun
 # installed and /dev/kvm exposed -- i.e. a host that already passes
@@ -45,14 +48,13 @@ GUEST_WORKSPACE_DIR="/workspace"
 WORKSPACE_DISK="$LOG_DIR/session.img"
 ANNOTATION_KEY="io.habitat.vm.workspace-disk"
 SSH_KEY_PATH="$LOG_DIR/session-key"
+GUEST_SSH_HOST="127.0.0.1"
 
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.md"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
-
-SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes)
 
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
@@ -114,19 +116,24 @@ podman run --detach --rm --name "$SESSION_NAME" \
     --runtime krun --network pasta --dns 127.0.0.1 --cpus 2 --memory 2048m \
     --annotation "${ANNOTATION_KEY}=${WORKSPACE_DISK}" \
     --env "HABITAT_AUTHORIZED_KEY=${AUTHORIZED_KEY}" \
+    --publish "${GUEST_SSH_HOST}::22/tcp" \
     "$GUEST_IMAGE" > "$LOG_DIR/launch.log" 2>&1
 record "- Launched session $SESSION_NAME (log: $LOG_DIR/launch.log)"
 
-GUEST_ADDR="$(podman inspect --format '{{.NetworkSettings.IPAddress}}' "$SESSION_NAME" | tr -d '[:space:]')"
-record "- Guest address: $GUEST_ADDR"
+PORT_OUTPUT="$(podman port "$SESSION_NAME" 22/tcp 2>&1 || true)"
+GUEST_SSH_PORT="${PORT_OUTPUT##*:}"
+record "- \`podman port $SESSION_NAME 22/tcp\` -> \`$PORT_OUTPUT\` (port: $GUEST_SSH_PORT)"
+
+SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p "$GUEST_SSH_PORT")
+
 for _ in $(seq 1 30); do
-    if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" true 2>/dev/null; then
         break
     fi
     sleep 1
 done
 
-ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" "git init --quiet '$GUEST_WORKSPACE_DIR'" || true
+ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" "git init --quiet '$GUEST_WORKSPACE_DIR'" || true
 record "- Seeded a git repo at $GUEST_WORKSPACE_DIR inside the guest (over SSH)"
 
 # --- Step 3: baseline process inventory (idle, between syncs) -----------
@@ -143,7 +150,7 @@ say "Step 4: host->sandbox sync (one discrete invocation) then re-check"
 record ""
 record "MANUAL: run one host->sandbox sync round here (e.g. via a debug binary or"
 record "\`cargo run\` invocation that calls habitat_workspace::sync::sync_host_to_sandbox"
-record "against session $SESSION_NAME at $GUEST_ADDR using $SSH_KEY_PATH), then"
+record "against session $SESSION_NAME at $GUEST_SSH_HOST:$GUEST_SSH_PORT using $SSH_KEY_PATH), then"
 record "immediately re-run:"
 record '```'
 record "ps -eo pid,ppid,cmd --no-headers | grep -iE 'podman|habitat|ssh|scp' | grep -v \$\$"

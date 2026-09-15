@@ -108,18 +108,19 @@ pub struct LaunchRequest {
 pub struct LaunchedSession {
     pub session_id: SessionId,
     pub workspace_disk_path: PathBuf,
-    /// Address the guest is reachable at over the `passt`-provided
-    /// network, for `habitat-workspace`'s SSH-based guest exec channel
-    /// (`docs/decisions/0008-guest-exec-channel.md`). Resolved by
-    /// `launcher::guest_address` after a successful launch.
-    ///
-    /// **Real-hardware caveat**, same shape as `launcher::
-    /// WORKSPACE_DISK_ANNOTATION`: whether `podman inspect`'s reported
-    /// address is actually reachable from the host for a `pasta`-backed
-    /// `krun` guest is this field's best current understanding, not yet
-    /// confirmed -- `tests/manual/validate-vm-launch.sh` is where that
-    /// gets confirmed or corrected.
-    pub guest_addr: String,
+    /// Host address the guest's `sshd` port was published to
+    /// (`docs/decisions/0008-guest-exec-channel.md`) -- always
+    /// `launcher::GUEST_SSH_HOST` (loopback), never a value that could
+    /// make this exec channel reachable from outside the host machine.
+    pub guest_ssh_host: String,
+    /// Host port the guest's `sshd` was published to. Resolved by
+    /// `launcher::guest_ssh_port` after a successful launch --
+    /// confirmed on real hardware that `pasta` gives no separate,
+    /// `podman inspect`-visible guest IP to address directly (an earlier
+    /// version of this field was a guest IP address for exactly that
+    /// reason, before real-hardware testing showed `NetworkSettings`
+    /// comes back empty for a `pasta`-backed container).
+    pub guest_ssh_port: u16,
     /// Where this session's ephemeral private SSH key lives on the host
     /// (`habitat_vm::guest_ssh`) -- carried here so `teardown` can delete
     /// it alongside the disk image, never leaving a session's credential

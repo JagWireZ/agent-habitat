@@ -30,11 +30,13 @@
 # shows the flag or ruleset isn't doing what's documented, fix
 # network_setup.rs and re-run.
 #
-# **Guest exec channel is SSH, not `podman exec`**
-# (docs/decisions/0008-guest-exec-channel.md): `podman exec` does not
-# work against the `krun` runtime at all -- this script's connection
-# trace (Step 5) runs each check over SSH into the guest, exactly as
-# `validate-vm-launch.sh` and `validate-sync.sh` do.
+# **Guest exec channel is SSH, reached by published port, not
+# `podman exec` or a distinct guest IP** (docs/decisions/
+# 0008-guest-exec-channel.md): `podman exec` does not work against the
+# `krun` runtime at all, and `pasta` gives no separate, `podman
+# inspect`-visible guest IP either -- this script's connection trace
+# (Step 5) runs each check over SSH into the guest's published port,
+# exactly as `validate-vm-launch.sh` and `validate-sync.sh` do.
 #
 # Requires: an AlmaLinux/Fedora host (dnf-family) with Podman + crun-krun
 # + passt installed and /dev/kvm exposed -- i.e. a host that already
@@ -55,14 +57,13 @@ WORKSPACE_DISK="$LOG_DIR/session.img"
 PROXY_ADDR="127.0.0.1:8443"
 DNS_ADDR="127.0.0.1:5300"
 SSH_KEY_PATH="$LOG_DIR/session-key"
+GUEST_SSH_HOST="127.0.0.1"
 
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.md"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
-
-SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes)
 
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
@@ -145,6 +146,7 @@ PODMAN_ARGS=(
     --cpus 2 --memory 2048m
     --annotation "io.habitat.vm.workspace-disk=${WORKSPACE_DISK}"
     --env "HABITAT_AUTHORIZED_KEY=${AUTHORIZED_KEY}"
+    --publish "${GUEST_SSH_HOST}::22/tcp"
     "$GUEST_IMAGE"
 )
 
@@ -163,10 +165,14 @@ if [[ "$LAUNCH_EXIT" -ne 0 ]]; then
 fi
 record "- CONFIRMED: session launched with a pasta-backed network."
 
-GUEST_ADDR="$(podman inspect --format '{{.NetworkSettings.IPAddress}}' "$SESSION_NAME" | tr -d '[:space:]')"
-record "- Guest address: $GUEST_ADDR"
+PORT_OUTPUT="$(podman port "$SESSION_NAME" 22/tcp 2>&1 || true)"
+GUEST_SSH_PORT="${PORT_OUTPUT##*:}"
+record "- \`podman port $SESSION_NAME 22/tcp\` -> \`$PORT_OUTPUT\` (port: $GUEST_SSH_PORT)"
+
+SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p "$GUEST_SSH_PORT")
+
 for _ in $(seq 1 30); do
-    if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" true 2>/dev/null; then
         break
     fi
     sleep 1
@@ -193,7 +199,7 @@ record "0008-guest-exec-channel.md -- podman exec does not work against krun at 
 record '```'
 
 run_trace() {
-    ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" "$1" 2>&1 || echo BLOCKED
+    ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" "$1" 2>&1 || echo BLOCKED
 }
 
 record "\$ curl -sS -o /dev/null -w '%{http_code}\\n' https://pypi.org/   # allowlisted -- must succeed"

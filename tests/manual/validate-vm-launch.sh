@@ -27,6 +27,15 @@
 # throwaway session keypair and bakes the public half into the guest via
 # `--env`, exactly as `habitat_vm::launcher::build_run_args` does.
 #
+# **Guest reachability is by published port, not a distinct guest IP**
+# (second correction, same ADR): a real run of an earlier version of this
+# script confirmed `podman inspect`'s `NetworkSettings` fields (IPAddress,
+# Gateway, everything) all come back empty for a `pasta`-backed
+# container -- `pasta` is a user-mode translator with no Podman-tracked
+# container IP to report. This script instead publishes the guest's
+# sshd port to an ephemeral host port on 127.0.0.1 and resolves it via
+# `podman port`, exactly as `habitat_vm::launcher::guest_ssh_port` does.
+#
 # This script drives the launch/teardown machinery directly through
 # `podman` (the same commands `habitat-vm::launcher` builds -- see
 # crates/vm/src/launcher.rs's `build_run_args`), since Phase 7 hasn't
@@ -34,14 +43,12 @@
 # below if `launcher.rs` changes what it builds, so this script keeps
 # testing the actual command in use, not a stale copy of it.
 #
-# Also confirms/corrects launcher.rs's real-hardware caveats: the exact
+# Also confirms/corrects launcher.rs's real-hardware caveat: the exact
 # OCI annotation key crun-krun expects for the extra virtio-blk device
-# (WORKSPACE_DISK_ANNOTATION), and the `podman inspect` format string
-# used to resolve the guest's address (GUEST_ADDRESS_INSPECT_FORMAT) --
-# both are best-understanding placeholders until this runbook has
-# actually been run once, the same "confirmed wrong on real hardware,
-# then fixed" pattern Phase 1 hit with the crun-krun package/binary name
-# split.
+# (WORKSPACE_DISK_ANNOTATION) is a best-understanding placeholder until
+# this runbook has actually been run once, the same "confirmed wrong on
+# real hardware, then fixed" pattern Phase 1 hit with the crun-krun
+# package/binary name split.
 #
 # Requires: an AlmaLinux/Fedora host (dnf-family) with Podman + crun-krun
 # installed and /dev/kvm exposed to the current user -- i.e. a host that
@@ -61,18 +68,13 @@ GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:alpine}"
 WORKSPACE_DISK="$LOG_DIR/session.img"
 ANNOTATION_KEY="io.habitat.vm.workspace-disk"
 SSH_KEY_PATH="$LOG_DIR/session-key"
-GUEST_ADDRESS_INSPECT_FORMAT='{{.NetworkSettings.IPAddress}}'
+GUEST_SSH_HOST="127.0.0.1"
 
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.md"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
-
-# Every SSH/SCP call to the guest in this script uses these options --
-# matches `habitat_workspace::guest_exec::ssh_option_args` exactly, so
-# this script keeps exercising the real client-side flags in use.
-SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes)
 
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
@@ -154,6 +156,13 @@ PODMAN_ARGS=(
     --cpus 2 --memory 2048m
     --annotation "${ANNOTATION_KEY}=${WORKSPACE_DISK}"
     --env "HABITAT_AUTHORIZED_KEY=${AUTHORIZED_KEY}"
+    # Guest exec channel (docs/decisions/0008-guest-exec-channel.md):
+    # publish the guest's sshd port to an ephemeral host port, loopback
+    # only -- never reachable from outside this host. `pasta` gives no
+    # separate, podman-inspect-visible guest IP to dial directly
+    # (confirmed on real hardware: NetworkSettings comes back empty for
+    # every field), so this published port is how the host reaches in.
+    --publish "${GUEST_SSH_HOST}::22/tcp"
     "$GUEST_IMAGE"
 )
 
@@ -172,52 +181,42 @@ if [[ "$LAUNCH_EXIT" -ne 0 ]]; then
 fi
 record "- CONFIRMED: session launched."
 
-# --- Step 3b: resolve the guest's address --------------------------------
-say "Step 3b: resolve the guest's address"
-# Always dump the full inspect JSON, before trying the format string --
-# so a failure here leaves something to actually diagnose from, instead
-# of just "it was empty, guess again." pasta is a fundamentally
-# different networking mode from Podman's own bridge/CNI stack, so
-# `.NetworkSettings.IPAddress` (which this constant currently guesses)
-# may simply not apply to it -- see GUEST_ADDRESS_INSPECT_FORMAT's doc
-# comment in launcher.rs for this real-hardware caveat.
-podman inspect "$SESSION_NAME" > "$LOG_DIR/inspect.json" 2>&1 || true
-GUEST_ADDR="$(podman inspect --format "$GUEST_ADDRESS_INSPECT_FORMAT" "$SESSION_NAME" 2>/dev/null | tr -d '[:space:]')"
-record "- \`podman inspect --format '$GUEST_ADDRESS_INSPECT_FORMAT' $SESSION_NAME\` -> \`$GUEST_ADDR\`"
-if [[ -z "$GUEST_ADDR" ]]; then
-    record "- Full inspect output saved to $LOG_DIR/inspect.json. NetworkSettings block:"
-    record '```'
-    if command -v jq >/dev/null 2>&1; then
-        jq '.[0].NetworkSettings' "$LOG_DIR/inspect.json" 2>&1 | tee -a "$SUMMARY"
-    else
-        NET_LINE="$(grep -n '"NetworkSettings"' "$LOG_DIR/inspect.json" || true)"
-        record "jq not available -- NetworkSettings starts around: $NET_LINE (see $LOG_DIR/inspect.json directly)"
-    fi
-    record '```'
-    record "- **FAILED**: empty guest address. Find the field/path pasta actually populates in the"
-    record "  block above, then update GUEST_ADDRESS_INSPECT_FORMAT in this script and"
-    record "  \`habitat_vm::launcher::GUEST_ADDRESS_INSPECT_FORMAT\` to match, then re-run."
+# --- Step 3b: resolve the guest's published SSH port ---------------------
+say "Step 3b: resolve the guest's published SSH port"
+PORT_OUTPUT="$(podman port "$SESSION_NAME" 22/tcp 2>&1 || true)"
+record "- \`podman port $SESSION_NAME 22/tcp\` -> \`$PORT_OUTPUT\`"
+GUEST_SSH_PORT="${PORT_OUTPUT##*:}"
+if ! [[ "$GUEST_SSH_PORT" =~ ^[0-9]+$ ]]; then
+    record "- **FAILED**: could not parse a port number from \`podman port\`'s output above."
+    record "  Find the actual shape of that output and fix this script's parsing (and"
+    record "  \`habitat_vm::launcher::guest_ssh_port\`'s parsing) to match, then re-run."
     podman rm --force --ignore "$SESSION_NAME" >/dev/null 2>&1 || true
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
+record "- Resolved guest SSH port: $GUEST_SSH_PORT"
+
+# Every SSH/SCP call to the guest in this script uses these options --
+# matches `habitat_workspace::guest_exec::ssh_option_args` exactly, so
+# this script keeps exercising the real client-side flags in use.
+SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p "$GUEST_SSH_PORT")
 
 say "Waiting for sshd to accept connections"
 SSH_READY=0
 for _ in $(seq 1 30); do
-    if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" true 2>/dev/null; then
         SSH_READY=1
         break
     fi
     sleep 1
 done
 if [[ "$SSH_READY" -ne 1 ]]; then
-    record "- **FAILED**: could not SSH into the guest at $GUEST_ADDR within 30s -- confirm guest/entrypoint.sh actually starts sshd, and that GUEST_ADDR is reachable from the host."
+    record "- **FAILED**: could not SSH into the guest at $GUEST_SSH_HOST:$GUEST_SSH_PORT within 30s -- confirm guest/entrypoint.sh actually starts sshd."
     podman rm --force --ignore "$SESSION_NAME" >/dev/null 2>&1 || true
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
-record "- CONFIRMED: SSH exec channel reachable at habitat@$GUEST_ADDR."
+record "- CONFIRMED: SSH exec channel reachable at habitat@$GUEST_SSH_HOST:$GUEST_SSH_PORT."
 
 # --- Step 4: escape attempts (the actual exit gate) ---------------------
 # Run for real, from this script, against the still-live session -- not
@@ -236,10 +235,10 @@ say "Step 4: escape attempts from inside the guest"
 HOST_MARKER="$LOG_DIR/host-marker-$$"
 HOST_TOKEN="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 echo "$HOST_TOKEN" > "$HOST_MARKER"
-GUEST_FILE_OUTPUT="$(ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" "cat '$HOST_MARKER' 2>&1 || echo BLOCKED")"
+GUEST_FILE_OUTPUT="$(ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" "cat '$HOST_MARKER' 2>&1 || echo BLOCKED")"
 record ""
 record "- Host files: wrote a random token to $HOST_MARKER on the host, then ran"
-record "  \`ssh habitat@$GUEST_ADDR cat '$HOST_MARKER'\` from the host into the guest."
+record "  \`ssh habitat@$GUEST_SSH_HOST cat '$HOST_MARKER'\` from the host into the guest."
 record "  Guest saw: \`$GUEST_FILE_OUTPUT\`"
 if [[ "$GUEST_FILE_OUTPUT" == *"$HOST_TOKEN"* ]]; then
     record "  **FAILED**: the guest read the host's own file -- a shared filesystem path exists."
@@ -252,7 +251,7 @@ rm -f "$HOST_MARKER"
 # exists in the host's process table) and confirm it's absent from what
 # the guest sees.
 HOST_PID="$$"
-GUEST_PS_OUTPUT="$(ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" 'ps aux 2>&1 || echo BLOCKED')"
+GUEST_PS_OUTPUT="$(ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" 'ps aux 2>&1 || echo BLOCKED')"
 record ""
 record "- Host processes: this script's own host PID is $HOST_PID. Guest's \`ps aux\`:"
 record '```'
@@ -268,7 +267,7 @@ fi
 # the guest's, side by side -- the guest must not show the host's actual
 # routes/interfaces.
 HOST_ROUTE_OUTPUT="$(ip route 2>&1 || echo "(ip route unavailable on host)")"
-GUEST_ROUTE_OUTPUT="$(ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" 'ip route 2>&1 || echo BLOCKED')"
+GUEST_ROUTE_OUTPUT="$(ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" 'ip route 2>&1 || echo BLOCKED')"
 record ""
 record "- Host network namespace. Host's \`ip route\`:"
 record '```'

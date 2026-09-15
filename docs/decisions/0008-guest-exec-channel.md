@@ -1,7 +1,9 @@
-# 0008. Guest exec channel: per-session SSH over the passt network, not `podman exec`
+# 0008. Guest exec channel: per-session SSH, reached by a published port, not `podman exec` or a distinct guest IP
 
 Status: accepted
 Date: 2026-09-15
+Corrected: 2026-09-15 (see "Correction" below -- the initial SSH fix's
+own addressing assumption was also wrong, confirmed by a second real run)
 
 ## Context
 
@@ -61,18 +63,23 @@ the container engine/runtime choice itself.
   Section 2 invariant 5, which is about credentials and API keys;
   an SSH public key is precisely the half of an asymmetric keypair meant
   to be exposed.
-- `habitat_vm::launcher` resolves the guest's address after launch (best
-  current understanding: `podman inspect`'s network-settings output for
-  the session; **not yet confirmed against real crun-krun/pasta output
-  shape** -- same "confirm or correct on real hardware" position as
-  `WORKSPACE_DISK_ANNOTATION`, see `tests/manual/validate-vm-launch.sh`).
+- The guest's `sshd` port is published to an ephemeral host port on
+  `127.0.0.1` (`--publish 127.0.0.1::22/tcp`), resolved after launch via
+  `podman port` (`habitat_vm::launcher::guest_ssh_port`) -- **not** by
+  addressing the guest at a distinct IP (see "Correction" below for why).
   `crates/workspace::guest_exec::GuestExecRunner` shells out to the real
-  `ssh`/`scp` binaries against that address and the session's private
-  key, replacing its previous `podman exec`/`podman cp` argv construction
-  while keeping the same `.exec()`/`.exec_with_env()`/`.copy_in()` call
-  shape `crates/workspace::sync` already uses -- this is a channel swap
-  under an unchanged sync design, not a redesign of Phase 4's sync logic
+  `ssh`/`scp` binaries against `127.0.0.1:<published-port>` and the
+  session's private key, replacing its previous `podman exec`/`podman cp`
+  argv construction while keeping the same
+  `.exec()`/`.exec_with_env()`/`.copy_in()` call shape
+  `crates/workspace::sync` already uses -- this is a channel swap under
+  an unchanged sync design, not a redesign of Phase 4's sync logic
   itself.
+- Because this port-publish exists purely for the host<->guest exec
+  channel, never for reachability from anywhere else, it is bound to
+  `127.0.0.1` unconditionally (`habitat_vm::launcher::GUEST_SSH_HOST`) --
+  never `0.0.0.0` or left to Podman's default, which on some
+  configurations would expose it to the whole LAN.
 - OpenSSH concatenates every argument after the destination into one
   string and hands it to the guest's login shell -- unlike `podman
   exec`'s pure-argv model, a value is exposed to shell interpretation on
@@ -115,3 +122,30 @@ the container engine/runtime choice itself.
   `validate-egress.sh` all update their guest-interaction steps from
   `podman exec` to SSH, since every one of them was silently relying on
   a mechanism that never worked in the first place.
+
+## Correction (2026-09-15)
+
+The Decision section originally said `habitat_vm::launcher` would
+resolve "the guest's address" via `podman inspect`'s network-settings
+output (`.NetworkSettings.IPAddress`), on the assumption that a
+`pasta`-backed container has a distinct, Podman-tracked IP the way a
+bridge-networked one does. A real run of `tests/manual/validate-vm-launch.sh`
+against that version confirmed this was wrong: `podman inspect`'s
+`NetworkSettings` block comes back with every field empty (`IPAddress`,
+`Gateway`, `MacAddress`, all of it) for a `pasta`-backed `krun` container.
+`pasta` is a user-mode network translator, not a bridge -- there is no
+separate, Podman-managed container-side address for `inspect` to report
+in the first place.
+
+The corrected mechanism (now reflected in the Decision section above):
+the guest's `sshd` port is explicitly published (`--publish
+127.0.0.1::22/tcp`) and the resulting ephemeral host port resolved via
+`podman port` -- the same reachability mechanism any other Podman
+networking mode uses for host<->container communication, rather than an
+assumption specific to `pasta`. This is a real, second instance of the
+"confirmed wrong on real hardware, then fixed" pattern this project has
+now hit three times (the `crun-krun` package/binary name in Phase 1, the
+`WORKSPACE_DISK_ANNOTATION` key still open in Phase 3, and this
+addressing assumption here) -- each time because the actual claim was
+untested against real `krun`/`pasta` behavior until a real run forced the
+issue, exactly the discipline `AGENTS.md` Section 3 asks for.

@@ -25,7 +25,8 @@ use std::process::Command;
 /// dialed; its values are placeholders, not exercised.
 fn unused_guest_endpoint() -> GuestEndpoint<'static> {
     GuestEndpoint {
-        addr: "unused",
+        host: "unused",
+        port: 0,
         private_key_path: Path::new("/unused"),
     }
 }

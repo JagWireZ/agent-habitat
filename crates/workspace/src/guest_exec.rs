@@ -1,22 +1,25 @@
 //! The seam between this crate's sync logic and an actual running guest
 //! session: every guest-side operation goes through the real `ssh`/`scp`
-//! binaries against the guest's `passt`-provided address and this
-//! session's ephemeral private key (`habitat_vm::guest_ssh`), through
-//! whatever `CommandRunner` the caller supplies -- mirroring
-//! `habitat-vm`'s own `CommandRunner` seam for the launcher rather than
-//! introducing a second shelling-out mechanism.
+//! binaries against the guest's published SSH port and this session's
+//! ephemeral private key (`habitat_vm::guest_ssh`), through whatever
+//! `CommandRunner` the caller supplies -- mirroring `habitat-vm`'s own
+//! `CommandRunner` seam for the launcher rather than introducing a
+//! second shelling-out mechanism.
 //!
 //! **This was `podman exec`/`podman cp` through Phase 4's first
 //! implementation.** A real run against a real, booted `krun` guest
 //! confirmed that does not work at all -- `podman exec` is unconditionally
 //! unsupported against the `krun` runtime (`the handler does not support
 //! exec`), a real, currently-unresolved upstream limitation, not
-//! something specific to this project's setup. See
-//! `docs/decisions/0008-guest-exec-channel.md` for the full story and why
-//! SSH, over the same `passt` network Phase 5 already requires, is the
-//! replacement. `crate::sync`'s call sites (`.exec()`, `.exec_with_env()`,
-//! `.copy_in()`) are unchanged by this -- only what happens inside this
-//! module changed.
+//! something specific to this project's setup. A *second* real run then
+//! confirmed the initial SSH-by-guest-IP fix's own assumption was also
+//! wrong: `pasta` gives no separate, `podman inspect`-visible guest IP to
+//! dial -- reachability is by an explicitly published port on
+//! `127.0.0.1` instead (`habitat_vm::launcher::guest_ssh_port`). See
+//! `docs/decisions/0008-guest-exec-channel.md` for the full story.
+//! `crate::sync`'s call sites (`.exec()`, `.exec_with_env()`,
+//! `.copy_in()`) are unchanged by either correction -- only what happens
+//! inside this module changed.
 //!
 //! Actually exercising this against a real, booted guest needs real KVM
 //! (`habitat-vm`'s own exit gate) -- so, same as before, the pure
@@ -34,13 +37,16 @@ use std::process::Output;
 /// never `root`.
 pub const GUEST_SSH_USER: &str = "habitat";
 
-/// Everything needed to reach one session's guest over SSH: its address
-/// (resolved by `habitat_vm::launcher::guest_address` -- see that
-/// function's real-hardware caveat) and the per-session ephemeral
-/// private key (`habitat_vm::guest_ssh::generate`) authorized for it.
+/// Everything needed to reach one session's guest over SSH: the host
+/// address/port its `sshd` was published to (`habitat_vm::launcher`'s
+/// `GUEST_SSH_HOST`/`guest_ssh_port` -- always loopback, see that
+/// module's real-hardware caveat on why there's no separate guest IP to
+/// address directly under `pasta`) and the per-session ephemeral private
+/// key (`habitat_vm::guest_ssh::generate`) authorized for it.
 #[derive(Debug, Clone, Copy)]
 pub struct GuestEndpoint<'a> {
-    pub addr: &'a str,
+    pub host: &'a str,
+    pub port: u16,
     pub private_key_path: &'a Path,
 }
 
@@ -53,8 +59,8 @@ pub struct GuestExecRunner<'a, R: CommandRunner> {
     endpoint: GuestEndpoint<'a>,
 }
 
-/// SSH options shared by every invocation this module makes -- exposed
-/// (not private) so external test targets (`tests/unit/workspace/`,
+/// Common `-i`/`-o` options shared by both `ssh` and `scp` invocations --
+/// exposed (not private) so external test targets (`tests/unit/workspace/`,
 /// `tests/adversarial/`) can build the exact expected invocation string
 /// for a `FakeCommandRunner` mock without hand-duplicating this flag
 /// list, the same reason `shell_quote` is public.
@@ -71,7 +77,11 @@ pub struct GuestExecRunner<'a, R: CommandRunner> {
 /// - `BatchMode=yes` -- never fall back to an interactive prompt (a
 ///   password, a passphrase, a host-key confirmation); fail closed
 ///   instead, since there is no operator present to answer one.
-pub fn ssh_option_args(endpoint: &GuestEndpoint<'_>) -> Vec<String> {
+///
+/// Does **not** include the port flag -- `ssh` and `scp` spell it
+/// differently (`-p` vs `-P`), so [`ssh_option_args`] and
+/// [`scp_option_args`] each add their own.
+fn common_option_args(endpoint: &GuestEndpoint<'_>) -> Vec<String> {
     vec![
         "-i".to_string(),
         endpoint.private_key_path.display().to_string(),
@@ -84,6 +94,23 @@ pub fn ssh_option_args(endpoint: &GuestEndpoint<'_>) -> Vec<String> {
         "-o".to_string(),
         "BatchMode=yes".to_string(),
     ]
+}
+
+/// Full option set for an `ssh` invocation, including `-p <port>`.
+pub fn ssh_option_args(endpoint: &GuestEndpoint<'_>) -> Vec<String> {
+    let mut args = common_option_args(endpoint);
+    args.push("-p".to_string());
+    args.push(endpoint.port.to_string());
+    args
+}
+
+/// Full option set for an `scp` invocation, including `-P <port>` --
+/// `scp` uses the uppercase flag for the same thing `ssh` spells `-p`.
+pub fn scp_option_args(endpoint: &GuestEndpoint<'_>) -> Vec<String> {
+    let mut args = common_option_args(endpoint);
+    args.push("-P".to_string());
+    args.push(endpoint.port.to_string());
+    args
 }
 
 /// Shell-quotes a single token for safe inclusion in the remote command
@@ -135,7 +162,7 @@ pub fn ssh_exec_args(
     args: &[&str],
 ) -> Vec<String> {
     let mut full = ssh_option_args(endpoint);
-    full.push(format!("{GUEST_SSH_USER}@{}", endpoint.addr));
+    full.push(format!("{GUEST_SSH_USER}@{}", endpoint.host));
     full.push(build_remote_command(env, program, args));
     full
 }
@@ -165,15 +192,15 @@ impl<'a, R: CommandRunner> GuestExecRunner<'a, R> {
         self.exec_with_env(&[], program, args)
     }
 
-    /// `scp [options] <host_path> habitat@<addr>:<guest_path>` -- the
+    /// `scp [options] <host_path> habitat@<host>:<guest_path>` -- the
     /// only way a host-generated patch file reaches the guest
     /// filesystem for this sync mechanism; never a live bind-mount.
     pub fn copy_in(&self, host_path: &str, guest_path: &str) -> io::Result<Output> {
-        let mut full = ssh_option_args(&self.endpoint);
+        let mut full = scp_option_args(&self.endpoint);
         full.push(host_path.to_string());
         full.push(format!(
             "{GUEST_SSH_USER}@{}:{guest_path}",
-            self.endpoint.addr
+            self.endpoint.host
         ));
         let arg_refs: Vec<&str> = full.iter().map(String::as_str).collect();
         self.inner.run("scp", &arg_refs)
@@ -188,7 +215,8 @@ mod tests {
 
     fn endpoint(key_path: &Path) -> GuestEndpoint<'_> {
         GuestEndpoint {
-            addr: "10.0.2.5",
+            host: "127.0.0.1",
+            port: 34567,
             private_key_path: key_path,
         }
     }
@@ -207,8 +235,8 @@ mod tests {
         let runner = FakeCommandRunner::default().with_ok(
             &format!(
                 "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o \
-                 UserKnownHostsFile=/dev/null -o BatchMode=yes habitat@10.0.2.5 'git' '-C' \
-                 '/workspace' 'status' '--porcelain'",
+                 UserKnownHostsFile=/dev/null -o BatchMode=yes -p 34567 habitat@127.0.0.1 'git' \
+                 '-C' '/workspace' 'status' '--porcelain'",
                 key_path.display()
             ),
             "",
@@ -226,7 +254,7 @@ mod tests {
         let runner = FakeCommandRunner::default().with_ok(
             &format!(
                 "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o \
-                 UserKnownHostsFile=/dev/null -o BatchMode=yes habitat@10.0.2.5 \
+                 UserKnownHostsFile=/dev/null -o BatchMode=yes -p 34567 habitat@127.0.0.1 \
                  GIT_AUTHOR_NAME='Agent Habitat' 'git' 'commit'",
                 key_path.display()
             ),
@@ -262,8 +290,8 @@ mod tests {
         let runner = FakeCommandRunner::default().with_ok(
             &format!(
                 "scp -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o \
-                 UserKnownHostsFile=/dev/null -o BatchMode=yes /tmp/x.patch \
-                 habitat@10.0.2.5:/tmp/x.patch",
+                 UserKnownHostsFile=/dev/null -o BatchMode=yes -P 34567 /tmp/x.patch \
+                 habitat@127.0.0.1:/tmp/x.patch",
                 key_path.display()
             ),
             "",

@@ -159,3 +159,26 @@ fn launch_command_never_leaks_a_private_key_shaped_value_into_the_env() {
         "no private-key-shaped value may ever appear in the launch argv: {args:?}"
     );
 }
+
+/// `docs/decisions/0008-guest-exec-channel.md`: the guest's SSH port is
+/// published for host<->guest exec, never for reachability from anywhere
+/// else -- the bind address must always be loopback, never `0.0.0.0` or
+/// left unspecified (which some Podman defaults would expose to every
+/// interface on the host, including the LAN).
+#[test]
+fn launch_command_publishes_the_ssh_port_to_loopback_only_never_all_interfaces() {
+    let args = build_run_args(&sample_request());
+    let pub_idx = args
+        .iter()
+        .position(|a| a == "--publish")
+        .expect("--publish must be explicitly set for the guest exec channel");
+    let mapping = &args[pub_idx + 1];
+    assert!(
+        mapping.starts_with("127.0.0.1:"),
+        "the SSH port publish must bind loopback only, got {mapping:?}"
+    );
+    assert!(
+        !mapping.starts_with("0.0.0.0") && !mapping.starts_with(':'),
+        "the SSH port publish must never bind all interfaces or Podman's unspecified default: {mapping:?}"
+    );
+}
