@@ -174,10 +174,29 @@ record "- CONFIRMED: session launched."
 
 # --- Step 3b: resolve the guest's address --------------------------------
 say "Step 3b: resolve the guest's address"
-GUEST_ADDR="$(podman inspect --format "$GUEST_ADDRESS_INSPECT_FORMAT" "$SESSION_NAME" | tr -d '[:space:]')"
+# Always dump the full inspect JSON, before trying the format string --
+# so a failure here leaves something to actually diagnose from, instead
+# of just "it was empty, guess again." pasta is a fundamentally
+# different networking mode from Podman's own bridge/CNI stack, so
+# `.NetworkSettings.IPAddress` (which this constant currently guesses)
+# may simply not apply to it -- see GUEST_ADDRESS_INSPECT_FORMAT's doc
+# comment in launcher.rs for this real-hardware caveat.
+podman inspect "$SESSION_NAME" > "$LOG_DIR/inspect.json" 2>&1 || true
+GUEST_ADDR="$(podman inspect --format "$GUEST_ADDRESS_INSPECT_FORMAT" "$SESSION_NAME" 2>/dev/null | tr -d '[:space:]')"
 record "- \`podman inspect --format '$GUEST_ADDRESS_INSPECT_FORMAT' $SESSION_NAME\` -> \`$GUEST_ADDR\`"
 if [[ -z "$GUEST_ADDR" ]]; then
-    record "- **FAILED**: empty guest address -- GUEST_ADDRESS_INSPECT_FORMAT in this script (and \`habitat_vm::launcher::GUEST_ADDRESS_INSPECT_FORMAT\`) needs correcting to whatever crun-krun/pasta actually reports, then re-run this script."
+    record "- Full inspect output saved to $LOG_DIR/inspect.json. NetworkSettings block:"
+    record '```'
+    if command -v jq >/dev/null 2>&1; then
+        jq '.[0].NetworkSettings' "$LOG_DIR/inspect.json" 2>&1 | tee -a "$SUMMARY"
+    else
+        NET_LINE="$(grep -n '"NetworkSettings"' "$LOG_DIR/inspect.json" || true)"
+        record "jq not available -- NetworkSettings starts around: $NET_LINE (see $LOG_DIR/inspect.json directly)"
+    fi
+    record '```'
+    record "- **FAILED**: empty guest address. Find the field/path pasta actually populates in the"
+    record "  block above, then update GUEST_ADDRESS_INSPECT_FORMAT in this script and"
+    record "  \`habitat_vm::launcher::GUEST_ADDRESS_INSPECT_FORMAT\` to match, then re-run."
     podman rm --force --ignore "$SESSION_NAME" >/dev/null 2>&1 || true
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
