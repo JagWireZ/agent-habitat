@@ -89,6 +89,20 @@ record "- /dev/kvm: present"
 record "- podman: $(podman --version)"
 record "- krun: $(krun --version 2>&1 || echo 'present (no --version output)')"
 
+# --- Step 1b: ensure the guest image actually exists locally -----------
+say "Step 1b: guest image"
+if ! podman image exists "$GUEST_IMAGE"; then
+    if [[ "$GUEST_IMAGE" == "localhost/habitat-guest:alpine" ]]; then
+        record "- $GUEST_IMAGE not found locally -- building it via guest/build.sh"
+        "$REPO_ROOT/guest/build.sh"
+    else
+        fail "$GUEST_IMAGE (from \$HABITAT_GUEST_IMAGE) not found locally, and it isn't the default this script knows how to build. Build or pull it yourself first."
+        record "- **ABORTED**: $GUEST_IMAGE not present and not buildable by this script."
+        exit 1
+    fi
+fi
+record "- guest image present: $GUEST_IMAGE"
+
 # --- Step 2: build a session disk image to launch against ---------------
 say "Step 2: build a disposable session disk"
 dd if=/dev/zero of="$WORKSPACE_DISK" bs=1M count=64 status=none
@@ -98,7 +112,16 @@ record "- Built a 64MB throwaway workspace disk at $WORKSPACE_DISK"
 PODMAN_ARGS=(
     run --detach --rm --name "$SESSION_NAME"
     --runtime krun
-    --network none
+    # Matches habitat_vm::launcher's current build_run_args (Phase 5):
+    # a pasta-backed network with DNS pinned to a proxy address, never
+    # the Phase 3 `--network none` placeholder or libkrun's default TSI
+    # mode. No real proxy is actually running for this script's own
+    # purpose (a containment escape attempt, not an egress trace --
+    # that's tests/manual/validate-egress.sh's job), so this address is
+    # a placeholder the guest's DNS won't actually be able to reach; that
+    # doesn't affect this script's own checks.
+    --network pasta
+    --dns 127.0.0.1
     --cpus 2 --memory 2048m
     --annotation "${ANNOTATION_KEY}=${WORKSPACE_DISK}"
     "$GUEST_IMAGE"

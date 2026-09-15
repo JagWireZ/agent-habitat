@@ -92,6 +92,18 @@ record "- podman: $(podman --version)"
 record "- passt: $(passt --version 2>&1 | head -1 || echo 'present (no --version output)')"
 record "- nft: $(nft --version)"
 
+if ! podman image exists "$GUEST_IMAGE"; then
+    if [[ "$GUEST_IMAGE" == "localhost/habitat-guest:alpine" ]]; then
+        record "- $GUEST_IMAGE not found locally -- building it via guest/build.sh"
+        "$REPO_ROOT/guest/build.sh"
+    else
+        fail "$GUEST_IMAGE (from \$HABITAT_GUEST_IMAGE) not found locally, and it isn't the default this script knows how to build. Build or pull it yourself first."
+        record "- **ABORTED**: $GUEST_IMAGE not present and not buildable by this script."
+        exit 1
+    fi
+fi
+record "- guest image present: $GUEST_IMAGE"
+
 # --- Step 2: start the local proxy and DNS forwarder on the host --------
 say "Step 2: start the local egress proxy and DNS forwarder"
 record "MANUAL: start \`habitat-egress\`'s proxy (crates/egress::proxy::run) bound to $PROXY_ADDR"

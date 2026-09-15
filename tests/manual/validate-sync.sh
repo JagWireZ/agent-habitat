@@ -78,6 +78,18 @@ fi
 record "- /dev/kvm: present"
 record "- podman: $(podman --version)"
 
+if ! podman image exists "$GUEST_IMAGE"; then
+    if [[ "$GUEST_IMAGE" == "localhost/habitat-guest:alpine" ]]; then
+        record "- $GUEST_IMAGE not found locally -- building it via guest/build.sh"
+        "$REPO_ROOT/guest/build.sh"
+    else
+        fail "$GUEST_IMAGE (from \$HABITAT_GUEST_IMAGE) not found locally, and it isn't the default this script knows how to build. Build or pull it yourself first."
+        record "- **ABORTED**: $GUEST_IMAGE not present and not buildable by this script."
+        exit 1
+    fi
+fi
+record "- guest image present: $GUEST_IMAGE"
+
 # --- Step 2: launch a real session --------------------------------------
 say "Step 2: launch a real session to sync against"
 dd if=/dev/zero of="$WORKSPACE_DISK" bs=1M count=64 status=none

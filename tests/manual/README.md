@@ -7,6 +7,15 @@ virtualization exposed) plus `sudo` and, for their negative cases,
 someone's explicit decision to temporarily break something on that
 machine.
 
+**Prerequisite for `validate-vm-launch.sh`, `validate-sync.sh`, and
+`validate-egress.sh`:** the guest image (`guest/Containerfile`) must
+already be built and tagged as `localhost/habitat-guest:alpine` --
+`guest/build.sh` does that, and each of these three scripts now runs it
+automatically the first time if the image isn't found locally. Without
+it, `podman run` fails trying to pull a nonexistent `localhost` image
+from a registry rather than finding a launch-flag problem; see
+`guest/README.md`.
+
 This sits alongside `tests/unit/<domain>/`, `tests/integration/`, and
 `tests/adversarial/` (see `file-structure.md`) rather than inside any of
 them: those three are all automated, in-process test suites that mirror

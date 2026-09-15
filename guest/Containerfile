@@ -1,0 +1,42 @@
+# guest/Containerfile -- Agent Habitat's guest image.
+#
+# Fixed to Alpine, independent of the host roadmap
+# (docs/decisions/0002-guest-os-layer.md, corrected 2026-09-15). This is
+# the image `crates/vm::launcher` boots as `localhost/habitat-guest:alpine`
+# via crun-krun -- nothing in `habitat run`'s own path builds it
+# automatically yet (Phase 7 territory), so it must be built once with
+# `guest/build.sh` before any launch (real or via a `tests/manual/`
+# runbook) can succeed.
+#
+# Deliberately minimal (ADR 0002's "little for an attacker to work with
+# even if something went wrong inside it"): only `git` is installed
+# beyond the base image, because that is the only guest-side binary the
+# two-point sync mechanism actually invokes via `podman exec`
+# (`crates/workspace/src/{sync,guest_exec}.rs`) -- `rm` and `sh` are
+# already provided by Alpine's built-in BusyBox. Add a package here only
+# when a concrete phase's guest-exec call actually needs it; this is not
+# a place for speculative "might be useful later" tooling
+# (AGENTS.md Section 4 -- deferred items are noted, not built ahead).
+#
+# Pin the Alpine version explicitly and bump it deliberately -- never
+# `alpine:latest`, so a build today and a build in six months produce
+# the same guest rather than whatever "latest" happened to resolve to.
+ARG ALPINE_VERSION=3.20
+FROM alpine:${ALPINE_VERSION}
+
+RUN apk add --no-cache git
+
+# No entrypoint of substance: every guest-side action in this project
+# goes through `podman exec` against an already-running container
+# (`crates/workspace::guest_exec`), never through whatever this image
+# itself would run on start. `sleep infinity` is this image's only job --
+# stay up between launch and the first `podman exec`.
+#
+# **Real-hardware caveat**, same shape as `launcher.rs`'s
+# `WORKSPACE_DISK_ANNOTATION`: whether a plain `CMD` like this is the
+# right way to keep a crun-krun/libkrun-booted guest alive for `podman
+# exec` to reach (as opposed to needing an explicit init process) is this
+# file's best current understanding, not yet confirmed against real
+# crun-krun -- `tests/manual/validate-vm-launch.sh` is where that gets
+# confirmed or corrected.
+CMD ["sleep", "infinity"]

@@ -21,6 +21,12 @@ implements, and `docs/plan.md` for what each domain is responsible for.
 |-- policy/                 # shared policy DATA: default blocklist, default egress allowlist,
 |                            # resource-limit defaults. Read by both crates/workspace and
 |                            # crates/egress via crates/policy -- never duplicated per-domain.
+|-- guest/                  # the guest image: Containerfile + build.sh, producing
+|                            # localhost/habitat-guest:alpine (docs/decisions/
+|                            # 0002-guest-os-layer.md). Not owned by any one crate --
+|                            # habitat-vm launches against it, but building it is a
+|                            # standalone concern of its own, same reasoning as policy/
+|                            # sitting outside crates/ despite crates/policy owning its schema.
 |-- docs/
 |   |-- plan.md             # product source of truth (existing)
 |   |-- diagrams/           # existing
