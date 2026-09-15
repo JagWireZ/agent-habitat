@@ -48,8 +48,9 @@ checks.
 - A release/packaging pipeline (building and publishing binaries or
   `.rpm` packages for v1/v1.1, later `.deb` packages for v2, on tagged
   releases) becomes a required piece of project infrastructure that does
-  not yet exist and needs its own design -- tracked as deferred work per
-  AGENTS.md Section 4 until a phase takes it up.
+  not yet exist and needs its own design -- tracked as Phase 9 in
+  `tmp/wip/implementation-plan.md`, sequenced after the Phase 8 validation
+  gate rather than folded into it.
 - Contributor-facing build instructions (rustc/cargo version, `cargo build
   --release`) belong in repo documentation for people working on `habitat`
   itself, not in any operator-facing preflight or install-checklist
