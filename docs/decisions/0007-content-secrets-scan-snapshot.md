@@ -67,7 +67,23 @@ call.
 
 - Phase 2's one-shot pipeline already satisfies point 1 in full: nothing
   further is needed there.
-- Phase 4, when built, must specifically:
+- **Implementation note (2026-09-15):** Phase 4 has landed
+  (`crates/workspace/src/sync.rs`) and implements all four bullets below
+  in full -- `sync::non_structural_gate` detects a `betterleaks.toml`-
+  touching patch by basename via `patch::touches_content_ruleset_file`
+  and routes it to `FlagReason::ContentRulesetMidSessionEdit`
+  unconditionally (before the structural check even runs);
+  `sync::emit_flagged` always emits `EventKind::SyncFlagged` and
+  `EventKind::ContentRulesetMidSessionEdit` together, never one instead
+  of the other; and `content_ruleset_path` (`pipeline::BuildRequest`) is
+  never written to anywhere in `sync.rs`, so a flagged edit cannot update
+  the governing snapshot even as a side effect. Pinned by
+  `tests/adversarial/sync_patch_validation.rs::host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_event`.
+  Applied symmetrically to the host->sandbox direction too, since a
+  ruleset edit is boundary-relevant regardless of which side it
+  originates from, even though this ADR's own scope was the
+  sandbox->host case.
+- Phase 4's original description, kept for history:
   - Detect when an incoming sandbox->host patch touches `betterleaks.toml`
     (by path, not by content-diffing -- the file's mere presence in the
     patch is what matters here, regardless of what changed).

@@ -29,3 +29,14 @@ manager, a real `sudo` prompt).
   confirmation (or correction) point for `launcher.rs`'s
   `WORKSPACE_DISK_ANNOTATION` real-hardware caveat. Reused, not
   duplicated, at Phase 8's validation run-book.
+
+- `validate-sync.sh` -- Phase 4's real-hardware exit gate: the one part
+  of the two-point sync mechanism (`habitat_workspace::sync`) that needs
+  a real, booted guest -- a live-session process inventory confirming no
+  continuous/background sync daemon exists beyond the two discrete
+  invocations (`sync_host_to_sandbox`/`sync_sandbox_to_host`). Everything
+  else in that phase's exit gate (malformed-patch handling, the
+  blocklist re-check, the no-op short-circuit, sync perf against real
+  fixtures) is covered by `tests/unit/workspace/sync_exit_gate.rs` and
+  `tests/adversarial/sync_patch_validation.rs` instead. Reused, not
+  duplicated, at Phase 8's validation run-book.

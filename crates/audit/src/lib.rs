@@ -50,13 +50,27 @@ pub enum EventKind {
     /// distinct from any other file's edit, not silently merged into a
     /// weaker snapshot.
     ///
-    /// **Not yet emitted anywhere**: this variant exists so the vocabulary
-    /// is in place, but nothing calls it yet -- the two-point sync/patch-
-    /// validation mechanism it depends on (`docs/plan.md` Section 2.2,
-    /// Phase 4 of `tmp/wip/implementation-plan.md`) isn't built. See
-    /// `docs/decisions/0007-content-secrets-scan-snapshot.md` for the
-    /// design note covering what emits this once Phase 4 lands.
+    /// Emitted by `habitat_workspace::sync` (Phase 4) whenever a sync
+    /// patch, in either direction, touches a project's `betterleaks.toml`
+    /// -- see `docs/decisions/0007-content-secrets-scan-snapshot.md`.
+    /// Always emitted *in addition to*, never instead of, whichever of
+    /// `SyncApplied`/`SyncFlagged` below the same sync round also
+    /// produces (a `betterleaks.toml`-touching patch always resolves to
+    /// `SyncFlagged`, per that ADR, but the two events answer different
+    /// questions: "was this patch applied" vs. "did this patch touch the
+    /// file governing content scanning").
     ContentRulesetMidSessionEdit,
+    /// A host<->sandbox sync patch (Phase 4, `habitat_workspace::sync`)
+    /// validated cleanly and was applied. The minimal "ordinary sync
+    /// event" record Phase 4 needs now; Phase 6 is expected to extend
+    /// this event's fields (direction, byte size, timing) rather than
+    /// introduce a second event kind for the same thing.
+    SyncApplied,
+    /// A host<->sandbox sync patch failed validation (malformed/
+    /// corrupted, or re-introduced a blocklisted path) and was flagged
+    /// for review instead of being applied -- never silently merged,
+    /// never silently dropped (`AGENTS.md` Section 2, invariant 10).
+    SyncFlagged,
 }
 
 impl EventKind {
@@ -66,6 +80,8 @@ impl EventKind {
             EventKind::InstallFailure => "install-failure",
             EventKind::InstallAction => "install-action",
             EventKind::ContentRulesetMidSessionEdit => "content-ruleset-mid-session-edit",
+            EventKind::SyncApplied => "sync-applied",
+            EventKind::SyncFlagged => "sync-flagged",
         }
     }
 }
@@ -223,6 +239,9 @@ mod tests {
             EventKind::ContentRulesetMidSessionEdit.tag(),
             EventKind::InstallAction.tag()
         );
+        assert_eq!(EventKind::SyncApplied.tag(), "sync-applied");
+        assert_eq!(EventKind::SyncFlagged.tag(), "sync-flagged");
+        assert_ne!(EventKind::SyncApplied.tag(), EventKind::SyncFlagged.tag());
     }
 
     #[test]

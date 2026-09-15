@@ -42,5 +42,7 @@ dependencies = [
 name = "habitat-workspace"
 version = "0.1.0"
 dependencies = [
+ "habitat-audit",
  "habitat-policy",
+ "habitat-vm",
 ]

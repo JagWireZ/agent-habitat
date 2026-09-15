@@ -56,6 +56,11 @@ pub mod testing {
     #[derive(Default, Clone)]
     pub struct FakeCommandRunner {
         outcomes: HashMap<String, FakeOutcome>,
+        /// Every invocation passed to `run`, in order -- lets a test
+        /// assert exactly what was (or wasn't) actually invoked, e.g.
+        /// that a true no-op sync round never goes beyond one status
+        /// check. Mirrors `habitat-vm`'s `FakeCommandRunner`.
+        pub invocations: std::cell::RefCell<Vec<String>>,
     }
 
     impl FakeCommandRunner {
@@ -113,6 +118,7 @@ pub mod testing {
     impl CommandRunner for FakeCommandRunner {
         fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
             let key = Self::key(program, args);
+            self.invocations.borrow_mut().push(key.clone());
             match self.outcomes.get(&key) {
                 Some(outcome) => Ok(Output {
                     // Real exit codes live in bits 8-15 of the raw wait

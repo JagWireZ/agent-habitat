@@ -24,10 +24,24 @@ use std::path::Path;
 
 /// A fixed, non-identifying author/committer used for every synthetic
 /// commit -- deliberately not the real operator's name or email, so the
-/// agent's own `git log` never surfaces anything personal.
-const SYNTHETIC_AUTHOR_NAME: &str = "Agent Habitat";
-const SYNTHETIC_AUTHOR_EMAIL: &str = "sandbox@agent-habitat.invalid";
+/// agent's own `git log` never surfaces anything personal. `pub(crate)`
+/// so `crate::sync`'s host-side mirror commits (Phase 4) use the exact
+/// same identity as the initial seed, rather than a second, subtly
+/// different constant.
+pub(crate) const SYNTHETIC_AUTHOR_NAME: &str = "Agent Habitat";
+pub(crate) const SYNTHETIC_AUTHOR_EMAIL: &str = "sandbox@agent-habitat.invalid";
 const SYNTHETIC_COMMIT_MESSAGE: &str = "Initial synthetic snapshot (Agent Habitat sandbox)";
+
+/// Serializes every test (in this module or `crate::sync`) that mutates
+/// the process-global `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars via
+/// [`run_git_with_identity`] -- cargo runs a crate's tests in multiple
+/// threads of the same process by default, so two such tests running
+/// concurrently could interleave their save/restore of those vars.
+/// `pub(crate)` (rather than `#[cfg(test)]`-only) so `crate::sync`'s own
+/// tests, which call the same identity-setting machinery, share this one
+/// lock instead of racing a second one.
+#[cfg(test)]
+pub(crate) static GIT_IDENTITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitSeedError {
@@ -168,8 +182,10 @@ fn run_git<R: CommandRunner>(runner: &R, dir: &str, args: &[&str]) -> Result<(),
 /// Same as [`run_git`], but with the fixed synthetic author/committer
 /// identity set via environment variables rather than global/repo git
 /// config -- so this never reads or depends on the operator's own
-/// `~/.gitconfig`, and never mutates it either.
-fn run_git_with_identity<R: CommandRunner>(
+/// `~/.gitconfig`, and never mutates it either. `pub(crate)` so
+/// `crate::sync`'s mirror-side commits (Phase 4) reuse this exact
+/// mechanism rather than re-implementing env save/restore a second time.
+pub(crate) fn run_git_with_identity<R: CommandRunner>(
     runner: &R,
     dir: &str,
     args: &[&str],
@@ -211,7 +227,6 @@ mod tests {
     use super::*;
     use crate::command_runner::SystemCommandRunner;
     use std::fs;
-    use std::sync::Mutex;
 
     // `seed_synthetic` mutates process-global `GIT_AUTHOR_*`/
     // `GIT_COMMITTER_*` env vars (see `run_git_with_identity`), and cargo
@@ -219,7 +234,9 @@ mod tests {
     // default. Serialize every test that calls `seed_synthetic` (directly
     // or via the pipeline) so two tests' env-var save/restore can't
     // interleave -- same reasoning as `habitat-policy`'s `ENV_TEST_LOCK`.
-    static GIT_IDENTITY_ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Defined at module scope (`super::GIT_IDENTITY_ENV_LOCK`, imported
+    // via the glob above) so `crate::sync`'s own tests share this one
+    // lock too.
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

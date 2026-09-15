@@ -7,6 +7,8 @@ description = "Secrets blocklist, disk-build pipeline, and two-point host/sandbo
 
 [dependencies]
 habitat-policy = { path = "../policy" }
+habitat-vm = { path = "../vm" }
+habitat-audit = { path = "../audit" }
 
 # Exit-gate and adversarial tests live under the top-level tests/unit/
 # and tests/adversarial/ (mirroring the source tree, per
@@ -29,3 +31,11 @@ path = "../../tests/adversarial/blocklist_disk_image.rs"
 [[test]]
 name = "content_scan_ruleset_tamper"
 path = "../../tests/adversarial/content_scan_ruleset_tamper.rs"
+
+[[test]]
+name = "sync_exit_gate"
+path = "../../tests/unit/workspace/sync_exit_gate.rs"
+
+[[test]]
+name = "sync_patch_validation"
+path = "../../tests/adversarial/sync_patch_validation.rs"

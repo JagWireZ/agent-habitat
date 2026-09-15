@@ -60,9 +60,8 @@ pub struct BuildRequest<'a> {
     /// `project_config.secrets_scan.content` is enabled. This is the
     /// snapshot taken once at session start (this build), per the
     /// governance note in `docs/decisions/0007-content-secrets-scan-snapshot.md`
-    /// -- a later sync (once Phase 4 exists) must reuse this snapshot
-    /// rather than re-resolving it from a possibly-edited on-disk
-    /// `betterleaks.toml`.
+    /// -- `crate::sync` (Phase 4) reuses this snapshot rather than
+    /// re-resolving it from a possibly-edited on-disk `betterleaks.toml`.
     pub content_ruleset_path: PathBuf,
 }
 

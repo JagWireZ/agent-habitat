@@ -13,12 +13,14 @@
 //! - [`diskimage`]: assembles the staged files into the session's
 //!   disposable raw disk image (`docs/decisions/0005-storage-layer.md`).
 //!
-//! Phase 4 responsibility (not yet built):
-//! - Host->sandbox sync immediately before each prompt, sandbox->host sync
-//!   immediately after each tool call, both via the same trusted patch
-//!   mechanism, both re-checked against the blocklist on arrival
-//!   (AGENTS.md Section 2, invariants 1, 3, 10).
-//! - No live/continuous file-share process at any point.
+//! Phase 4 (done): [`sync`] implements the two-point host<->sandbox sync --
+//! host->sandbox immediately before each prompt, sandbox->host immediately
+//! after each tool call, both via the same trusted patch mechanism
+//! ([`patch`]), both re-checked against the blocklist and structurally
+//! validated on arrival (AGENTS.md Section 2, invariants 1, 3, 10). No
+//! live/continuous file-share process at any point -- every guest-side
+//! step is one discrete `podman exec`/`podman cp` invocation
+//! ([`guest_exec`]).
 //!
 //! Content-based secrets scanning (Betterleaks, alongside the filename
 //! blocklist): [`content_scan`] shells out to the `betterleaks` binary,
@@ -26,17 +28,18 @@
 //! filename blocklist already uses (before a file is ever copied into
 //! staging). [`pipeline`] resolves the effective ruleset once per build
 //! via `habitat_policy::secrets_scan`, mirroring Phase 2's blocklist
-//! wiring. **Not yet built, and explicitly out of scope here**: the
-//! Phase 4 half of this feature -- snapshotting a project's own
-//! `betterleaks.toml` once at session start and routing a later
-//! sandbox->host edit to it through the "flagged for review" patch path
-//! instead of silently updating the governing snapshot -- depends on the
-//! two-point sync mechanism above, which doesn't exist yet. See
+//! wiring. The Phase 4 half of this feature -- a sandbox->host patch
+//! touching a project's `betterleaks.toml` routed through the flagged-
+//! for-review path rather than silently updating the governing snapshot
+//! -- is implemented in [`sync`]'s validation gate; see
 //! `docs/decisions/0007-content-secrets-scan-snapshot.md`.
 
 pub mod command_runner;
 pub mod content_scan;
 pub mod diskimage;
 pub mod gitseed;
+pub mod guest_exec;
+pub mod patch;
 pub mod pipeline;
 pub mod staging;
+pub mod sync;
