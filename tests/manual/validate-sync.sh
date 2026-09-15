@@ -14,12 +14,36 @@
 # real fixtures) is covered by real, automated tests already:
 #   tests/unit/workspace/sync_exit_gate.rs
 #   tests/adversarial/sync_patch_validation.rs
-# This script's only job is the one thing those can't cover without a
-# real, booted guest: proving there is no background process bridging
-# host and sandbox, only the two discrete sync invocations
-# (habitat_workspace::sync::sync_host_to_sandbox /
-# sync_sandbox_to_host) actually running when they're supposed to and
-# nothing running in between.
+# This script's job is the things those can't cover without a real,
+# booted guest:
+#   1. Proving there is no background process bridging host and sandbox,
+#      only the two discrete sync invocations
+#      (habitat_workspace::sync::sync_host_to_sandbox /
+#      sync_sandbox_to_host) actually running when they're supposed to
+#      and nothing running in between.
+#   2. Proving *both* directions' `Applied` code path actually runs
+#      against a real guest, not just their `NoOp` branch.
+#
+# **2026-09-15 fix:** an earlier version of this script only ever wrote
+# changes on the host side (via `manual_sync_round host-to-sandbox`,
+# which stamps `hello.txt` under `project_root` on every run). Because
+# `sync_host_to_sandbox` advances the host-side mirror in lockstep with
+# the guest every time it applies a patch, the guest and the mirror
+# always agreed again immediately afterwards -- so every subsequent
+# `sandbox-to-host` round found nothing to sync and returned `NoOp`.
+# That earlier version's own code comment claimed the guest would have
+# "something real to pull back," but nothing ever actually exercised
+# `sync_sandbox_to_host`'s `Applied` branch against a real, booted guest
+# -- only `FakeCommandRunner` in the unit/adversarial suites had. This
+# version fixes that: immediately before every `sandbox-to-host` round,
+# it SSHes into the guest and writes a fresh, guest-originated file
+# directly under `/workspace` -- independent of any prior
+# `host-to-sandbox` round -- so `git status --porcelain` inside the
+# guest (what `sync_sandbox_to_host` actually keys off) always has a
+# real, uncommitted change to find. It then confirms the outcome was
+# really `Applied` (not `NoOp`/`Flagged`) and that the file actually
+# landed in the host-side project tree with the guest's own stamp in it
+# -- not just that the printed enum variant looked right.
 #
 # Steps 4-5 run for real, from this script, against the still-live
 # session -- not printed as instructions for a human to act on in a
@@ -165,12 +189,36 @@ STATE_DIR="$LOG_DIR/sync-state"
 rm -rf "$STATE_DIR"
 mkdir -p "$STATE_DIR"
 
+# Writes a fresh, guest-originated file directly under the guest's
+# workspace over SSH -- independent of any host->sandbox round, and
+# independent of `manual_sync_round` entirely. This is what gives
+# `sync_sandbox_to_host` (which keys off `git status --porcelain` run
+# *inside the guest*) a real, uncommitted change to find on every round,
+# instead of relying on a host->sandbox round having left something
+# behind (it never does -- see the header comment's 2026-09-15 fix note).
+# Echoes the stamp on stdout so the caller can verify it landed on the
+# host side after the sync claims `Applied`.
+edit_directly_in_guest() {
+    local stamp
+    stamp="$(date +%s%N)"
+    ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" \
+        "printf 'hello from the guest, sync round %s\n' '$stamp' > '$GUEST_WORKSPACE_DIR/from-guest.txt'"
+    printf '%s' "$stamp"
+}
+
 # Runs one sync round for real via the manual_sync_round example, then
 # immediately re-inventories processes and compares against the idle
 # baseline -- exactly the check an earlier version of this script left
-# for a human to do by hand in a race against teardown.
+# for a human to do by hand in a race against teardown. Also checks that
+# the sync actually produced the *expected* outcome variant (`Applied` or
+# `NoOp`) rather than just checking it ran without error -- a round that
+# silently no-ops when it was supposed to apply something is exactly the
+# kind of "looks fine by inspection" gap this runbook exists to catch.
+#
+# Sets the globals SYNC_OUTPUT (the raw `manual_sync_round` output) and
+# ROUND_OK (1 if every sub-check passed, 0 otherwise) for the caller.
 run_sync_round() {
-    local step_label="$1" direction="$2" checklist_label="$3"
+    local step_label="$1" direction="$2" checklist_label="$3" expected_outcome="$4"
     say "$step_label: $direction sync (one discrete invocation) then re-check"
     record ""
     set +e
@@ -179,21 +227,90 @@ run_sync_round() {
     SYNC_EXIT=$?
     set -e
     record "- \`manual_sync_round $direction\` (exit $SYNC_EXIT): \`$SYNC_OUTPUT\`"
+
+    ROUND_OK=1
+
+    if [[ "$SYNC_EXIT" -ne 0 ]]; then
+        record "  **FAILED**: manual_sync_round exited non-zero."
+        ROUND_OK=0
+    fi
+
+    if [[ "$SYNC_OUTPUT" == *"$expected_outcome"* ]]; then
+        record "  CONFIRMED: sync outcome was $expected_outcome, as expected."
+    else
+        record "  **FAILED**: expected a \`$expected_outcome\` outcome, got: $SYNC_OUTPUT"
+        ROUND_OK=0
+    fi
+
     AFTER="$(ps -eo pid,ppid,cmd --no-headers | grep -iE '[p]odman|[h]abitat|[s]sh|[s]cp' | grep -v "$$" || true)"
     if [[ "$AFTER" == "$(cat "$BASELINE")" ]]; then
         record "  CONFIRMED: process list after this round matches the idle baseline."
-        record "- [x] $checklist_label"
     else
         record "  **FAILED**: process list after this round differs from the idle baseline:"
         record '```'
         record "$AFTER"
         record '```'
+        ROUND_OK=0
+    fi
+
+    if [[ "$ROUND_OK" -eq 1 ]]; then
+        record "- [x] $checklist_label"
+    else
         record "- [ ] $checklist_label"
     fi
 }
 
-run_sync_round "Step 4" "host-to-sandbox" "Process list after a host->sandbox sync round matches the idle baseline"
-run_sync_round "Step 5" "sandbox-to-host" "Process list after a sandbox->host sync round matches the idle baseline"
+# Wraps run_sync_round for the sandbox->host direction: makes the real,
+# guest-originated edit first (so there is always something for this
+# direction to actually apply), then -- once `Applied` is confirmed --
+# verifies the file really landed in the host-side project tree with the
+# guest's own stamp in it, rather than trusting the printed enum alone.
+run_sandbox_to_host_round() {
+    local step_label="$1" checklist_label="$2"
+    say "$step_label: guest-side edit, then sandbox-to-host sync"
+    record ""
+    local stamp
+    stamp="$(edit_directly_in_guest)"
+    record "- Wrote $GUEST_WORKSPACE_DIR/from-guest.txt **directly inside the guest** over SSH (stamp $stamp) -- independent of any host->sandbox round, so this round has a real, guest-originated change to detect and pull back, not just the mirror already agreeing with the guest."
+
+    run_sync_round "$step_label" "sandbox-to-host" "$checklist_label" "Applied"
+
+    if [[ "$SYNC_OUTPUT" == *"Applied"* ]]; then
+        local landed="$STATE_DIR/project/from-guest.txt"
+        if [[ -f "$landed" ]] && grep -q "$stamp" "$landed"; then
+            record "  CONFIRMED: $landed exists on the host and contains the guest's stamp ($stamp)."
+            record "- [x] $checklist_label (host file content verified)"
+        else
+            record "  **FAILED**: $landed is missing or does not contain stamp $stamp after an 'Applied' outcome."
+            record "- [ ] $checklist_label (host file content verified)"
+            ROUND_OK=0
+            # Diagnostic dump -- pins down *where* the applied patch
+            # actually landed (nowhere, just the mirror, or somewhere
+            # else entirely) instead of leaving "missing" ambiguous.
+            record "  -- diagnostics --"
+            record '```'
+            record "project_root ($STATE_DIR/project):"
+            (ls -la "$STATE_DIR/project" 2>&1 || true) | tee -a "$SUMMARY"
+            record ""
+            record "mirror_dir ($STATE_DIR/mirror):"
+            (ls -la "$STATE_DIR/mirror" 2>&1 || true) | tee -a "$SUMMARY"
+            record ""
+            record "mirror_dir git log (most recent 3):"
+            (git -C "$STATE_DIR/mirror" log --oneline -3 2>&1 || true) | tee -a "$SUMMARY"
+            record ""
+            record "mirror_dir git show of the from-guest.txt blob at HEAD, if any:"
+            (git -C "$STATE_DIR/mirror" show HEAD:from-guest.txt 2>&1 || true) | tee -a "$SUMMARY"
+            record '```'
+        fi
+    fi
+}
+
+run_sync_round "Step 4" "host-to-sandbox" \
+    "Process list after a host->sandbox sync round matches the idle baseline, and the round actually applies" \
+    "Applied"
+
+run_sandbox_to_host_round "Step 5" \
+    "Process list after a sandbox->host sync round matches the idle baseline, and the round actually applies a real guest-originated change"
 
 # --- Aggregate check: several rounds back-to-back, re-inventoried after
 # each one -- the exit gate's actual claim is about the whole sequence,
@@ -202,15 +319,18 @@ say "Step 5b: aggregate check -- several rounds back-to-back"
 record ""
 AGGREGATE_OK=1
 for round in 1 2; do
-    run_sync_round "Step 5b round $round (host->sandbox)" "host-to-sandbox" "round $round host->sandbox matches baseline"
-    [[ "$AFTER" == "$(cat "$BASELINE")" ]] || AGGREGATE_OK=0
-    run_sync_round "Step 5b round $round (sandbox->host)" "sandbox-to-host" "round $round sandbox->host matches baseline"
-    [[ "$AFTER" == "$(cat "$BASELINE")" ]] || AGGREGATE_OK=0
+    run_sync_round "Step 5b round $round (host->sandbox)" "host-to-sandbox" \
+        "round $round host->sandbox matches baseline and applies" "Applied"
+    [[ "$ROUND_OK" -eq 1 ]] || AGGREGATE_OK=0
+
+    run_sandbox_to_host_round "Step 5b round $round (sandbox->host)" \
+        "round $round sandbox->host matches baseline and applies a real guest-originated change"
+    [[ "$ROUND_OK" -eq 1 ]] || AGGREGATE_OK=0
 done
 if [[ "$AGGREGATE_OK" -eq 1 ]]; then
-    record "- [x] No continuous/background sync process observed across multiple rounds"
+    record "- [x] No continuous/background sync process observed across multiple rounds, and every round produced its expected outcome"
 else
-    record "- [ ] No continuous/background sync process observed across multiple rounds"
+    record "- [ ] No continuous/background sync process observed across multiple rounds, and every round produced its expected outcome"
 fi
 
 # --- Step 6: teardown -----------------------------------------------------
