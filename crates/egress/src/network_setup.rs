@@ -25,7 +25,49 @@ use std::net::SocketAddr;
 /// reason for existing: TSI isn't visible to host-side network policy at
 /// all). Rootless Podman's `pasta` network driver is `passt`'s intended
 /// integration point for exactly this case.
+///
+/// **Do not "fix" this to `pasta:-T,all,-U,all`** -- that was tried and
+/// reverted after it broke the guest's SSH exec channel on real hardware.
+/// `-T`/`-U` are pasta's "TCP/UDP port forwarding to init namespace":
+/// *auto-publishing whatever port the guest itself is listening on* to
+/// the host, the same direction `-t`/`-u` (which Podman already drives
+/// from `--publish`) cover explicitly -- not "let the guest reach a
+/// service bound on the host's own loopback", which was the wrong
+/// direction this constant needed. Forcing `-T all -U all` makes pasta
+/// auto-forward the guest's sshd on top of Podman's own explicit `-t`
+/// forward for the same port, and the resulting duplicate/conflicting
+/// path is what reset every SSH connection.
+///
+/// The real, still-open question this leaves: how a guest under
+/// `--network pasta` reaches a service bound on the host's own loopback
+/// at all (needed for `build_network_flags`' `--dns` value and this
+/// crate's proxy to be reachable) is **not yet confirmed on real
+/// hardware** -- `tests/manual/validate-egress.sh` is where that gets
+/// resolved, not a guess baked into this constant.
 pub const NETWORK_MODE: &str = "pasta";
+
+/// The port `crate::dns`'s forwarder must be listening on, at the same
+/// IP as the proxy, for [`build_network_flags`]'s `--dns` value to
+/// actually reach it: `--dns` (like any resolver configuration a guest's
+/// libc resolver reads) carries no port, so the guest always queries
+/// port 53 -- there is no way to point it at a forwarder listening
+/// anywhere else. `crate::dns::run` takes its listen address as a plain
+/// argument rather than hardcoding this port itself, so this constant is
+/// the one place that coupling is written down; every caller (this
+/// crate's own harness included) must bind the forwarder to
+/// `(proxy_addr.ip(), DNS_LISTEN_PORT)`, not an arbitrary port, or the
+/// guest's resolver silently has nowhere to send queries at all -- which
+/// looks identical to "everything is blocked" (the exact false-positive
+/// `tests/manual/validate-egress.sh` failed on when it briefly forwarded
+/// on port 5300 instead).
+pub const DNS_LISTEN_PORT: u16 = 53;
+
+/// The address `crate::dns::run` must bind to so that a guest launched
+/// with [`build_network_flags`]'s `--dns` value can actually reach it --
+/// see [`DNS_LISTEN_PORT`] for why this can't be an arbitrary port.
+pub fn dns_listen_addr(proxy_addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(proxy_addr.ip(), DNS_LISTEN_PORT)
+}
 
 /// Builds the `podman run` flags that give the guest a `pasta`-backed
 /// network and pin its DNS resolution to the local proxy's own address
@@ -97,7 +139,13 @@ mod tests {
     fn network_flags_use_pasta_not_the_default_tsi_mode() {
         let flags = build_network_flags(proxy_addr());
         let idx = flags.iter().position(|a| a == "--network").unwrap();
-        assert_eq!(flags[idx + 1], "pasta");
+        assert_eq!(flags[idx + 1], NETWORK_MODE);
+    }
+
+    #[test]
+    fn dns_listen_addr_uses_the_proxy_ip_on_port_53() {
+        let addr = dns_listen_addr(proxy_addr());
+        assert_eq!(addr, "127.0.0.1:53".parse().unwrap());
     }
 
     #[test]

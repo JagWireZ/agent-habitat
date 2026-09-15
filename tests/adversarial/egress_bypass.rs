@@ -152,5 +152,5 @@ fn network_flags_never_select_host_networking_or_leave_it_unset() {
         .iter()
         .position(|a| a == "--network")
         .expect("--network must be explicitly set");
-    assert_eq!(flags[net_idx + 1], "pasta");
+    assert_eq!(flags[net_idx + 1], network_setup::NETWORK_MODE);
 }

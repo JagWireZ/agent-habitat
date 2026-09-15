@@ -19,24 +19,35 @@
 # change what they build, so this script keeps testing the actual
 # configuration in use, not a stale copy of it.
 #
-# Also confirms/corrects network_setup.rs's real-hardware caveats: the
-# `--network pasta` flag's actual behavior under crun-krun (rather than
-# plain crun), and whether the nftables ruleset built by
-# `build_egress_firewall_rules` is the right mechanism for restricting a
-# rootless pasta interface, are this crate's best current understanding,
-# not yet confirmed against real hardware -- same "confirmed wrong on
-# real hardware, then fixed" pattern as Phase 3's WORKSPACE_DISK_ANNOTATION
-# and Phase 1's crun-krun package/binary name split. If any step below
-# shows the flag or ruleset isn't doing what's documented, fix
-# network_setup.rs and re-run.
+# Also confirms/corrects network_setup.rs's real-hardware caveats. One
+# already went through a wrong-then-reverted cycle here: `pasta --help`
+# describes `-T`/`-U` as "TCP/UDP port forwarding to init namespace", which
+# reads like "let the guest reach the host's loopback" but is actually the
+# *other* direction -- auto-publishing whatever port the guest itself is
+# listening on, the same thing `-t`/`-u` (which Podman already drives from
+# `--publish`) cover explicitly. Forcing `--network pasta:-T,all,-U,all`
+# made pasta auto-forward the guest's own sshd on top of Podman's already-
+# explicit forward for the same port, and broke the SSH exec channel
+# outright (confirmed on real hardware, then reverted -- see
+# `network_setup::NETWORK_MODE`'s doc comment for the full trail). Whether
+# a guest under plain `--network pasta` can reach a service bound on the
+# host's own loopback at all -- which this crate's `--dns` pinning and
+# proxy reachability both assume -- is accordingly **still an open
+# question**, not a solved one; Step 3b below is where that gets checked
+# for real, not assumed from either direction. The nftables ruleset built
+# by `build_egress_firewall_rules` is similarly this crate's best current
+# understanding of how to restrict a rootless `pasta` interface, not yet
+# confirmed -- same "confirmed wrong on real hardware, then fixed" pattern
+# as Phase 3's WORKSPACE_DISK_ANNOTATION and Phase 1's crun-krun
+# package/binary name split.
 #
 # **Guest exec channel is SSH, reached by published port, not
 # `podman exec` or a distinct guest IP** (docs/decisions/
 # 0008-guest-exec-channel.md): `podman exec` does not work against the
 # `krun` runtime at all, and `pasta` gives no separate, `podman
-# inspect`-visible guest IP either -- this script's connection trace
-# (Step 5) runs each check over SSH into the guest's published port,
-# exactly as `validate-vm-launch.sh` and `validate-sync.sh` do.
+# inspect`-visible guest IP either -- this script's connection trace runs
+# each check over SSH into the guest's published port, exactly as
+# `validate-vm-launch.sh` and `validate-sync.sh` do.
 #
 # Requires: an AlmaLinux/Fedora host (dnf-family) with Podman + crun-krun
 # + passt installed and /dev/kvm exposed -- i.e. a host that already
@@ -55,15 +66,44 @@ SESSION_NAME="habitat-manual-egress-$$"
 GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:alpine}"
 WORKSPACE_DISK="$LOG_DIR/session.img"
 PROXY_ADDR="127.0.0.1:8443"
-DNS_ADDR="127.0.0.1:5300"
+# Must be the same IP as PROXY_ADDR, on port 53: podman's `--dns` flag (and
+# network_setup::build_network_flags, which this script's PODMAN_ARGS
+# mirrors) carries no port, so the guest's resolver always queries port 53
+# -- see network_setup::DNS_LISTEN_PORT's doc comment for the false-positive
+# this caused when this constant was previously 127.0.0.1:5300 (every
+# lookup, including the allowlisted one, silently had nowhere to resolve).
+DNS_ADDR="127.0.0.1:53"
+# Must match crates/egress/src/network_setup.rs's NETWORK_MODE constant --
+# duplicated here rather than shelled out to Rust to read it, same
+# "kept in sync by hand, update both if one changes" tradeoff this script
+# already makes for build_egress_firewall_rules's shape in Step 4's own
+# instructions. Do NOT "fix" this to pasta:-T,all,-U,all -- see
+# NETWORK_MODE's own doc comment for why that was tried and reverted (it
+# broke the SSH exec channel outright).
+PASTA_NETWORK_MODE="pasta"
 SSH_KEY_PATH="$LOG_DIR/session-key"
 GUEST_SSH_HOST="127.0.0.1"
+AUDIT_LOG="$LOG_DIR/audit.jsonl"
+HARNESS_LOG="$LOG_DIR/egress-harness.log"
+HARNESS_PID=""
 
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.md"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
+
+# Belt-and-braces: if any step below exits early (a failed launch, a
+# failed nft apply, Ctrl-C), the harness started in Step 2 must not be
+# left running past this script -- it's a throwaway validation process,
+# never a background service this project expects to persist.
+cleanup_harness() {
+    if [[ -n "$HARNESS_PID" ]] && kill -0 "$HARNESS_PID" 2>/dev/null; then
+        kill "$HARNESS_PID" 2>/dev/null || true
+        wait "$HARNESS_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_harness EXIT
 
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
@@ -116,15 +156,83 @@ record "- guest image present: $GUEST_IMAGE"
 
 # --- Step 2: start the local proxy and DNS forwarder on the host --------
 say "Step 2: start the local egress proxy and DNS forwarder"
-record "MANUAL: start \`habitat-egress\`'s proxy (crates/egress::proxy::run) bound to $PROXY_ADDR"
-record "with the effective allowlist for this project, and its DNS forwarder"
-record "(crates/egress::dns::run) bound to $DNS_ADDR. There is no standalone binary yet"
-record "(Phase 7 wires \`habitat run\`'s lifecycle) -- run them via a throwaway"
-record "\`cargo run --example\` or a debug harness pointed at those functions, and"
-record "record the exact invocation used here:"
+record "Building and launching \`crates/egress/examples/egress_harness.rs\` -- the real"
+record "\`crate::proxy::run\`/\`crate::dns::run\` functions this project ships, not a stand-in"
+record "(Phase 7 wires this into \`habitat run\`'s own lifecycle; until then this harness is"
+record "the exact invocation, kept in-tree so it can't drift from those functions' real"
+record "signatures):"
 record ""
-record "- [ ] Proxy started, listening on $PROXY_ADDR"
-record "- [ ] DNS forwarder started, listening on $DNS_ADDR"
+
+HARNESS_ARGS=(
+    --proxy-addr "$PROXY_ADDR"
+    --dns-addr "$DNS_ADDR"
+    --audit-log "$AUDIT_LOG"
+)
+if [[ -n "${HABITAT_PROJECT_CONFIG:-}" ]]; then
+    HARNESS_ARGS+=(--project-config "$HABITAT_PROJECT_CONFIG")
+fi
+
+# Built explicitly (rather than via `cargo run`) and launched by its own
+# binary path -- port 53 is privileged, and the fix below grants
+# CAP_NET_BIND_SERVICE on that exact binary file. `cargo run` re-execs
+# through cargo itself, which is a needless extra hop for a capability
+# that's only meaningful on the file actually calling bind(2).
+cargo build --quiet -p habitat-egress --example egress_harness
+HARNESS_BIN="$REPO_ROOT/target/debug/examples/egress_harness"
+record "\$ $HARNESS_BIN ${HARNESS_ARGS[*]}"
+
+launch_harness() {
+    : > "$HARNESS_LOG"
+    "$HARNESS_BIN" "${HARNESS_ARGS[@]}" >> "$HARNESS_LOG" 2>&1 &
+    HARNESS_PID=$!
+
+    HARNESS_READY=""
+    for _ in $(seq 1 60); do
+        if ! kill -0 "$HARNESS_PID" 2>/dev/null; then
+            break
+        fi
+        if grep -q '^READY' "$HARNESS_LOG" 2>/dev/null; then
+            HARNESS_READY=1
+            break
+        fi
+        sleep 0.5
+    done
+}
+
+launch_harness
+
+if [[ -z "$HARNESS_READY" ]] && grep -qi 'bind: permission denied' "$HARNESS_LOG" 2>/dev/null; then
+    fail "Binding on port 53 needs CAP_NET_BIND_SERVICE, which this run doesn't have."
+    if [[ -t 0 ]] && command -v setcap >/dev/null 2>&1; then
+        read -r -p "Grant it to $HARNESS_BIN via 'sudo setcap cap_net_bind_service=+ep' now? [y/N] " REPLY
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+            if sudo setcap cap_net_bind_service=+ep "$HARNESS_BIN"; then
+                record "- Granted \`cap_net_bind_service\` on $HARNESS_BIN via \`sudo setcap\` (one-time,"
+                record "  scoped to this binary file; re-run \`cargo build\` clears it)."
+                launch_harness
+            else
+                fail "setcap failed -- see above."
+            fi
+        fi
+    fi
+fi
+
+if [[ -z "$HARNESS_READY" ]]; then
+    fail "egress_harness did not report READY -- see $HARNESS_LOG"
+    cat "$HARNESS_LOG" >&2
+    record "- **ABORTED**: proxy/DNS forwarder harness failed to start (log: $HARNESS_LOG)."
+    if grep -qi 'permission denied' "$HARNESS_LOG" 2>/dev/null; then
+        record "  \`dns bind\` on port 53 needs a privilege this run doesn't have -- either"
+        record "  grant \`cap_net_bind_service\` on \`$HARNESS_BIN\` yourself"
+        record "  (\`sudo setcap cap_net_bind_service=+ep $HARNESS_BIN\`), or lower"
+        record "  \`net.ipv4.ip_unprivileged_port_start\` on this host, then re-run."
+    fi
+    exit 1
+fi
+record "\`$(grep '^READY' "$HARNESS_LOG")\`"
+record ""
+record "- [x] Proxy started, listening on $PROXY_ADDR"
+record "- [x] DNS forwarder started, listening on $DNS_ADDR"
 
 # --- Step 3: build a session disk and launch with the pasta network ------
 say "Step 3: build a disposable session disk and launch"
@@ -141,7 +249,7 @@ record "  docs/decisions/0008-guest-exec-channel.md)"
 PODMAN_ARGS=(
     run --detach --rm --name "$SESSION_NAME"
     --runtime krun
-    --network pasta
+    --network "$PASTA_NETWORK_MODE"
     --dns "${PROXY_ADDR%%:*}"
     --cpus 2 --memory 2048m
     --annotation "io.habitat.vm.workspace-disk=${WORKSPACE_DISK}"
@@ -157,9 +265,9 @@ set -e
 cat "$LOG_DIR/launch.log"
 record "- Launch exit: $LAUNCH_EXIT (log: $LOG_DIR/launch.log)"
 if [[ "$LAUNCH_EXIT" -ne 0 ]]; then
-    record "- **FAILED**: session did not launch with \`--network pasta\` -- if the log shows"
-    record "  pasta/crun-krun rejected the flag, network_setup.rs's NETWORK_MODE constant needs"
-    record "  correcting, then re-run this script."
+    record "- **FAILED**: session did not launch with \`--network $PASTA_NETWORK_MODE\` -- if the"
+    record "  log shows pasta/crun-krun rejected the flag, network_setup.rs's NETWORK_MODE"
+    record "  constant needs correcting, then re-run this script."
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
@@ -171,12 +279,70 @@ record "- \`podman port $SESSION_NAME 22/tcp\` -> \`$PORT_OUTPUT\` (port: $GUEST
 
 SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p "$GUEST_SSH_PORT")
 
+run_trace() {
+    # Each command below already carries its own in-guest timeout (curl's
+    # `-m 5` or an explicit `timeout 5` prefix), but that only bounds
+    # curl/nslookup itself -- it does nothing if the guest's TCP connect()
+    # to an unreachable-but-not-yet-firewalled address (e.g. the direct-IP
+    # bypass target, before Step 4's ruleset is applied) blocks in a way
+    # that outlasts it, or if the SSH session itself stalls. Wrap the
+    # whole thing in a host-side `timeout` too, generous enough not to cut
+    # off a real 5s in-guest timeout's own output, so no single check can
+    # ever hang this script indefinitely.
+    timeout 15 ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" "$1" 2>&1 || echo BLOCKED
+}
+
 for _ in $(seq 1 30); do
     if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" true 2>/dev/null; then
         break
     fi
     sleep 1
 done
+
+# --- Step 3b: DNS-pinning diagnostics -------------------------------------
+# Isolates *why* a lookup fails before Step 5's trace runs: is the guest's
+# resolver actually pointed at the proxy's DNS forwarder at all (resolv.conf),
+# and if so, can it actually reach it (an explicit query naming
+# $PROXY_ADDR's IP, bypassing resolv.conf entirely)? Both must hold for the
+# default-resolver lookups in Step 5 to mean anything. Confirmed on real
+# hardware NOT to work as-is under plain `--network pasta` (nor under the
+# `-T,all,-U,all` variant tried and reverted -- see NETWORK_MODE's doc
+# comment): whether a guest can reach the host's loopback under pasta at
+# all is still an open question, and this step is deliberately not
+# guessing an answer, just reporting what's actually observed.
+say "Step 3b: DNS-pinning diagnostics"
+RESOLV_CONF="$(run_trace "cat /etc/resolv.conf")"
+record "- Guest \`/etc/resolv.conf\`:"
+record '```'
+record "$RESOLV_CONF"
+record '```'
+EXPLICIT_DNS_RESULT="$(run_trace "timeout 5 nslookup pypi.org 127.0.0.1")"
+record "- \`nslookup pypi.org 127.0.0.1\` (explicit, bypassing resolv.conf -- proves whether the"
+record "  forwarder is reachable at all, independent of whether resolv.conf itself is"
+record "  correctly pinned):"
+record '```'
+record "$EXPLICIT_DNS_RESULT"
+record '```'
+DNS_OK=1
+if echo "$EXPLICIT_DNS_RESULT" | grep -qi 'BLOCKED\|refused\|timed out\|no servers'; then
+    DNS_OK=""
+    record "  -- forwarder is NOT reachable from the guest at 127.0.0.1:53 (confirmed on real"
+    record "  hardware -- this is a still-open question, not a regression to chase further from"
+    record "  this script alone). \`-T,all,-U,all\` was tried and reverted: it targets the wrong"
+    record "  direction (auto-publishing the guest's own listening ports, not guest-to-host"
+    record "  loopback) and broke the SSH exec channel instead of fixing this. Whatever the real"
+    record "  mechanism is (if one exists at all under \`--network pasta\`), it needs identifying"
+    record "  from pasta/passt's own docs or upstream, not by guessing at more CLI flags here."
+elif ! echo "$RESOLV_CONF" | grep -q '^nameserver 127\.0\.0\.1'; then
+    DNS_OK=""
+    record "  -- forwarder IS reachable, but resolv.conf isn't actually pointed at it -- \`--dns\`"
+    record "  either didn't apply under \`--network $PASTA_NETWORK_MODE\`, or something in the"
+    record "  guest (entrypoint.sh, a DHCP client) overwrote it after boot."
+fi
+if [[ -n "$DNS_OK" ]]; then
+    record "  -- forwarder reachable and resolv.conf correctly pinned; Step 5's default-resolver"
+    record "  lookups should work."
+fi
 
 # --- Step 4: apply the reachability-restricting firewall ruleset --------
 say "Step 4: restrict the guest's pasta interface to the proxy only"
@@ -189,6 +355,18 @@ record "netns) or required a privilege this project's containment model does not
 record ""
 record "- [ ] pasta interface identified: ______________________"
 record "- [ ] \`nft -f\` applied successfully, no elevated privilege required"
+record ""
+record "**Until this step is actually applied, expect every check in Step 5 to reach its"
+record "real destination, allowlisted or not**: nothing before this point makes the proxy"
+record "reachable from the guest's own outbound connections, and this ruleset's accept rule"
+record "(destination = the proxy's own address) only helps once the guest's traffic is"
+record "actually forced through it. Cross-check this against network_setup.rs's own"
+record "\`build_egress_firewall_rules\` -- as written it default-denies everything except"
+record "connections the guest itself dials *to* \`$PROXY_ADDR\`, but nothing in this repo yet"
+record "redirects a guest's ordinary outbound :443 connections there (no DNAT rule, no"
+record "in-guest proxy configuration) -- if that's still true when you read this, a"
+record "genuinely allowed destination will fail closed once Step 4 is applied, which is a"
+record "real gap in network_setup.rs to fix, not a mistake in this script."
 
 # --- Step 5: connection trace (the actual exit gate) ---------------------
 say "Step 5: connection trace from inside the guest"
@@ -197,10 +375,6 @@ record "Running each of these over SSH against the guest and recording the actua
 record "not checking a box from inspection of the ruleset alone (docs/decisions/"
 record "0008-guest-exec-channel.md -- podman exec does not work against krun at all):"
 record '```'
-
-run_trace() {
-    ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" "$1" 2>&1 || echo BLOCKED
-}
 
 record "\$ curl -sS -o /dev/null -w '%{http_code}\\n' https://pypi.org/   # allowlisted -- must succeed"
 ALLOWED_RESULT="$(run_trace "curl -sS -o /dev/null -w '%{http_code}\\n' https://pypi.org/")"
@@ -243,11 +417,16 @@ TEARDOWN_EXIT=$?
 set -e
 rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
 record "- Teardown exit: $TEARDOWN_EXIT (log: $LOG_DIR/teardown.log)"
-record "MANUAL: also stop the proxy and DNS forwarder processes started in Step 2, and"
-record "remove the nftables table applied in Step 4 (\`nft delete table inet habitat_egress\`)."
+
+cleanup_harness
+HARNESS_PID=""
+record "- [x] Proxy and DNS forwarder stopped (harness log: $HARNESS_LOG, audit log: $AUDIT_LOG)"
 record ""
-record "- [ ] Proxy and DNS forwarder stopped"
-record "- [ ] nftables ruleset removed"
+record "MANUAL: if Step 4 was actually applied (this script does not apply it itself --"
+record "see that step's own note), also remove its nftables table:"
+record "\`nft delete table inet habitat_egress\`."
+record ""
+record "- [ ] nftables ruleset removed (only applicable if Step 4 was applied)"
 
 say "Done"
 echo "Summary written to $SUMMARY -- fold the connection-trace results from Step 5 into it by hand."

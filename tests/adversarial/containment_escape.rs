@@ -17,6 +17,7 @@
 //! containment tests and Phase 5's egress-bypass tests together here and
 //! in `tests/manual/`).
 
+use habitat_egress::network_setup;
 use habitat_policy::resource_limits::ResourceLimitsConfig;
 use habitat_vm::launcher::build_run_args;
 use habitat_vm::session::{LaunchRequest, SessionId};
@@ -99,7 +100,7 @@ fn launch_command_always_uses_the_passt_backed_network_not_unset_or_tsi() {
         .iter()
         .position(|a| a == "--network")
         .expect("--network must be explicitly set, not left to podman's default");
-    assert_eq!(args[net_idx + 1], "pasta");
+    assert_eq!(args[net_idx + 1], network_setup::NETWORK_MODE);
 }
 
 /// DNS pinning (`0004`'s open item): the guest's resolver must be

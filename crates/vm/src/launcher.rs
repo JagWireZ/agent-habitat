@@ -332,7 +332,7 @@ mod tests {
         request.egress_proxy_addr = "127.0.0.1:9999".parse().unwrap();
         let args = build_run_args(&request);
         let net_idx = args.iter().position(|a| a == "--network").unwrap();
-        assert_eq!(args[net_idx + 1], "pasta");
+        assert_eq!(args[net_idx + 1], habitat_egress::network_setup::NETWORK_MODE);
         let dns_idx = args.iter().position(|a| a == "--dns").unwrap();
         assert_eq!(args[dns_idx + 1], "127.0.0.1");
     }
