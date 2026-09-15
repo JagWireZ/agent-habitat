@@ -1,156 +1,207 @@
-//! Phase 5's adversarial coverage of the egress path -- the part of "a
-//! non-allowlisted destination, an allowlist-lookalike, and a direct-IP
-//! bypass are all blocked" that can actually be checked without an
-//! actually-booted guest: that the proxy's decision logic and the
-//! network/firewall configuration this crate builds never leave a gap a
-//! crafted destination could slip through.
+//! Phase 3's adversarial coverage of the launch command itself -- the
+//! part of "a concrete escape attempt fails" that can actually be checked
+//! without real KVM: that the `podman run` argv this crate builds never
+//! requests a host-reachable path in the first place. A booted guest that
+//! never gets a bind mount, a host device, or a widened capability set
+//! has nothing to escape *through* on that particular route, regardless
+//! of what happens inside the guest -- which is exactly the part of this
+//! phase's containment story that mocked-seam tests over pure argv
+//! construction can meaningfully pin down.
 //!
 //! This deliberately does **not** claim to be the exit gate's real
-//! connection trace -- confirming the `pasta` interface and nftables
-//! ruleset actually restrict a booted guest's reachability, including
-//! that DNS can't be used to route around it, needs real KVM neither
-//! this dev container nor this project's CI has. That real trace is
-//! `tests/manual/validate-egress.sh`'s job (see `tests/manual/README.md`
-//! and `file-structure.md`, which puts Phase 3's containment tests and
-//! Phase 5's egress-bypass tests together here and in `tests/manual/`).
+//! escape-attempt test -- reaching host files, host processes, or the
+//! host network namespace from *inside* an actually-booted guest needs
+//! real KVM, which neither this dev container nor this project's CI has.
+//! That real attempt is `tests/manual/validate-vm-launch.sh`'s job (see
+//! `tests/manual/README.md` and `file-structure.md`, which puts Phase 3's
+//! containment tests and Phase 5's egress-bypass tests together here and
+//! in `tests/manual/`).
 
-use habitat_audit::MemoryAuditSink;
-use habitat_egress::dialer::testing::FakeDialer;
-use habitat_egress::sni::testing::build_client_hello;
-use habitat_egress::{network_setup, proxy};
-use habitat_policy::egress_allowlist;
-use std::io::Write;
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::thread;
+use habitat_egress::network_setup;
+use habitat_policy::resource_limits::ResourceLimitsConfig;
+use habitat_vm::launcher::build_run_args;
+use habitat_vm::session::{LaunchRequest, SessionId};
+use std::path::PathBuf;
 
-fn connect_and_send(addr: SocketAddr, bytes: &[u8]) -> TcpStream {
-    let mut guest = TcpStream::connect(addr).unwrap();
-    guest.write_all(bytes).unwrap();
-    guest.shutdown(Shutdown::Write).unwrap();
-    guest
-}
-
-fn deny_check(sni_host: &str, entries: &[String]) -> proxy::ConnectionOutcome {
-    let dialer = FakeDialer::default(); // no routes -- any dial attempt is itself a failure
-    let audit = MemoryAuditSink::default();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let hello = build_client_hello(sni_host);
-    thread::spawn(move || {
-        connect_and_send(addr, &hello);
-    });
-    let (client, _) = listener.accept().unwrap();
-    let outcome = proxy::handle_connection(client, entries, &dialer, &audit).unwrap();
-    assert!(
-        dialer.attempts.borrow().is_empty(),
-        "a denied SNI host must never trigger an outbound dial: {sni_host:?}"
-    );
-    outcome
-}
-
-/// A crafted hostname built specifically to look like it should match a
-/// wildcard default-allowlist entry (`*.githubusercontent.com`) without
-/// actually being a subdomain of it -- the classic "suffix, not
-/// subdomain" confusion attack.
-#[test]
-fn a_wildcard_lookalike_hostname_is_denied_against_the_real_default_allowlist() {
-    let entries = egress_allowlist::default_entries();
-    for lookalike in [
-        "githubusercontent.com.attacker.example",
-        "evilgithubusercontent.com",
-        "notgithubusercontent.com",
-    ] {
-        let outcome = deny_check(lookalike, &entries);
-        assert_eq!(
-            outcome,
-            proxy::ConnectionOutcome::Denied {
-                host: Some(lookalike.to_string())
-            }
-        );
+fn sample_request() -> LaunchRequest {
+    LaunchRequest {
+        session_id: SessionId::from_name("habitat-adversarial-session").unwrap(),
+        workspace_disk_path: PathBuf::from("/tmp/habitat-adversarial-session.img"),
+        guest_image: "localhost/habitat-guest:alpine".to_string(),
+        resource_limits: ResourceLimitsConfig::default(),
+        egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
+        guest_ssh_public_key: "ssh-ed25519 AAAAtest habitat-session".to_string(),
+        guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-adversarial-session-key"),
     }
 }
 
-/// A direct-IP-literal SNI (some TLS clients will send one if configured
-/// to connect straight to an IP) matches no allowlist entry -- there is
-/// no IP-based fallback path anywhere in the matcher or the proxy.
+/// No live/continuous file-share mount at any point (`AGENTS.md` Section
+/// 2, invariant 1) -- a `-v`/`--volume`/`--mount type=bind` flag would be
+/// exactly that kind of route back to the real host filesystem, and the
+/// workspace disk crosses in exactly once via the block-device
+/// annotation, never a bind mount.
 #[test]
-fn a_direct_ip_literal_sni_is_denied() {
-    let entries = egress_allowlist::default_entries();
-    for ip_literal in ["93.184.216.34", "127.0.0.1", "0.0.0.0"] {
-        let outcome = deny_check(ip_literal, &entries);
-        assert_eq!(
-            outcome,
-            proxy::ConnectionOutcome::Denied {
-                host: Some(ip_literal.to_string())
-            }
-        );
-    }
-}
-
-/// A connection that supplies no SNI at all (the shape a raw direct-IP
-/// TLS connection with no `server_name` extension would take, or a
-/// non-TLS probe) is denied the same way a mismatched hostname is --
-/// there is no "no SNI means allow it, we can't tell" fallback.
-#[test]
-fn a_connection_with_no_sni_extension_at_all_is_denied() {
-    let entries = egress_allowlist::default_entries();
-    let dialer = FakeDialer::default();
-    let audit = MemoryAuditSink::default();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    thread::spawn(move || {
-        // Raw bytes shaped like a plausible probe, never a valid
-        // ClientHello with an SNI extension.
-        connect_and_send(addr, &[0xffu8; 32]);
-    });
-    let (client, _) = listener.accept().unwrap();
-    let outcome = proxy::handle_connection(client, &entries, &dialer, &audit).unwrap();
-    assert_eq!(outcome, proxy::ConnectionOutcome::Denied { host: None });
-    assert!(dialer.attempts.borrow().is_empty());
-}
-
-/// The nftables ruleset this crate builds must never contain a
-/// blanket/any-destination accept rule -- the entire point of the
-/// network-layer restriction is that the proxy is the *only* reachable
-/// address, so a rule with no `daddr`/`dport` scoping, or a non-drop
-/// default policy, would defeat it even if the SNI-matching logic above
-/// is perfect.
-#[test]
-fn firewall_rules_never_contain_an_unscoped_accept() {
-    let proxy_addr: SocketAddr = "10.0.2.100:8443".parse().unwrap();
-    let rules = network_setup::build_egress_firewall_rules("pasta1", proxy_addr);
-
+fn launch_command_never_bind_mounts_the_host_filesystem() {
+    let args = build_run_args(&sample_request());
     assert!(
-        rules.contains("policy drop"),
-        "default policy must be drop, not accept -- fail closed on anything unmatched: {rules}"
+        !args.iter().any(|a| a == "-v" || a == "--volume"),
+        "a -v/--volume flag would be a host filesystem bind mount: {args:?}"
     );
-    for line in rules.lines().filter(|l| l.contains("accept")) {
+    assert!(
+        !args
+            .iter()
+            .any(|a| a.starts_with("--mount") || a.contains("type=bind")),
+        "a --mount type=bind flag would be a host filesystem bind mount: {args:?}"
+    );
+}
+
+/// The security boundary is the VM/kernel isolation itself
+/// (`0003-container-engine-runtime-layer.md`), never a widened
+/// container-level privilege on top of it -- so none of the flags that
+/// would hand a guest a route to the host (privileged mode, added
+/// capabilities, the host PID/network/IPC namespaces, or a loosened
+/// security policy) may ever appear in the launch argv.
+#[test]
+fn launch_command_never_widens_host_privilege() {
+    let args = build_run_args(&sample_request());
+    let joined = args.join(" ");
+    let forbidden = [
+        "--privileged",
+        "--cap-add",
+        "--pid=host",
+        "--pid host",
+        "--ipc=host",
+        "--ipc host",
+        "--network=host",
+        "--userns=host",
+        "--security-opt=seccomp=unconfined",
+        "--security-opt seccomp=unconfined",
+    ];
+    for flag in forbidden {
         assert!(
-            line.contains(&proxy_addr.ip().to_string())
-                && line.contains(&proxy_addr.port().to_string()),
-            "every accept rule must be scoped to the proxy's exact address and port: {line:?}"
+            !joined.contains(flag),
+            "launch argv must never include {flag:?} -- containment is the VM boundary, not a \
+             container hardening layer: {args:?}"
         );
     }
 }
 
-/// The `podman run` network flags built for launch must never select
-/// libkrun's default TSI mode (invisible to host firewall rules, the
-/// entire reason `0004` moved to `passt`) or the host's own network
-/// namespace -- the same "never widen host reach" invariant Phase 3's
-/// `containment_escape.rs` pins for the container-privilege flags,
-/// applied here to networking specifically.
+/// The guest's network is always explicitly `pasta` (Phase 5's real
+/// `passt`-backed egress path, `docs/decisions/0004-networking-layer.md`)
+/// -- never left unset, which on some Podman defaults would mean an
+/// unfiltered bridge network reaching the host's own network namespace,
+/// and never libkrun's default TSI mode, which isn't visible to
+/// host-side firewall rules at all. Fail closed on missing egress
+/// control, never open by default.
 #[test]
-fn network_flags_never_select_host_networking_or_leave_it_unset() {
-    let proxy_addr: SocketAddr = "127.0.0.1:8443".parse().unwrap();
-    let flags = network_setup::build_network_flags(proxy_addr);
-    let joined = flags.join(" ");
-    assert!(
-        !joined.contains("host"),
-        "must never use host networking: {flags:?}"
-    );
-    let net_idx = flags
+fn launch_command_always_uses_the_passt_backed_network_not_unset_or_tsi() {
+    let args = build_run_args(&sample_request());
+    let net_idx = args
         .iter()
         .position(|a| a == "--network")
-        .expect("--network must be explicitly set");
-    assert_eq!(flags[net_idx + 1], network_setup::NETWORK_MODE);
+        .expect("--network must be explicitly set, not left to podman's default");
+    assert_eq!(
+        args[net_idx + 1],
+        format!(
+            "{}:--map-host-loopback={}",
+            network_setup::NETWORK_MODE,
+            network_setup::HOST_LOOPBACK_ADDR
+        )
+    );
+    // Also confirms the `krun.use_passt` annotation is present -- real
+    // hardware confirmed `--network pasta` alone is not sufficient for
+    // `crun-krun`; without this annotation it silently falls back to
+    // libkrun's default TSI mode regardless of the `--network` value.
+    let expected_annotation = format!("{}=1", network_setup::KRUN_USE_PASST_ANNOTATION);
+    assert!(
+        args.iter().any(|a| a == &expected_annotation),
+        "expected {expected_annotation:?} somewhere in the argv, got {args:?}"
+    );
+}
+
+/// DNS pinning (`0004`'s open item): the guest's resolver must be
+/// pointed at an address that actually reaches the egress proxy's host,
+/// never left on whatever `pasta` would otherwise hand it -- a leftover
+/// default resolver would be a way to quietly leak past the
+/// reachability restriction.
+///
+/// This is [`network_setup::HOST_LOOPBACK_ADDR`], not the proxy's own IP
+/// directly -- confirmed on real hardware that pointing `--dns` straight
+/// at the proxy's bind address (typically `127.0.0.1`) never works,
+/// since that address means the guest's *own* loopback from inside its
+/// own network namespace, never the host's. `pasta`'s own
+/// `--map-host-loopback` translation (paired with this in `--network`)
+/// is what actually gets guest traffic to the host's loopback.
+#[test]
+fn launch_command_pins_guest_dns_to_the_egress_proxy() {
+    let request = sample_request();
+    let args = build_run_args(&request);
+    let dns_idx = args
+        .iter()
+        .position(|a| a == "--dns")
+        .expect("--dns must be explicitly set to the egress proxy's address");
+    assert_eq!(args[dns_idx + 1], network_setup::HOST_LOOPBACK_ADDR);
+}
+
+/// Every session gets its own disposable disk image, attached only via
+/// the annotation this launcher controls -- confirms the guest image
+/// reference (the shared, roadmap-stage-wide base image,
+/// `0002-guest-os-layer.md`) and the per-session workspace disk
+/// (`0005-storage-layer.md`) are never conflated into the same argument.
+#[test]
+fn workspace_disk_and_guest_image_are_passed_as_distinct_arguments() {
+    let request = sample_request();
+    let args = build_run_args(&request);
+    assert_eq!(
+        args.last(),
+        Some(&request.guest_image),
+        "the guest image reference must be the final positional argument"
+    );
+    assert!(
+        args.iter()
+            .any(|a| a.contains(&request.workspace_disk_path.display().to_string())),
+        "the workspace disk path must appear (via the annotation), separately from the image ref"
+    );
+}
+
+/// `docs/decisions/0008-guest-exec-channel.md`: only the *public* half of
+/// the session's SSH keypair may ever reach the guest via
+/// `AUTHORIZED_KEY_ENV` -- a defense-in-depth guard against a future bug
+/// that accidentally hands the guest the private key instead. An ed25519
+/// private key's OpenSSH text encoding is always PEM-shaped
+/// (`-----BEGIN OPENSSH PRIVATE KEY-----`); a public key never contains
+/// that marker.
+#[test]
+fn launch_command_never_leaks_a_private_key_shaped_value_into_the_env() {
+    let mut request = sample_request();
+    request.guest_ssh_public_key = "ssh-ed25519 AAAAtest habitat-session".to_string();
+    let args = build_run_args(&request);
+    let joined = args.join(" ");
+    assert!(
+        !joined.contains("PRIVATE KEY"),
+        "no private-key-shaped value may ever appear in the launch argv: {args:?}"
+    );
+}
+
+/// `docs/decisions/0008-guest-exec-channel.md`: the guest's SSH port is
+/// published for host<->guest exec, never for reachability from anywhere
+/// else -- the bind address must always be loopback, never `0.0.0.0` or
+/// left unspecified (which some Podman defaults would expose to every
+/// interface on the host, including the LAN).
+#[test]
+fn launch_command_publishes_the_ssh_port_to_loopback_only_never_all_interfaces() {
+    let args = build_run_args(&sample_request());
+    let pub_idx = args
+        .iter()
+        .position(|a| a == "--publish")
+        .expect("--publish must be explicitly set for the guest exec channel");
+    let mapping = &args[pub_idx + 1];
+    assert!(
+        mapping.starts_with("127.0.0.1:"),
+        "the SSH port publish must bind loopback only, got {mapping:?}"
+    );
+    assert!(
+        !mapping.starts_with("0.0.0.0") && !mapping.starts_with(':'),
+        "the SSH port publish must never bind all interfaces or Podman's unspecified default: {mapping:?}"
+    );
 }

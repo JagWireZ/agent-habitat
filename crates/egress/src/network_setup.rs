@@ -58,10 +58,40 @@ use std::net::SocketAddr;
 ///
 /// Whether a guest under real `pasta` networking (now that
 /// [`KRUN_USE_PASST_ANNOTATION`] actually gets it one) can reach a
-/// service bound on the host's own loopback is still open --
-/// `tests/manual/validate-egress.sh` is where that gets resolved against
-/// real hardware, not a guess baked into this constant.
+/// service bound on the host's own loopback is **no longer open** --
+/// confirmed on real hardware (`tmp/wip/egress-validation`) that the
+/// obvious approach (`--dns` pointed straight at the proxy's own bind
+/// address, e.g. `127.0.0.1`) never had a chance: `127.0.0.1` inside the
+/// guest's own network namespace always means the guest's *own*
+/// loopback, never the host's, regardless of routing, DHCP, or which
+/// networking mode is in play. See [`HOST_LOOPBACK_ADDR`] for the actual
+/// fix -- `pasta`'s own `--map-host-loopback` translation, not a guess
+/// baked into this constant.
 pub const NETWORK_MODE: &str = "pasta";
+
+/// The fixed address this project tells the guest to use for anything
+/// that actually lives on the *host's* loopback (the egress proxy, the
+/// DNS forwarder) -- paired with a `pasta:--map-host-loopback=...`
+/// `--network` value in [`build_network_flags`], which makes `pasta`
+/// translate any guest traffic destined here into the host's real
+/// loopback (`127.0.0.1`) before delivering it. Per `pasta`'s own
+/// manual: "packets with destination address corresponding to the
+/// `--map-host-loopback` address will have their destination address
+/// translated to a loopback address."
+///
+/// A fixed link-local address, not the host's real LAN gateway --
+/// `pasta` defaults `--map-host-loopback` to the observed default
+/// gateway if the option is omitted, which is exactly the trap this
+/// project fell into first: on real hardware that gateway is the host's
+/// actual router (e.g. `192.168.1.1`), a real, physical-network-specific
+/// address this project has no business depending on for something as
+/// load-bearing as reaching its own egress proxy. Setting this option
+/// explicitly, to a fixed address in the `169.254.0.0/16` link-local
+/// block (the same convention Podman's own `host.containers.internal`
+/// uses for pasta-backed bridge networking), keeps this working
+/// identically regardless of whatever physical network the host happens
+/// to be on, or whether it has one at all.
+pub const HOST_LOOPBACK_ADDR: &str = "169.254.1.1";
 
 /// The OCI annotation that tells `crun-krun` to actually attach a real
 /// virtio-net device backed by `passt` to the microVM, instead of
@@ -71,7 +101,13 @@ pub const NETWORK_MODE: &str = "pasta";
 /// "When set to a value greater than 0, enable passt-based networking in
 /// the microVM." `--network pasta` alone configures podman's own side of
 /// this; libkrun's VM configuration needs this separate, explicit
-/// annotation before it will honor that at all.
+/// annotation before it will honor that at all. Also confirmed on real
+/// hardware: this annotation only exists from `crun` 1.27.1 onward --
+/// AlmaLinux 10's own `crun-krun-1.27-2.el10_2` predates it and silently
+/// ignores it, still booting under TSI. There is no way to detect that
+/// mismatch from this crate alone; `tests/manual/validate-vm-launch.sh`
+/// checking for `tsi_hijack`/`PF_TSI*` on the guest's kernel command
+/// line and registered protocol families is what catches it.
 pub const KRUN_USE_PASST_ANNOTATION: &str = "krun.use_passt";
 
 /// The port `crate::dns`'s forwarder must be listening on, at the same
@@ -92,7 +128,11 @@ pub const DNS_LISTEN_PORT: u16 = 53;
 
 /// The address `crate::dns::run` must bind to so that a guest launched
 /// with [`build_network_flags`]'s `--dns` value can actually reach it --
-/// see [`DNS_LISTEN_PORT`] for why this can't be an arbitrary port.
+/// see [`DNS_LISTEN_PORT`] for why this can't be an arbitrary port. Binds
+/// to `proxy_addr`'s own IP (the host's real loopback, e.g. `127.0.0.1`)
+/// -- `pasta`'s `--map-host-loopback` translation is what lets the guest
+/// reach that from [`HOST_LOOPBACK_ADDR`]; the forwarder itself doesn't
+/// need to know or care about that address at all.
 pub fn dns_listen_addr(proxy_addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(proxy_addr.ip(), DNS_LISTEN_PORT)
 }
@@ -105,6 +145,20 @@ pub fn dns_listen_addr(proxy_addr: SocketAddr) -> SocketAddr {
 /// configuration rather than in-guest configuration this project has no
 /// way to enforce after boot.
 ///
+/// `--dns` points at [`HOST_LOOPBACK_ADDR`], not the proxy's own bind
+/// address -- confirmed on real hardware that pointing it straight at
+/// the proxy's own IP (typically `127.0.0.1`) never works, because that
+/// address means the guest's *own* loopback from inside the guest's
+/// network namespace, never the host's. This function takes no
+/// `proxy_addr` parameter at all for that reason: nothing about the
+/// guest-side network configuration actually depends on where the proxy
+/// binds, only on `HOST_LOOPBACK_ADDR` and `pasta`'s own translation of
+/// it. `--network` carries a matching
+/// `pasta:--map-host-loopback=<HOST_LOOPBACK_ADDR>` value so `pasta`
+/// actually translates guest traffic bound for that address to the
+/// host's real loopback, where [`dns_listen_addr`] and the proxy itself
+/// are listening.
+///
 /// Includes [`KRUN_USE_PASST_ANNOTATION`] alongside `--network`/`--dns` --
 /// confirmed on real hardware that omitting it silently leaves the guest
 /// on libkrun's default TSI networking regardless of the `--network`
@@ -115,12 +169,12 @@ pub fn dns_listen_addr(proxy_addr: SocketAddr) -> SocketAddr {
 /// Reachability restriction itself (making the proxy the *only* address
 /// the guest can reach at all) is not a `podman run` flag -- see
 /// [`build_egress_firewall_rules`] for that half.
-pub fn build_network_flags(proxy_addr: SocketAddr) -> Vec<String> {
+pub fn build_network_flags() -> Vec<String> {
     vec![
         "--network".to_string(),
-        NETWORK_MODE.to_string(),
+        format!("{NETWORK_MODE}:--map-host-loopback={HOST_LOOPBACK_ADDR}"),
         "--dns".to_string(),
-        proxy_addr.ip().to_string(),
+        HOST_LOOPBACK_ADDR.to_string(),
         "--annotation".to_string(),
         format!("{KRUN_USE_PASST_ANNOTATION}=1"),
     ]
@@ -173,10 +227,16 @@ mod tests {
     }
 
     #[test]
-    fn network_flags_use_pasta_not_the_default_tsi_mode() {
-        let flags = build_network_flags(proxy_addr());
+    fn network_flags_use_pasta_with_the_map_host_loopback_suboption() {
+        // Confirmed on real hardware: the bare "pasta" mode alone leaves
+        // no way for the guest to reach a host-loopback-bound service --
+        // `--map-host-loopback` is what makes that translation happen.
+        let flags = build_network_flags();
         let idx = flags.iter().position(|a| a == "--network").unwrap();
-        assert_eq!(flags[idx + 1], NETWORK_MODE);
+        assert_eq!(
+            flags[idx + 1],
+            format!("{NETWORK_MODE}:--map-host-loopback={HOST_LOOPBACK_ADDR}")
+        );
     }
 
     #[test]
@@ -186,10 +246,15 @@ mod tests {
     }
 
     #[test]
-    fn network_flags_pin_dns_to_the_proxy_address() {
-        let flags = build_network_flags(proxy_addr());
+    fn network_flags_pin_dns_to_the_host_loopback_map_address_not_the_proxy_ip() {
+        // Confirmed on real hardware: pointing `--dns` straight at the
+        // proxy's own IP (127.0.0.1) never works, because that address
+        // means the guest's *own* loopback from inside its own network
+        // namespace, never the host's -- HOST_LOOPBACK_ADDR is the
+        // address `--map-host-loopback` actually translates for us.
+        let flags = build_network_flags();
         let idx = flags.iter().position(|a| a == "--dns").unwrap();
-        assert_eq!(flags[idx + 1], "127.0.0.1");
+        assert_eq!(flags[idx + 1], HOST_LOOPBACK_ADDR);
     }
 
     #[test]
@@ -197,7 +262,7 @@ mod tests {
         // Confirmed on real hardware: without this, `crun-krun` silently
         // falls back to libkrun's default TSI networking regardless of
         // `--network pasta`, so this must never be left out.
-        let flags = build_network_flags(proxy_addr());
+        let flags = build_network_flags();
         let idx = flags
             .iter()
             .position(|a| a == "--annotation")
@@ -207,6 +272,7 @@ mod tests {
             format!("{KRUN_USE_PASST_ANNOTATION}=1")
         );
     }
+
 
     #[test]
     fn firewall_rules_default_to_dropping_all_output() {

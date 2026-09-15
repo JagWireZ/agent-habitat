@@ -81,6 +81,17 @@ DNS_ADDR="127.0.0.1:53"
 # NETWORK_MODE's own doc comment for why that was tried and reverted (it
 # broke the SSH exec channel outright).
 PASTA_NETWORK_MODE="pasta"
+# Must match network_setup::HOST_LOOPBACK_ADDR -- confirmed on real
+# hardware that pointing the guest's `--dns` straight at PROXY_ADDR's own
+# IP (127.0.0.1) never works: that address means the guest's *own*
+# loopback from inside its own network namespace, never the host's. This
+# fixed link-local address, paired with `pasta:--map-host-loopback=` on
+# `--network` below, is what `pasta` actually translates to the host's
+# real loopback -- see HOST_LOOPBACK_ADDR's own doc comment for why it's
+# a fixed address rather than whatever the host's real network gateway
+# happens to be (`pasta`'s own default for this option, and the first,
+# wrong thing this project relied on).
+HOST_LOOPBACK_ADDR="169.254.1.1"
 SSH_KEY_PATH="$LOG_DIR/session-key"
 GUEST_SSH_HOST="127.0.0.1"
 AUDIT_LOG="$LOG_DIR/audit.jsonl"
@@ -249,8 +260,8 @@ record "  docs/decisions/0008-guest-exec-channel.md)"
 PODMAN_ARGS=(
     run --detach --rm --name "$SESSION_NAME"
     --runtime krun
-    --network "$PASTA_NETWORK_MODE"
-    --dns "${PROXY_ADDR%%:*}"
+    --network "${PASTA_NETWORK_MODE}:--map-host-loopback=${HOST_LOOPBACK_ADDR}"
+    --dns "$HOST_LOOPBACK_ADDR"
     # Without this, crun-krun silently falls back to libkrun's own
     # default TSI networking regardless of `--network pasta` above --
     # confirmed on real hardware (tmp/wip/egress-validation): a session
@@ -313,21 +324,24 @@ done
 # Isolates *why* a lookup fails before Step 5's trace runs: is the guest's
 # resolver actually pointed at the proxy's DNS forwarder at all (resolv.conf),
 # and if so, can it actually reach it (an explicit query naming
-# $PROXY_ADDR's IP, bypassing resolv.conf entirely)? Both must hold for the
-# default-resolver lookups in Step 5 to mean anything. Confirmed on real
-# hardware NOT to work as-is under plain `--network pasta` (nor under the
-# `-T,all,-U,all` variant tried and reverted -- see NETWORK_MODE's doc
-# comment): whether a guest can reach the host's loopback under pasta at
-# all is still an open question, and this step is deliberately not
-# guessing an answer, just reporting what's actually observed.
+# $HOST_LOOPBACK_ADDR, bypassing resolv.conf entirely)? Both must hold for
+# the default-resolver lookups in Step 5 to mean anything.
+#
+# Confirmed on real hardware (tmp/wip/egress-validation): the guest CAN
+# reach a service on the host's own loopback under `pasta`, but not by
+# querying the proxy's own IP (127.0.0.1) directly -- that address always
+# means the guest's *own* loopback from inside its own network namespace.
+# The actual mechanism is `pasta`'s `--map-host-loopback` translation:
+# guest traffic sent to HOST_LOOPBACK_ADDR gets translated to the host's
+# real loopback before delivery. This is no longer an open question.
 say "Step 3b: DNS-pinning diagnostics"
 RESOLV_CONF="$(run_trace "cat /etc/resolv.conf")"
 record "- Guest \`/etc/resolv.conf\`:"
 record '```'
 record "$RESOLV_CONF"
 record '```'
-EXPLICIT_DNS_RESULT="$(run_trace "timeout 5 nslookup pypi.org 127.0.0.1")"
-record "- \`nslookup pypi.org 127.0.0.1\` (explicit, bypassing resolv.conf -- proves whether the"
+EXPLICIT_DNS_RESULT="$(run_trace "timeout 5 nslookup pypi.org $HOST_LOOPBACK_ADDR")"
+record "- \`nslookup pypi.org $HOST_LOOPBACK_ADDR\` (explicit, bypassing resolv.conf -- proves whether the"
 record "  forwarder is reachable at all, independent of whether resolv.conf itself is"
 record "  correctly pinned):"
 record '```'
@@ -336,14 +350,12 @@ record '```'
 DNS_OK=1
 if echo "$EXPLICIT_DNS_RESULT" | grep -qi 'BLOCKED\|refused\|timed out\|no servers'; then
     DNS_OK=""
-    record "  -- forwarder is NOT reachable from the guest at 127.0.0.1:53 (confirmed on real"
-    record "  hardware -- this is a still-open question, not a regression to chase further from"
-    record "  this script alone). \`-T,all,-U,all\` was tried and reverted: it targets the wrong"
-    record "  direction (auto-publishing the guest's own listening ports, not guest-to-host"
-    record "  loopback) and broke the SSH exec channel instead of fixing this. Whatever the real"
-    record "  mechanism is (if one exists at all under \`--network pasta\`), it needs identifying"
-    record "  from pasta/passt's own docs or upstream, not by guessing at more CLI flags here."
-elif ! echo "$RESOLV_CONF" | grep -q '^nameserver 127\.0\.0\.1'; then
+    record "  -- forwarder is NOT reachable from the guest at ${HOST_LOOPBACK_ADDR}:53. Confirm"
+    record "  \`pasta\` actually got the \`--map-host-loopback=${HOST_LOOPBACK_ADDR}\` option (check"
+    record "  the real \`pasta\` process argv on the host, e.g. \`ps aux | grep pasta\`) and that"
+    record "  \`crun-krun\`/\`libkrun\` are new enough for \`krun.use_passt\` (crun >= 1.27.1 --"
+    record "  see network_setup::KRUN_USE_PASST_ANNOTATION's doc comment)."
+elif ! echo "$RESOLV_CONF" | grep -q "^nameserver ${HOST_LOOPBACK_ADDR}\$"; then
     DNS_OK=""
     record "  -- forwarder IS reachable, but resolv.conf isn't actually pointed at it -- \`--dns\`"
     record "  either didn't apply under \`--network $PASTA_NETWORK_MODE\`, or something in the"

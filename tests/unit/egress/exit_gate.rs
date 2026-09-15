@@ -107,17 +107,21 @@ fn a_project_config_addition_actually_reaches_the_proxy_decision() {
     assert!(effective_entries.contains(&"pypi.org".to_string()));
 }
 
-/// Exit gate: the network-launch flags this crate hands `habitat-vm`
-/// actually carry the proxy's real bound address, not a placeholder --
-/// confirmed against a real `TcpListener`, not a hand-typed socket addr.
+/// Exit gate: `dns_listen_addr` (what the forwarder actually binds to)
+/// carries the proxy's real bound address, not a placeholder -- confirmed
+/// against a real `TcpListener`, not a hand-typed socket addr.
+/// `build_network_flags`'s own `--dns` value is deliberately *not* the
+/// proxy's address directly (confirmed on real hardware that doesn't
+/// work -- see `network_setup::HOST_LOOPBACK_ADDR`'s doc comment), so
+/// that half is covered by `crates/egress/src/network_setup.rs`'s own
+/// inline tests instead of duplicated here.
 #[test]
 fn network_flags_reflect_the_proxys_actual_bound_address() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let proxy_addr = listener.local_addr().unwrap();
 
-    let flags = network_setup::build_network_flags(proxy_addr);
-    let dns_idx = flags.iter().position(|a| a == "--dns").unwrap();
-    assert_eq!(flags[dns_idx + 1], proxy_addr.ip().to_string());
+    let forwarder_addr = network_setup::dns_listen_addr(proxy_addr);
+    assert_eq!(forwarder_addr.ip(), proxy_addr.ip());
 }
 
 /// Exit gate: DNS pinning actually forwards a real query end to end --

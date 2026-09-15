@@ -144,15 +144,16 @@ PODMAN_ARGS=(
     run --detach --rm --name "$SESSION_NAME"
     --runtime krun
     # Matches habitat_vm::launcher's current build_run_args (Phase 5):
-    # a pasta-backed network with DNS pinned to a proxy address, never
-    # the Phase 3 `--network none` placeholder or libkrun's default TSI
-    # mode. No real proxy is actually running for this script's own
-    # purpose (a containment escape attempt, not an egress trace --
-    # that's tests/manual/validate-egress.sh's job), so this address is
-    # a placeholder the guest's DNS won't actually be able to reach; that
+    # a pasta-backed network with DNS pinned to a fixed host-loopback-map
+    # address (network_setup::HOST_LOOPBACK_ADDR), never the Phase 3
+    # `--network none` placeholder or libkrun's default TSI mode. No real
+    # proxy is actually running for this script's own purpose (a
+    # containment escape attempt, not an egress trace -- that's
+    # tests/manual/validate-egress.sh's job), so this address is a
+    # placeholder the guest's DNS won't actually be able to reach; that
     # doesn't affect this script's own checks.
-    --network pasta
-    --dns 127.0.0.1
+    --network "pasta:--map-host-loopback=169.254.1.1"
+    --dns 169.254.1.1
     # Without this, crun-krun silently falls back to libkrun's own
     # default TSI networking regardless of `--network pasta` above --
     # confirmed on real hardware (tmp/wip/vm-launch-validation): a

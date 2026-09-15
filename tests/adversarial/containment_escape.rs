@@ -100,13 +100,38 @@ fn launch_command_always_uses_the_passt_backed_network_not_unset_or_tsi() {
         .iter()
         .position(|a| a == "--network")
         .expect("--network must be explicitly set, not left to podman's default");
-    assert_eq!(args[net_idx + 1], network_setup::NETWORK_MODE);
+    assert_eq!(
+        args[net_idx + 1],
+        format!(
+            "{}:--map-host-loopback={}",
+            network_setup::NETWORK_MODE,
+            network_setup::HOST_LOOPBACK_ADDR
+        )
+    );
+    // Also confirms the `krun.use_passt` annotation is present -- real
+    // hardware confirmed `--network pasta` alone is not sufficient for
+    // `crun-krun`; without this annotation it silently falls back to
+    // libkrun's default TSI mode regardless of the `--network` value.
+    let expected_annotation = format!("{}=1", network_setup::KRUN_USE_PASST_ANNOTATION);
+    assert!(
+        args.iter().any(|a| a == &expected_annotation),
+        "expected {expected_annotation:?} somewhere in the argv, got {args:?}"
+    );
 }
 
 /// DNS pinning (`0004`'s open item): the guest's resolver must be
-/// pointed at the egress proxy, never left on whatever `pasta` would
-/// otherwise hand it -- a leftover default resolver would be a way to
-/// quietly leak past the reachability restriction.
+/// pointed at an address that actually reaches the egress proxy's host,
+/// never left on whatever `pasta` would otherwise hand it -- a leftover
+/// default resolver would be a way to quietly leak past the
+/// reachability restriction.
+///
+/// This is [`network_setup::HOST_LOOPBACK_ADDR`], not the proxy's own IP
+/// directly -- confirmed on real hardware that pointing `--dns` straight
+/// at the proxy's bind address (typically `127.0.0.1`) never works,
+/// since that address means the guest's *own* loopback from inside its
+/// own network namespace, never the host's. `pasta`'s own
+/// `--map-host-loopback` translation (paired with this in `--network`)
+/// is what actually gets guest traffic to the host's loopback.
 #[test]
 fn launch_command_pins_guest_dns_to_the_egress_proxy() {
     let request = sample_request();
@@ -115,10 +140,7 @@ fn launch_command_pins_guest_dns_to_the_egress_proxy() {
         .iter()
         .position(|a| a == "--dns")
         .expect("--dns must be explicitly set to the egress proxy's address");
-    assert_eq!(
-        args[dns_idx + 1],
-        request.egress_proxy_addr.ip().to_string()
-    );
+    assert_eq!(args[dns_idx + 1], network_setup::HOST_LOOPBACK_ADDR);
 }
 
 /// Every session gets its own disposable disk image, attached only via

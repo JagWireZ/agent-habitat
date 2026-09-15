@@ -121,9 +121,7 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
         "--runtime".to_string(),
         KRUN_RUNTIME.to_string(),
     ];
-    args.extend(habitat_egress::network_setup::build_network_flags(
-        request.egress_proxy_addr,
-    ));
+    args.extend(habitat_egress::network_setup::build_network_flags());
     args.extend([
         "--cpus".to_string(),
         format!("{}", request.resource_limits.cpus),
@@ -332,9 +330,19 @@ mod tests {
         request.egress_proxy_addr = "127.0.0.1:9999".parse().unwrap();
         let args = build_run_args(&request);
         let net_idx = args.iter().position(|a| a == "--network").unwrap();
-        assert_eq!(args[net_idx + 1], habitat_egress::network_setup::NETWORK_MODE);
+        assert_eq!(
+            args[net_idx + 1],
+            format!(
+                "{}:--map-host-loopback={}",
+                habitat_egress::network_setup::NETWORK_MODE,
+                habitat_egress::network_setup::HOST_LOOPBACK_ADDR
+            )
+        );
         let dns_idx = args.iter().position(|a| a == "--dns").unwrap();
-        assert_eq!(args[dns_idx + 1], "127.0.0.1");
+        assert_eq!(
+            args[dns_idx + 1],
+            habitat_egress::network_setup::HOST_LOOPBACK_ADDR
+        );
     }
 
     /// Confirmed on real hardware (`tmp/wip/vm-launch-validation`,
