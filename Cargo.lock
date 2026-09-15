@@ -18,6 +18,10 @@ dependencies = [
 [[package]]
 name = "habitat-egress"
 version = "0.1.0"
+dependencies = [
+ "habitat-audit",
+ "habitat-policy",
+]
 
 [[package]]
 name = "habitat-install"
@@ -35,6 +39,7 @@ version = "0.1.0"
 name = "habitat-vm"
 version = "0.1.0"
 dependencies = [
+ "habitat-egress",
  "habitat-policy",
 ]
 

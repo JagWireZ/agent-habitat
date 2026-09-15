@@ -6,3 +6,19 @@ publish.workspace = true
 description = "Local egress proxy enforcing a default-deny, SNI-based allowlist (Phase 5)."
 
 [dependencies]
+habitat-policy = { path = "../policy" }
+habitat-audit = { path = "../audit" }
+
+# Exit-gate and adversarial tests live under the top-level tests/unit/
+# and tests/adversarial/ (mirroring the source tree, per
+# file-structure.md) rather than as inline #[cfg(test)] modules, since
+# they cover this crate's contract with the rest of the system rather
+# than pure internal logic. These [[test]] targets point cargo at those
+# files without duplicating them under crates/egress/.
+[[test]]
+name = "exit_gate"
+path = "../../tests/unit/egress/exit_gate.rs"
+
+[[test]]
+name = "egress_bypass"
+path = "../../tests/adversarial/egress_bypass.rs"

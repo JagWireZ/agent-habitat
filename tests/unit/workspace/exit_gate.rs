@@ -70,6 +70,7 @@ fn flipping_git_history_on_without_approval_hard_fails_the_whole_build_before_st
             },
             secrets_scan: content_scan_disabled(),
             resource_limits: Default::default(),
+            egress_allowlist_additions: vec![],
         },
         content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };
@@ -149,6 +150,7 @@ fn approved_git_history_toggle_shares_real_history() {
             },
             secrets_scan: content_scan_disabled(),
             resource_limits: Default::default(),
+            egress_allowlist_additions: vec![],
         },
         content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };

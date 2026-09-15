@@ -40,3 +40,22 @@ manager, a real `sudo` prompt).
   fixtures) is covered by `tests/unit/workspace/sync_exit_gate.rs` and
   `tests/adversarial/sync_patch_validation.rs` instead. Reused, not
   duplicated, at Phase 8's validation run-book.
+
+- `validate-egress.sh` -- Phase 5's real-hardware exit gate: a
+  connection trace from inside a running guest, launched with the real
+  `pasta`-backed network and the nftables reachability restriction
+  `habitat_egress::network_setup` builds, confirming an allowlisted
+  destination succeeds, a non-allowlisted destination and an
+  allowlist-lookalike hostname are both blocked, and neither a
+  direct-IP nor a direct-DNS-server bypass can route around the proxy.
+  Also the confirmation (or correction) point for `network_setup.rs`'s
+  `--network pasta` and nftables-ruleset real-hardware caveats, same
+  "confirmed wrong on real hardware, then fixed" pattern as
+  `validate-vm-launch.sh`'s `WORKSPACE_DISK_ANNOTATION` caveat.
+  Everything in this phase's exit gate that doesn't need a booted guest
+  (the SNI-based allow/deny decision itself, the relay, the DNS
+  forwarder, the argv/ruleset construction) is exercised for real over
+  loopback sockets in `tests/unit/egress/exit_gate.rs` and
+  `tests/adversarial/egress_bypass.rs` instead. Reused, not duplicated,
+  at Phase 8's validation run-book -- and, per this phase's own exit
+  gate, re-run after any allowlist ruleset change.

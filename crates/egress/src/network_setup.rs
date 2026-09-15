@@ -1,0 +1,131 @@
+//! Pure construction of the guest-network configuration Phase 5 needs at
+//! VM launch time, coordinated with `habitat-vm::launcher`
+//! (`docs/decisions/0004-networking-layer.md`). Kept here rather than in
+//! `crates/vm` because the *policy* of "the proxy is the only reachable
+//! address" belongs to the egress domain, not the launcher; `habitat-vm`
+//! only calls into this module and splices the result into its own argv.
+//!
+//! Same "pure and unit-tested here, confirmed for real on hardware
+//! separately" split as `habitat_vm::launcher::build_run_args` and its
+//! `WORKSPACE_DISK_ANNOTATION` caveat: everything in this module is
+//! plain string/argv construction, checkable without Podman, `passt`, or
+//! real KVM. Whether crun-krun's `--network`/`--dns` flags behave the
+//! way documented here when combined with libkrun (rather than plain
+//! crun) -- and whether the nftables ruleset below is actually the right
+//! mechanism for restricting a rootless `pasta` interface, as opposed to
+//! some other rootless-networking primitive -- is **not yet confirmed
+//! against real hardware**. `tests/manual/validate-egress.sh` is where
+//! that confirmation (or correction, same "wrong on real hardware, then
+//! fixed" pattern as the Phase 3 annotation key) happens.
+
+use std::net::SocketAddr;
+
+/// The `--network` value that gets the guest a real `passt`-backed
+/// interface instead of libkrun's default TSI mode (`0004`'s whole
+/// reason for existing: TSI isn't visible to host-side network policy at
+/// all). Rootless Podman's `pasta` network driver is `passt`'s intended
+/// integration point for exactly this case.
+pub const NETWORK_MODE: &str = "pasta";
+
+/// Builds the `podman run` flags that give the guest a `pasta`-backed
+/// network and pin its DNS resolution to the local proxy's own address
+/// (`crate::dns`) rather than leaving the guest's resolver on whatever
+/// pasta would otherwise hand it -- the "DNS pinned to the proxy path"
+/// requirement (`0004`'s open item), expressed as launch-time
+/// configuration rather than in-guest configuration this project has no
+/// way to enforce after boot.
+///
+/// Reachability restriction itself (making the proxy the *only* address
+/// the guest can reach at all) is not a `podman run` flag -- see
+/// [`build_egress_firewall_rules`] for that half.
+pub fn build_network_flags(proxy_addr: SocketAddr) -> Vec<String> {
+    vec![
+        "--network".to_string(),
+        NETWORK_MODE.to_string(),
+        "--dns".to_string(),
+        proxy_addr.ip().to_string(),
+    ]
+}
+
+/// The nftables table/chain name used for the egress-restriction
+/// ruleset -- named distinctly so it's identifiable in `nft list ruleset`
+/// output next to whatever else a host is running, same intent as
+/// `habitat_vm::session::SessionId`'s fixed prefix.
+pub const FIREWALL_TABLE: &str = "habitat_egress";
+
+/// Builds the nftables ruleset text that restricts a session's `pasta`
+/// interface to reach `proxy_addr` and nothing else: default-deny
+/// output, one explicit accept rule for the proxy's own address and
+/// port. This is the actual enforcement of "the guest cannot construct a
+/// network path that skips the proxy" -- reachability is removed at the
+/// network layer, not just at the SNI-matching layer, so there is
+/// nothing left to catch-and-redirect after the fact (`0004`'s design
+/// rationale).
+///
+/// Pure text construction, loaded via `nft -f` at launch time (real
+/// application, and confirming this is actually enforced against a
+/// booted guest attempting a direct-IP bypass, is
+/// `tests/manual/validate-egress.sh`'s job -- unprivileged/rootless
+/// nftables application against a `pasta`-owned interface is real,
+/// hardware-and-kernel-version-dependent behavior this function cannot
+/// verify by construction alone).
+pub fn build_egress_firewall_rules(pasta_interface: &str, proxy_addr: SocketAddr) -> String {
+    format!(
+        "table inet {table} {{\n\
+         \x20   chain egress {{\n\
+         \x20       type filter hook output priority 0; policy drop;\n\
+         \x20       oifname \"{iface}\" ip daddr {ip} tcp dport {port} accept\n\
+         \x20       oifname \"{iface}\" ip daddr {ip} udp dport {port} accept\n\
+         \x20   }}\n\
+         }}\n",
+        table = FIREWALL_TABLE,
+        iface = pasta_interface,
+        ip = proxy_addr.ip(),
+        port = proxy_addr.port(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy_addr() -> SocketAddr {
+        "127.0.0.1:8443".parse().unwrap()
+    }
+
+    #[test]
+    fn network_flags_use_pasta_not_the_default_tsi_mode() {
+        let flags = build_network_flags(proxy_addr());
+        let idx = flags.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(flags[idx + 1], "pasta");
+    }
+
+    #[test]
+    fn network_flags_pin_dns_to_the_proxy_address() {
+        let flags = build_network_flags(proxy_addr());
+        let idx = flags.iter().position(|a| a == "--dns").unwrap();
+        assert_eq!(flags[idx + 1], "127.0.0.1");
+    }
+
+    #[test]
+    fn firewall_rules_default_to_dropping_all_output() {
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains("policy drop"));
+    }
+
+    #[test]
+    fn firewall_rules_accept_only_the_proxy_address_and_port() {
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains("127.0.0.1"));
+        assert!(rules.contains("8443"));
+        // Confirms the one accept rule is scoped to the pasta interface,
+        // not left to apply host-wide.
+        assert!(rules.contains("oifname \"pasta0\""));
+    }
+
+    #[test]
+    fn firewall_rules_are_scoped_to_a_distinctly_named_table() {
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains(&format!("table inet {FIREWALL_TABLE}")));
+    }
+}

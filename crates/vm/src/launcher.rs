@@ -69,8 +69,18 @@ fn err(message: impl Into<String>) -> LaunchError {
 /// (`0003-container-engine-runtime-layer.md`). `tests/adversarial/
 /// containment_escape.rs` pins both of these absences as a mocked-seam
 /// check; the real, booted escape-attempt is `tests/manual`'s job.
+///
+/// Networking (Phase 5): `habitat_egress::network_setup::
+/// build_network_flags` supplies the `--network`/`--dns` flags -- a real
+/// `passt`-backed interface pinned to the session's egress proxy, never
+/// libkrun's default TSI mode (invisible to host firewall rules) and
+/// never left unset (`docs/decisions/0004-networking-layer.md`). Actual
+/// reachability restriction (making the proxy the *only* address the
+/// guest can reach) is a separate nftables ruleset
+/// (`habitat_egress::network_setup::build_egress_firewall_rules`)
+/// applied alongside this launch, not a `podman run` flag itself.
 pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "run".to_string(),
         "--detach".to_string(),
         "--rm".to_string(),
@@ -78,12 +88,11 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
         request.session_id.to_string(),
         "--runtime".to_string(),
         KRUN_RUNTIME.to_string(),
-        // Phase 5 replaces this with the passt-backed egress-proxy path;
-        // until that lands, the guest gets no network at all rather than
-        // an unfiltered one -- fail closed on missing egress control, not
-        // open by default.
-        "--network".to_string(),
-        "none".to_string(),
+    ];
+    args.extend(habitat_egress::network_setup::build_network_flags(
+        request.egress_proxy_addr,
+    ));
+    args.extend([
         "--cpus".to_string(),
         format!("{}", request.resource_limits.cpus),
         "--memory".to_string(),
@@ -94,7 +103,8 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
             request.workspace_disk_path.display()
         ),
         request.guest_image.clone(),
-    ]
+    ]);
+    args
 }
 
 /// Launches one session: runs `podman run` (detached) with the argv from
@@ -185,6 +195,7 @@ mod tests {
                 cpus: 2.0,
                 memory_mb: 2048,
             },
+            egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
         }
     }
 
@@ -213,6 +224,17 @@ mod tests {
         assert_eq!(args[cpus_idx + 1], "4");
         let mem_idx = args.iter().position(|a| a == "--memory").unwrap();
         assert_eq!(args[mem_idx + 1], "8192m");
+    }
+
+    #[test]
+    fn build_run_args_wires_the_egress_proxy_address_into_the_network_flags() {
+        let mut request = sample_request();
+        request.egress_proxy_addr = "127.0.0.1:9999".parse().unwrap();
+        let args = build_run_args(&request);
+        let net_idx = args.iter().position(|a| a == "--network").unwrap();
+        assert_eq!(args[net_idx + 1], "pasta");
+        let dns_idx = args.iter().position(|a| a == "--dns").unwrap();
+        assert_eq!(args[dns_idx + 1], "127.0.0.1");
     }
 
     #[test]

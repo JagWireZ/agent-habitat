@@ -18,8 +18,17 @@ Populated so far:
   This list is explicitly separate from `.gitignore` and never derived
   from or merged with it.
 - **Phase 5** (`docs/plan.md` Section 2.3 / AGENTS.md Section 2 invariant
-  7) -- not yet populated: the default egress allowlist (major AI
-  provider APIs, standard package registries).
+  7) -- done: `egress_allowlist.txt` holds the default egress allowlist
+  (major AI provider APIs, standard package registries, scoped to the v1
+  AlmaLinux platform target), parsed by
+  `crates/policy/src/egress_allowlist.rs` (baked into the binary via
+  `include_str!`, same "not re-read from disk at runtime" contract as
+  `blocklist.txt`) and extended per project via that project's checked-in
+  config (`crates/policy/src/config.rs`'s `egress_allowlist_additions`,
+  additive only). Matching is by destination hostname (exact, or `*.`
+  subdomain-wildcard) only -- never IP-based, per `docs/decisions/
+  0004-networking-layer.md`. `crates/egress`'s local proxy is what
+  actually checks a guest connection's SNI hostname against it.
 - **Content-based secrets scanning** (Betterleaks) -- done:
   `betterleaks-baseline.toml` holds the bundled baseline content-scan
   ruleset, parsed by `crates/policy/src/secrets_scan.rs` (baked into the

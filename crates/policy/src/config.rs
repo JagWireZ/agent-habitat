@@ -25,6 +25,11 @@
 //! `memory_mb`) -- `crates/vm`'s launcher reads it the same way Phase 2's
 //! two fields are read here; a project only overrides what it wants to
 //! change, and either key absent keeps `ResourceLimitsConfig::default()`.
+//!
+//! Phase 5 adds `egress_allowlist_additions`, read the same way as
+//! `blocklist_additions`: a plain list, additive only -- a project can
+//! extend the default egress allowlist (`crate::egress_allowlist`), never
+//! remove or override a default entry.
 
 use crate::git_history::{GitHistoryApproval, GitHistoryConfig};
 use crate::resource_limits::ResourceLimitsConfig;
@@ -44,6 +49,7 @@ pub struct ProjectConfig {
     pub git_history: GitHistoryConfig,
     pub secrets_scan: SecretsScanConfig,
     pub resource_limits: ResourceLimitsConfig,
+    pub egress_allowlist_additions: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +142,16 @@ pub fn parse(contents: &str) -> Result<ProjectConfig, ConfigError> {
                 }
                 let (resource_limits, consumed) = parse_resource_limits(&lines, i + 1)?;
                 config.resource_limits = resource_limits;
+                i += 1 + consumed;
+            }
+            "egress_allowlist_additions" => {
+                if !rest.trim().is_empty() {
+                    return Err(err(
+                        "egress_allowlist_additions: must be a list (a bare value isn't allowed)",
+                    ));
+                }
+                let (items, consumed) = parse_list(&lines, i + 1)?;
+                config.egress_allowlist_additions = items;
                 i += 1 + consumed;
             }
             other => {
@@ -469,5 +485,32 @@ mod tests {
     fn unrecognized_resource_limits_key_is_a_hard_error() {
         let err = parse("resource_limits:\n  cpsu: 2\n").unwrap_err();
         assert!(err.message.contains("unrecognized"));
+    }
+
+    #[test]
+    fn parses_egress_allowlist_additions_list() {
+        let config = parse(
+            "egress_allowlist_additions:\n  - internal.registry.example\n  - \"*.corp.example\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.egress_allowlist_additions,
+            vec![
+                "internal.registry.example".to_string(),
+                "*.corp.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn egress_allowlist_additions_default_to_empty() {
+        let config = parse("").unwrap();
+        assert!(config.egress_allowlist_additions.is_empty());
+    }
+
+    #[test]
+    fn egress_allowlist_additions_rejects_a_bare_value() {
+        let err = parse("egress_allowlist_additions: pypi.org\n").unwrap_err();
+        assert!(err.message.contains("egress_allowlist_additions"));
     }
 }

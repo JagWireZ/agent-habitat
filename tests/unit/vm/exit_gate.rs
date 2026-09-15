@@ -25,6 +25,7 @@ fn request_with_limits(cpus: f64, memory_mb: u64) -> LaunchRequest {
         workspace_disk_path: PathBuf::from("/tmp/habitat-exit-gate-session.img"),
         guest_image: "localhost/habitat-guest:almalinux".to_string(),
         resource_limits: ResourceLimitsConfig { cpus, memory_mb },
+        egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
     }
 }
 

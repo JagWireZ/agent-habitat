@@ -28,6 +28,7 @@ fn sample_request() -> LaunchRequest {
         workspace_disk_path: PathBuf::from("/tmp/habitat-adversarial-session.img"),
         guest_image: "localhost/habitat-guest:almalinux".to_string(),
         resource_limits: ResourceLimitsConfig::default(),
+        egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
     }
 }
 
@@ -82,19 +83,39 @@ fn launch_command_never_widens_host_privilege() {
     }
 }
 
-/// The guest's network is explicitly `none` here (a placeholder Phase 5
-/// replaces with the passt-backed egress path) -- never left unset,
-/// which on some Podman defaults would mean an unfiltered bridge network
-/// reaching the host's own network namespace. Fail closed on missing
-/// egress control, not open by default.
+/// The guest's network is always explicitly `pasta` (Phase 5's real
+/// `passt`-backed egress path, `docs/decisions/0004-networking-layer.md`)
+/// -- never left unset, which on some Podman defaults would mean an
+/// unfiltered bridge network reaching the host's own network namespace,
+/// and never libkrun's default TSI mode, which isn't visible to
+/// host-side firewall rules at all. Fail closed on missing egress
+/// control, never open by default.
 #[test]
-fn launch_command_defaults_network_to_none_not_unset() {
+fn launch_command_always_uses_the_passt_backed_network_not_unset_or_tsi() {
     let args = build_run_args(&sample_request());
     let net_idx = args
         .iter()
         .position(|a| a == "--network")
         .expect("--network must be explicitly set, not left to podman's default");
-    assert_eq!(args[net_idx + 1], "none");
+    assert_eq!(args[net_idx + 1], "pasta");
+}
+
+/// DNS pinning (`0004`'s open item): the guest's resolver must be
+/// pointed at the egress proxy, never left on whatever `pasta` would
+/// otherwise hand it -- a leftover default resolver would be a way to
+/// quietly leak past the reachability restriction.
+#[test]
+fn launch_command_pins_guest_dns_to_the_egress_proxy() {
+    let request = sample_request();
+    let args = build_run_args(&request);
+    let dns_idx = args
+        .iter()
+        .position(|a| a == "--dns")
+        .expect("--dns must be explicitly set to the egress proxy's address");
+    assert_eq!(
+        args[dns_idx + 1],
+        request.egress_proxy_addr.ip().to_string()
+    );
 }
 
 /// Every session gets its own disposable disk image, attached only via

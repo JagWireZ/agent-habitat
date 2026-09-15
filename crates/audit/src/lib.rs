@@ -71,6 +71,23 @@ pub enum EventKind {
     /// for review instead of being applied -- never silently merged,
     /// never silently dropped (`AGENTS.md` Section 2, invariant 10).
     SyncFlagged,
+    /// The local egress proxy (Phase 5, `habitat_egress::proxy`) let a
+    /// guest connection through -- its SNI hostname matched the
+    /// effective allowlist. Emitted for every allowed connection, not
+    /// just denials, so a complete connection trace is possible from the
+    /// log alone (`docs/decisions/0004-networking-layer.md`'s
+    /// verify-before-trusting requirement; full aggregation into the
+    /// unified log format is Phase 6's job, same "add the event kind now,
+    /// aggregate later" precedent Phase 4 set for `SyncApplied`/
+    /// `SyncFlagged`).
+    EgressAllowed,
+    /// The local egress proxy refused a guest connection -- no SNI
+    /// hostname could be read from its TLS ClientHello (missing or
+    /// malformed), or the hostname it named is not on the effective
+    /// allowlist. Fails closed either way: the connection is never
+    /// forwarded, and this event is emitted before the connection is
+    /// dropped, never after a best-effort forward.
+    EgressDenied,
 }
 
 impl EventKind {
@@ -82,6 +99,8 @@ impl EventKind {
             EventKind::ContentRulesetMidSessionEdit => "content-ruleset-mid-session-edit",
             EventKind::SyncApplied => "sync-applied",
             EventKind::SyncFlagged => "sync-flagged",
+            EventKind::EgressAllowed => "egress-allowed",
+            EventKind::EgressDenied => "egress-denied",
         }
     }
 }
@@ -242,6 +261,12 @@ mod tests {
         assert_eq!(EventKind::SyncApplied.tag(), "sync-applied");
         assert_eq!(EventKind::SyncFlagged.tag(), "sync-flagged");
         assert_ne!(EventKind::SyncApplied.tag(), EventKind::SyncFlagged.tag());
+        assert_eq!(EventKind::EgressAllowed.tag(), "egress-allowed");
+        assert_eq!(EventKind::EgressDenied.tag(), "egress-denied");
+        assert_ne!(
+            EventKind::EgressAllowed.tag(),
+            EventKind::EgressDenied.tag()
+        );
     }
 
     #[test]

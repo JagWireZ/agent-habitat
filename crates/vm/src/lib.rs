@@ -28,10 +28,17 @@
 //! real KVM and confirming a concrete escape attempt fails --
 //! `tests/manual/validate-vm-launch.sh` is that verification, since
 //! neither this dev container nor this project's CI has real hardware
-//! virtualization available (`AGENTS.md` Section 3). Egress (Phase 5)
-//! and the full audit trail (Phase 6) are later phases' responsibility;
-//! this crate's `--network none` default is a placeholder Phase 5
-//! replaces, not a finished egress story.
+//! virtualization available (`AGENTS.md` Section 3). The full audit
+//! trail (Phase 6) is a later phase's responsibility.
+//!
+//! Phase 5 (`habitat-egress`): the launch command's `--network`/`--dns`
+//! flags come from `habitat_egress::network_setup::build_network_flags`
+//! -- a real `passt`-backed interface pinned to the session's egress
+//! proxy, replacing the Phase 3 `--network none` placeholder. This crate
+//! only splices that module's output into its own argv; the egress
+//! policy itself (the allowlist, the proxy, the reachability-restricting
+//! firewall ruleset) lives in `crates/egress`, per `file-structure.md`
+//! Section 2's "not duplicated per-domain" rule.
 
 pub mod command_runner;
 pub mod launcher;

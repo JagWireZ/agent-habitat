@@ -26,8 +26,8 @@
 //! per-project extension mechanism), the git-history toggle
 //! ([`git_history`], default off, hard-fails closed without a logged
 //! approval), and the Phase 2 slice of the checked-in project config
-//! ([`config`]) that carries both. Allowlist (Phase 5) and the rest of
-//! the operator config schema (Phase 7) are still to come.
+//! ([`config`]) that carries both. The rest of the operator config
+//! schema (Phase 7) is still to come.
 //!
 //! Adds: content-based secrets scanning ([`secrets_scan`], Betterleaks-
 //! powered), named alongside the filename blocklist under one
@@ -42,9 +42,16 @@
 //! `crates/vm`'s launcher reads to bound each session's microVM -- same
 //! "shared, not duplicated per-domain" rule, just for a different
 //! consumer than the blocklist/allowlist.
+//!
+//! Phase 5 adds: [`egress_allowlist`], the default-deny egress allowlist
+//! schema `crates/egress`'s local proxy checks every guest connection's
+//! SNI hostname against -- built-in defaults plus a project's own
+//! additive-only `egress_allowlist_additions` (`config::ProjectConfig`),
+//! same "shared, not duplicated per-domain" rule as the blocklist.
 
 pub mod blocklist;
 pub mod config;
+pub mod egress_allowlist;
 pub mod git_history;
 pub mod resource_limits;
 pub mod secrets_scan;

@@ -3,6 +3,7 @@
 
 use habitat_policy::resource_limits::ResourceLimitsConfig;
 use std::fmt;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,6 +76,14 @@ pub struct LaunchRequest {
     /// never chosen independently per project or per session.
     pub guest_image: String,
     pub resource_limits: ResourceLimitsConfig,
+    /// The local egress proxy's bound address for this session
+    /// (`habitat_egress::proxy`) -- the guest's network is configured
+    /// (Phase 5, `habitat_egress::network_setup`) so this is the *only*
+    /// address it can reach at all. Required, not optional: there is no
+    /// launch path with no egress proxy configured (`AGENTS.md` Section
+    /// 2, invariant 7 -- fail closed on missing egress control, never
+    /// open by default).
+    pub egress_proxy_addr: SocketAddr,
 }
 
 /// What a successful launch hands back -- enough to tear the session
