@@ -71,6 +71,63 @@ pub fn touches_content_ruleset_file(paths: &[String]) -> bool {
     })
 }
 
+/// The env var git honors to stop walking upward while searching for an
+/// enclosing repository -- see [`git_apply_ceiling`]'s doc comment for
+/// why every `git apply`/`git apply --check` call in this crate that
+/// targets a plain (non-repo) directory must set it.
+pub const GIT_CEILING_DIRECTORIES_VAR: &str = "GIT_CEILING_DIRECTORIES";
+
+/// **Real-hardware-confirmed bug this works around:** `git apply`
+/// silently no-ops a *new file* hunk -- printing `Skipped patch
+/// '<file>'` to stderr but still exiting `0` -- whenever the `-C
+/// <target>` directory is a *subdirectory* of some other git repository
+/// discovered by walking upward from it, rather than that repository's
+/// own toplevel. This has nothing to do with `.gitignore` content
+/// (reproduced with zero ignore rules present); it depends purely on
+/// `target` being a subdirectory of a discovered repo vs. being a repo's
+/// own root vs. having no enclosing repo at all -- only the latter two
+/// apply cleanly.
+///
+/// `crate::sync`'s `project_root` is deliberately never a git repository
+/// of its own (Phase 2's plain, blocklist-filtered project tree), so
+/// every `git apply -C project_root` call is exposed to this the moment
+/// `project_root` happens to sit inside *any* unrelated enclosing repo.
+/// `tests/manual/validate-sync.sh` hit this directly (`project_root`
+/// lives nested under this very repo's own `tmp/`, discovered as the
+/// enclosing repo); a real user's project layout is not guaranteed to
+/// avoid it either. `mirror_dir` is unaffected -- it has its own `.git`,
+/// so git resolves it as its own toplevel, not a subdirectory of
+/// anything else.
+///
+/// The fix: point `GIT_CEILING_DIRECTORIES` at `target`'s own parent
+/// before invoking `git apply`. `target` itself is always checked first
+/// regardless of the ceiling, so this is a no-op for a directory that
+/// already *is* a repo's own toplevel (`mirror_dir`), and the actual fix
+/// for one that isn't (`project_root`) -- git's upward search now stops
+/// at the boundary instead of continuing on to discover an unrelated
+/// repo.
+///
+/// Returns the ceiling path as a UTF-8 string ready to hand to
+/// [`CommandRunner::run_with_env`] under [`GIT_CEILING_DIRECTORIES_VAR`].
+/// Errors rather than silently proceeding unprotected if `target` has no
+/// parent directory, or if the parent isn't valid UTF-8 -- an
+/// unprotected `git apply` call would silently reproduce the exact bug
+/// this exists to prevent, which is worse than failing loudly here.
+pub fn git_apply_ceiling(target: &Path) -> Result<String, PatchError> {
+    let parent = target.parent().ok_or_else(|| {
+        err(format!(
+            "cannot compute a {GIT_CEILING_DIRECTORIES_VAR} boundary for {} -- it has no parent directory",
+            target.display()
+        ))
+    })?;
+    parent.to_str().map(str::to_string).ok_or_else(|| {
+        err(format!(
+            "{GIT_CEILING_DIRECTORIES_VAR} boundary path {} is not valid UTF-8",
+            parent.display()
+        ))
+    })
+}
+
 /// Whether `git apply --check` accepts `patch` against the tree at
 /// `target_dir` -- the real, authoritative structural-validity check,
 /// run against whatever tree is the actual arrival point for this
@@ -97,8 +154,13 @@ pub fn structurally_valid<R: CommandRunner>(
         let patch_path = tmp
             .to_str()
             .ok_or_else(|| err("temp patch file path is not valid UTF-8"))?;
+        let ceiling = git_apply_ceiling(target_dir)?;
         let output = runner
-            .run("git", &["-C", target, "apply", "--check", patch_path])
+            .run_with_env(
+                &[(GIT_CEILING_DIRECTORIES_VAR, ceiling.as_str())],
+                "git",
+                &["-C", target, "apply", "--check", patch_path],
+            )
             .map_err(|e| err(format!("could not run `git apply --check`: {e}")))?;
         Ok(output.status.success())
     })();

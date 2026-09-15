@@ -281,6 +281,17 @@ fn commit_with_synthetic_identity<R: CommandRunner>(
     .map_err(|e| err(e.to_string()))
 }
 
+/// **2026-09-15 fix, confirmed via `tests/manual/validate-sync.sh`'s
+/// diagnostics on real hardware:** always runs `git apply` with
+/// `GIT_CEILING_DIRECTORIES` pinned to `dir`'s own parent
+/// (`patch::git_apply_ceiling`). Without it, applying a *new file* patch
+/// to `project_root` (never a git repo of its own) silently no-ops --
+/// `git apply` prints `Skipped patch` and exits `0` -- the instant
+/// `project_root` happens to sit inside some other, unrelated
+/// repository's working tree; the file lands nowhere, and this function
+/// would report success. `mirror_dir` is unaffected either way (it's
+/// always its own repo toplevel), so the ceiling is applied
+/// unconditionally here rather than only for `project_root`'s call site.
 fn apply_patch_to_dir<R: CommandRunner>(
     runner: &R,
     dir: &Path,
@@ -294,8 +305,13 @@ fn apply_patch_to_dir<R: CommandRunner>(
         let patch_path = tmp
             .to_str()
             .ok_or_else(|| err("temp patch path is not valid UTF-8"))?;
+        let ceiling = patch::git_apply_ceiling(dir).map_err(|e| err(e.to_string()))?;
         let output = runner
-            .run("git", &["-C", dir_str, "apply", patch_path])
+            .run_with_env(
+                &[(patch::GIT_CEILING_DIRECTORIES_VAR, ceiling.as_str())],
+                "git",
+                &["-C", dir_str, "apply", patch_path],
+            )
             .map_err(|e| err(format!("could not run `git apply`: {e}")))?;
         if !output.status.success() {
             return Err(err(format!(

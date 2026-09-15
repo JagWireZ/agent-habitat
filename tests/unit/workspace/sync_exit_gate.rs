@@ -489,3 +489,122 @@ fn sync_perf_is_measured_against_a_large_binary_fixture_with_real_numbers() {
     fs::remove_dir_all(&project).unwrap();
     fs::remove_dir_all(&mirror).unwrap();
 }
+
+/// **Regression test for the 2026-09-15 `GIT_CEILING_DIRECTORIES` fix**
+/// (`crate::patch::git_apply_ceiling`), found via
+/// `tests/manual/validate-sync.sh`'s real-hardware diagnostics: applying
+/// a sandbox->host patch that creates a *new* file must actually land
+/// that file in `project_root` on disk, even when `project_root` is
+/// nested inside some other, unrelated git repository -- not just report
+/// `Applied` while `git apply` silently skips it (`Skipped patch`, exit
+/// `0`) because it discovered that outer repo and `project_root` isn't
+/// its toplevel. Deliberately does *not* use `tests/unit/workspace`'s
+/// usual `temp_dir()` helper for `project_root`, since `std::env::temp_dir()`
+/// (`/tmp`) has no enclosing repo and would never have caught this --
+/// exactly why this bug shipped past every other test in this file.
+#[test]
+fn sandbox_to_host_applies_a_new_file_even_when_project_root_is_nested_in_another_repo() {
+    // Simulate an unrelated enclosing repository -- e.g. the real
+    // `tests/manual/validate-sync.sh` scenario, where `project_root`
+    // lives under agent-habitat's own `tmp/`, itself a real git repo.
+    let outer_repo = temp_dir("nested-outer-repo");
+    git_init_committed(&outer_repo);
+    let project = outer_repo.join("some").join("nested").join("project");
+    fs::create_dir_all(&project).unwrap();
+    // project_root deliberately has no `.git` of its own -- it's never
+    // supposed to be a repo (Phase 2's plain, blocklist-filtered tree).
+    assert!(!project.join(".git").exists());
+
+    // mirror_dir must already be a committed repo here -- in production
+    // it would already have been seeded by an earlier host->sandbox
+    // round; this test only exercises the sandbox->host direction.
+    let mirror = temp_dir("nested-mirror");
+    git_init_committed(&mirror);
+    let flagged_dir = temp_dir("nested-flagged");
+    let store = FlaggedPatchStore::new(&flagged_dir);
+
+    let new_file_patch = "diff --git a/from-guest.txt b/from-guest.txt\n\
+new file mode 100644\n\
+index 0000000..1111111\n\
+--- /dev/null\n\
++++ b/from-guest.txt\n\
+@@ -0,0 +1 @@\n\
++hello from the guest\n";
+
+    let runner = FakeCommandRunner::default()
+        .with_ok(
+            &ssh_invocation(
+                &[],
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "status", "--porcelain"],
+            ),
+            "?? from-guest.txt\n",
+        )
+        .with_ok(
+            &ssh_invocation(
+                &SYNC_IDENTITY_ENV,
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "add", "-A"],
+            ),
+            "",
+        )
+        .with_ok(
+            &ssh_invocation(
+                &SYNC_IDENTITY_ENV,
+                "git",
+                &[
+                    "-C",
+                    GUEST_WORKSPACE_DIR,
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "habitat sync",
+                ],
+            ),
+            "",
+        )
+        .with_ok(
+            &ssh_invocation(
+                &[],
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "diff", "HEAD~1", "HEAD"],
+            ),
+            new_file_patch,
+        );
+    let audit = MemoryAuditSink::default();
+    let request = SandboxToHostRequest {
+        project_root: &project,
+        mirror_dir: &mirror,
+        guest: guest_endpoint(),
+        patterns: &[],
+        flagged_store: &store,
+    };
+
+    // The structural check and the real apply both run for real
+    // (`SystemCommandRunner`) against `project`, exactly as they would
+    // in production -- only the guest side is faked.
+    let host_runner = SystemCommandRunner;
+    let outcome = sync::sync_sandbox_to_host(&request, &host_runner, &runner, &audit).unwrap();
+
+    match &outcome {
+        SyncOutcome::Applied { touched_paths, .. } => {
+            assert_eq!(touched_paths, &vec!["from-guest.txt".to_string()]);
+        }
+        other => panic!("expected Applied, got {other:?}"),
+    }
+
+    // The actual regression check: without the GIT_CEILING_DIRECTORIES
+    // fix, `outcome` would already claim `Applied` above while this file
+    // silently never existed.
+    assert_eq!(
+        fs::read_to_string(project.join("from-guest.txt")).unwrap(),
+        "hello from the guest\n",
+        "an 'Applied' outcome must mean the file actually landed in \
+         project_root, even when project_root sits inside an unrelated \
+         enclosing git repository"
+    );
+
+    fs::remove_dir_all(&outer_repo).unwrap();
+    fs::remove_dir_all(&mirror).unwrap();
+    fs::remove_dir_all(&flagged_dir).unwrap();
+}

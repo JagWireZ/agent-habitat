@@ -22,15 +22,42 @@ use std::process::Output;
 /// `status.success() == false`, which callers must check -- same
 /// contract as `habitat_install::Environment::run_command`.
 pub trait CommandRunner {
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output>;
+    /// Runs `program` with `args`, inheriting this process's own
+    /// environment unchanged. Equivalent to `run_with_env(&[], program,
+    /// args)` -- kept as a separate method (rather than making every
+    /// call site pass `&[]`) purely for callers that have no env
+    /// concerns at all.
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        self.run_with_env(&[], program, args)
+    }
+
+    /// Runs `program` with `args`, plus `env` set on top of this
+    /// process's own environment. Deliberately **not** defaulted to
+    /// silently ignore `env` and fall back to plain `run` -- a caller
+    /// that requests `GIT_CEILING_DIRECTORIES` (see
+    /// `crate::patch::git_apply_ceiling`) to stop `git apply` from
+    /// walking into an unrelated enclosing repository needs to know, at
+    /// compile time, whether its runner actually honors that or would
+    /// silently reproduce the exact bug the env var exists to prevent.
+    /// Every real implementation must decide this explicitly.
+    fn run_with_env(&self, env: &[(&str, &str)], program: &str, args: &[&str])
+        -> io::Result<Output>;
 }
 
 /// The real, unmocked runner.
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
-        std::process::Command::new(program).args(args).output()
+    fn run_with_env(
+        &self,
+        env: &[(&str, &str)],
+        program: &str,
+        args: &[&str],
+    ) -> io::Result<Output> {
+        std::process::Command::new(program)
+            .args(args)
+            .envs(env.iter().map(|(k, v)| (*k, *v)))
+            .output()
     }
 }
 
@@ -116,7 +143,18 @@ pub mod testing {
     }
 
     impl CommandRunner for FakeCommandRunner {
-        fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        /// Ignores `env` entirely -- no fake-runner test needs to assert
+        /// on it today, only on which program+args ran (`invocations`
+        /// already captures that). If a future test needs to assert a
+        /// call carried a specific `GIT_CEILING_DIRECTORIES` (or any
+        /// other env var), extend `key()`/`invocations` to include it
+        /// rather than reaching around this method.
+        fn run_with_env(
+            &self,
+            _env: &[(&str, &str)],
+            program: &str,
+            args: &[&str],
+        ) -> io::Result<Output> {
             let key = Self::key(program, args);
             self.invocations.borrow_mut().push(key.clone());
             match self.outcomes.get(&key) {
