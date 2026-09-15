@@ -23,3 +23,8 @@ current, standalone decision for its layer.
 - [`0006-distribution-packaging-layer.md`](0006-distribution-packaging-layer.md)
   -- `habitat` ships as prebuilt binaries/native packages, not built from
   source by operators.
+- [`0007-content-secrets-scan-snapshot.md`](0007-content-secrets-scan-snapshot.md)
+  -- content-based secrets scanning's effective ruleset is snapshotted
+  once per session/build, never re-read on sync; records what Phase 4's
+  sync/patch validation must do with a mid-session `betterleaks.toml`
+  edit once that phase is built.

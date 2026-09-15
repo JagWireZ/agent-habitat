@@ -14,3 +14,12 @@ reaching the disk image or the staging artifact -- lives in
 
 Phase 4 (two-point sync) adds more logic, and therefore more tests, here
 later.
+
+`content_scan_exit_gate.rs` holds the exit gate for content-based secrets
+scanning (Betterleaks): the enabled/disabled flag is respected, scanning
+fails closed when the `betterleaks` binary isn't installed, the effective
+ruleset snapshot written per build merges the bundled baseline with a
+project's own `betterleaks.toml`, and a real (stub) `betterleaks` on
+`PATH` blocks exactly the file carrying a finding. A project ruleset
+attempting to weaken or disable detection is covered adversarially
+instead, in `tests/adversarial/content_scan_ruleset_tamper.rs`.

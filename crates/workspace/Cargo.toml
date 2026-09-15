@@ -19,5 +19,13 @@ name = "exit_gate"
 path = "../../tests/unit/workspace/exit_gate.rs"
 
 [[test]]
+name = "content_scan_exit_gate"
+path = "../../tests/unit/workspace/content_scan_exit_gate.rs"
+
+[[test]]
 name = "blocklist_disk_image"
 path = "../../tests/adversarial/blocklist_disk_image.rs"
+
+[[test]]
+name = "content_scan_ruleset_tamper"
+path = "../../tests/adversarial/content_scan_ruleset_tamper.rs"

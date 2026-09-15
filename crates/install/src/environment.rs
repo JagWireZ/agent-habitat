@@ -238,7 +238,13 @@ pub mod testing {
             let key = Self::invocation_key(program, args);
             match self.command_results.get(&key) {
                 Some(result) => Ok(Output {
-                    status: ExitStatus::from_raw(if result.success { 0 } else { 1 }),
+                    // See `habitat-workspace`'s `FakeCommandRunner` for
+                    // why this shifts into bits 8-15 rather than using
+                    // the raw value `1` directly: `.success()` behaves
+                    // identically either way, but only the shifted form
+                    // makes `.code()` decode as a normal exit with code 1
+                    // rather than `None` (signal-terminated).
+                    status: ExitStatus::from_raw(if result.success { 0 } else { 1 << 8 }),
                     stdout: result.stdout.clone().into_bytes(),
                     stderr: result.stderr.clone().into_bytes(),
                 }),

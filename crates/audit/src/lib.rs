@@ -41,6 +41,22 @@ pub enum EventKind {
     /// attempt, not just failures -- running `sudo` on the operator's
     /// behalf is security-relevant regardless of outcome.
     InstallAction,
+    /// A sandbox->host sync patch touched a project's `betterleaks.toml`
+    /// mid-session. Boundary-relevant even though it's an ordinary-
+    /// looking file edit: this file governs content-based secrets
+    /// scanning, and the running session's effective ruleset is a
+    /// snapshot taken once at session start (`habitat_policy::secrets_scan`),
+    /// never re-read on a later sync -- so an edit here must be visibly
+    /// distinct from any other file's edit, not silently merged into a
+    /// weaker snapshot.
+    ///
+    /// **Not yet emitted anywhere**: this variant exists so the vocabulary
+    /// is in place, but nothing calls it yet -- the two-point sync/patch-
+    /// validation mechanism it depends on (`docs/plan.md` Section 2.2,
+    /// Phase 4 of `tmp/wip/implementation-plan.md`) isn't built. See
+    /// `docs/decisions/0007-content-secrets-scan-snapshot.md` for the
+    /// design note covering what emits this once Phase 4 lands.
+    ContentRulesetMidSessionEdit,
 }
 
 impl EventKind {
@@ -49,6 +65,7 @@ impl EventKind {
             EventKind::PreflightFailure => "preflight-failure",
             EventKind::InstallFailure => "install-failure",
             EventKind::InstallAction => "install-action",
+            EventKind::ContentRulesetMidSessionEdit => "content-ruleset-mid-session-edit",
         }
     }
 }
@@ -190,6 +207,10 @@ mod tests {
         assert_eq!(EventKind::PreflightFailure.tag(), "preflight-failure");
         assert_eq!(EventKind::InstallFailure.tag(), "install-failure");
         assert_eq!(EventKind::InstallAction.tag(), "install-action");
+        assert_eq!(
+            EventKind::ContentRulesetMidSessionEdit.tag(),
+            "content-ruleset-mid-session-edit"
+        );
         assert_ne!(
             EventKind::PreflightFailure.tag(),
             EventKind::InstallFailure.tag()
@@ -197,6 +218,10 @@ mod tests {
         assert_ne!(
             EventKind::InstallAction.tag(),
             EventKind::InstallFailure.tag()
+        );
+        assert_ne!(
+            EventKind::ContentRulesetMidSessionEdit.tag(),
+            EventKind::InstallAction.tag()
         );
     }
 

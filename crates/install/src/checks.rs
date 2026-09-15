@@ -16,6 +16,7 @@ pub enum CheckId {
     Kvm,
     Podman,
     KrunRuntime,
+    Betterleaks,
 }
 
 impl CheckId {
@@ -25,6 +26,7 @@ impl CheckId {
             CheckId::Kvm => "kvm",
             CheckId::Podman => "podman",
             CheckId::KrunRuntime => "krun-runtime",
+            CheckId::Betterleaks => "betterleaks",
         }
     }
 }
@@ -196,6 +198,38 @@ pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
     }
 }
 
+/// The `betterleaks` binary (content-based secrets scanning) on `PATH`.
+/// Only run when a project's checked-in config has `secrets_scan.content`
+/// enabled (the default) -- see `crate::preflight::run_preflight`, which
+/// gates the call to this check on that flag rather than always running
+/// it, since a project may have explicitly opted out of content scanning
+/// and shouldn't be blocked on a binary it doesn't need.
+///
+/// Same shape as [`krun_runtime`]: absence is a hard preflight failure,
+/// never a silent skip -- content scanning that's supposed to be on must
+/// not quietly become a no-op because the scanner isn't installed
+/// (AGENTS.md Section 2 invariant 11, "fail closed and never silently").
+pub fn betterleaks<E: Environment>(env: &E) -> CheckResult {
+    match env.run_command("betterleaks", &["--version"]) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => fail(
+            CheckId::Betterleaks,
+            format!(
+                "betterleaks --version exited non-zero: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ),
+        Err(e) => fail(
+            CheckId::Betterleaks,
+            format!(
+                "betterleaks not found on PATH, but secrets_scan.content is enabled for this \
+                 project -- install betterleaks or set secrets_scan.content: disabled in the \
+                 project's checked-in config: {e}"
+            ),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +324,21 @@ mod tests {
     fn krun_runtime_passes_when_present() {
         let env = FakeEnvironment::linux().with_command_ok("krun --version", "krun 1.14");
         assert!(krun_runtime(&env).is_ok());
+    }
+
+    #[test]
+    fn betterleaks_fails_when_missing() {
+        let env = FakeEnvironment::linux();
+        let err = betterleaks(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::Betterleaks);
+        assert!(err.message.contains("secrets_scan.content"));
+    }
+
+    #[test]
+    fn betterleaks_passes_when_present() {
+        let env =
+            FakeEnvironment::linux().with_command_ok("betterleaks --version", "betterleaks 0.4.0");
+        assert!(betterleaks(&env).is_ok());
     }
 
     // The Phase 1 exit-gate scenarios (KVM-absent reported not-false-positive,

@@ -12,10 +12,25 @@
 
 use habitat_policy::config::ProjectConfig;
 use habitat_policy::git_history::{GitHistoryApproval, GitHistoryConfig};
+use habitat_policy::secrets_scan::{SecretsScanConfig, Toggle};
 use habitat_workspace::command_runner::SystemCommandRunner;
 use habitat_workspace::pipeline::{self, BuildError, BuildRequest};
 use std::fs;
 use std::path::PathBuf;
+
+/// `betterleaks` isn't ordinary tooling guaranteed present in this dev
+/// container or CI (unlike `git`/e2fsprogs, per Phase 2's own precedent;
+/// see `crates/install/src/checks.rs::betterleaks` for why this needs its
+/// own preflight check). These git-history-toggle tests aren't about
+/// content scanning at all, so they disable it explicitly rather than
+/// depending on a binary that may not be installed. Content-scanning's
+/// own exit gate lives in `content_scan_exit_gate.rs` alongside this file.
+fn content_scan_disabled() -> SecretsScanConfig {
+    SecretsScanConfig {
+        content: Toggle::Disabled,
+        ..Default::default()
+    }
+}
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -53,7 +68,10 @@ fn flipping_git_history_on_without_approval_hard_fails_the_whole_build_before_st
                 enabled: true,
                 approval: None,
             },
+            secrets_scan: content_scan_disabled(),
+            resource_limits: Default::default(),
         },
+        content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };
 
     let result = pipeline::build(request, &SystemCommandRunner);
@@ -83,7 +101,11 @@ fn default_off_git_history_builds_a_synthetic_repo() {
         staging_dir: workdir.join("staging"),
         image_path: workdir.join("session.img"),
         image_size_mb: 16,
-        project_config: ProjectConfig::default(),
+        project_config: ProjectConfig {
+            secrets_scan: content_scan_disabled(),
+            ..Default::default()
+        },
+        content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };
 
     let outcome = pipeline::build(request, &SystemCommandRunner).unwrap();
@@ -125,7 +147,10 @@ fn approved_git_history_toggle_shares_real_history() {
                     reason: "team needs blame history".to_string(),
                 }),
             },
+            secrets_scan: content_scan_disabled(),
+            resource_limits: Default::default(),
         },
+        content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };
 
     let outcome = pipeline::build(request, &SystemCommandRunner).unwrap();

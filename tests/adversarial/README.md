@@ -23,6 +23,23 @@ hardening nice-to-haves.
   container and in CI, so it runs for real here rather than deferring to
   `tests/manual/`.
 
-Phase 3 (containment-escape) and Phase 5 (egress-bypass) still need
-real KVM and are not yet populated; see `tests/manual/` for why those
-two land there instead once built.
+- `content_scan_ruleset_tamper.rs` (content-based secrets scanning):
+  confirms a project's own `betterleaks.toml` can't be used to weaken or
+  fully disable detection -- a catch-all `[allowlist]` regex hard-fails
+  the build before anything is staged, and an empty project ruleset can't
+  be read as "skip the baseline too" (the baseline is always present in
+  the effective ruleset regardless of what the project supplies).
+
+- `containment_escape.rs` (Phase 3): the mocked-launch-seam half of the
+  containment story -- confirms the `podman run` argv this crate builds
+  never includes a bind mount (`-v`, `--mount type=bind`), never widens
+  host privilege (`--privileged`, `--cap-add`, `--pid=host`,
+  `--network=host`, and similar), and defaults the guest's network to
+  explicitly `none` rather than an unset default. This is *not* the exit
+  gate's real escape-attempt test -- reaching host files/processes/network
+  from inside an actually-booted guest needs real KVM, which neither this
+  dev container nor this project's CI has, so that attempt is
+  `tests/manual/validate-vm-launch.sh`'s job instead.
+
+Phase 5 (egress-bypass) still needs real KVM and is not yet populated;
+see `tests/manual/` for why it lands there instead once built.

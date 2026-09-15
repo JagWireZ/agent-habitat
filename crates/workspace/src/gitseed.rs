@@ -62,10 +62,24 @@ pub fn seed_synthetic<R: CommandRunner>(
 
     run_git(runner, dir, &["init", "--quiet"])?;
     run_git(runner, dir, &["add", "--all"])?;
+    // `--allow-empty`: staging can legitimately end up with nothing in it
+    // -- every file filtered by the blocklist and/or the content scanner
+    // (e.g. content scanning enabled with the scanner unavailable, which
+    // fails closed on every file -- `crate::content_scan`) is a real,
+    // if unusual, outcome, not something that should turn into a
+    // confusing "nothing to commit" git failure that masks the actual
+    // reason staging ended up empty (that reason is already recorded in
+    // `StagingReport`).
     run_git_with_identity(
         runner,
         dir,
-        &["commit", "--quiet", "-m", SYNTHETIC_COMMIT_MESSAGE],
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            SYNTHETIC_COMMIT_MESSAGE,
+        ],
     )?;
     Ok(())
 }
@@ -247,6 +261,22 @@ mod tests {
         assert!(log.contains(SYNTHETIC_COMMIT_MESSAGE));
         assert_eq!(log.lines().count(), 1, "exactly one synthetic commit");
 
+        fs::remove_dir_all(&staging).unwrap();
+    }
+
+    /// Staging can legitimately end up empty (every file filtered out by
+    /// the blocklist and/or content scan) -- seeding a synthetic repo
+    /// over it must still succeed, not fail with a confusing "nothing to
+    /// commit" error that masks the real, already-recorded reason
+    /// staging ended up empty.
+    #[test]
+    fn seed_synthetic_succeeds_over_an_empty_staging_directory() {
+        let _guard = GIT_IDENTITY_ENV_LOCK.lock().unwrap();
+        let staging = temp_dir("empty-staging");
+
+        seed_synthetic(&staging, &SystemCommandRunner).unwrap();
+
+        assert!(staging.join(".git").is_dir());
         fs::remove_dir_all(&staging).unwrap();
     }
 

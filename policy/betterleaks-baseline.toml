@@ -1,0 +1,65 @@
+# Betterleaks baseline content-scan ruleset -- Agent Habitat.
+#
+# Baked into the binary (see `crates/policy/src/secrets_scan.rs`'s
+# `include_str!`), not re-read from disk at runtime -- mirrors
+# `blocklist.txt`'s "shipped default, project additions are additive
+# only" contract. A project's own `betterleaks.toml` (resolution order
+# documented in `secrets_scan.rs`) is merged on top of this file via
+# `merge_rules`; it can add rules or a narrow allowlist entry, but it can
+# never remove, replace, or blanket-suppress anything defined here.
+#
+# Rule shape mirrors common gitleaks-style rulesets: an id, a regex, and
+# optional keywords used as a cheap pre-filter before the regex runs.
+# This is data, not code -- `crates/workspace`'s content-scan module
+# never parses this file directly; it hands the merged text straight to
+# the `betterleaks` binary via `--config`.
+
+title = "Agent Habitat baseline content-scan rules"
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API key / token assignment"
+regex = '''(?i)(api[_-]?key|api[_-]?token|secret[_-]?key)\s*[:=]\s*['"][A-Za-z0-9_\-]{16,}['"]'''
+keywords = ["api_key", "api-key", "apikey", "secret_key", "secretkey"]
+
+[[rules]]
+id = "aws-access-key-id"
+description = "AWS access key ID"
+regex = '''AKIA[0-9A-Z]{16}'''
+keywords = ["AKIA"]
+
+[[rules]]
+id = "aws-secret-access-key"
+description = "AWS secret access key assignment"
+regex = '''(?i)aws_secret_access_key\s*[:=]\s*['"][A-Za-z0-9/+=]{40}['"]'''
+keywords = ["aws_secret_access_key"]
+
+[[rules]]
+id = "private-key-block"
+description = "PEM-style private key block"
+regex = '''-----BEGIN[ A-Z]*PRIVATE KEY-----'''
+keywords = ["PRIVATE KEY"]
+
+[[rules]]
+id = "jwt-token"
+description = "JSON Web Token"
+regex = '''eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}'''
+keywords = ["eyJ"]
+
+[[rules]]
+id = "slack-token"
+description = "Slack API token"
+regex = '''xox[baprs]-[A-Za-z0-9-]{10,}'''
+keywords = ["xoxb", "xoxa", "xoxp", "xoxr", "xoxs"]
+
+[[rules]]
+id = "github-token"
+description = "GitHub personal access / app token"
+regex = '''gh[pousr]_[A-Za-z0-9]{36,}'''
+keywords = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+
+[[rules]]
+id = "generic-password-assignment"
+description = "Generic password assignment with a non-trivial value"
+regex = '''(?i)password\s*[:=]\s*['"][^'"\s]{8,}['"]'''
+keywords = ["password"]

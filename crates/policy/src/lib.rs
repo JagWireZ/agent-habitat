@@ -28,10 +28,26 @@
 //! approval), and the Phase 2 slice of the checked-in project config
 //! ([`config`]) that carries both. Allowlist (Phase 5) and the rest of
 //! the operator config schema (Phase 7) are still to come.
+//!
+//! Adds: content-based secrets scanning ([`secrets_scan`], Betterleaks-
+//! powered), named alongside the filename blocklist under one
+//! `secrets_scan:` config mapping (`filenames` / `content`, both default
+//! enabled) rather than a second, parallel config surface -- per
+//! `file-structure.md` Section 4's "no second config/policy directory"
+//! rule. `crates/workspace` is what actually shells out to the
+//! `betterleaks` binary; this crate only owns the schema, the toggle
+//! defaults, and the baseline/project ruleset merge rule.
+//!
+//! Phase 3 adds: [`resource_limits`], the CPU/memory-cap schema
+//! `crates/vm`'s launcher reads to bound each session's microVM -- same
+//! "shared, not duplicated per-domain" rule, just for a different
+//! consumer than the blocklist/allowlist.
 
 pub mod blocklist;
 pub mod config;
 pub mod git_history;
+pub mod resource_limits;
+pub mod secrets_scan;
 
 use std::path::PathBuf;
 

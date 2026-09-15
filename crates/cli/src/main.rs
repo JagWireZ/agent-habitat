@@ -80,6 +80,7 @@ fn friendly_name(check: CheckId) -> &'static str {
         CheckId::Kvm => "Hardware virtualization",
         CheckId::Podman => "Container runtime",
         CheckId::KrunRuntime => "Sandbox isolation layer",
+        CheckId::Betterleaks => "Content secrets scanner",
     }
 }
 
@@ -91,6 +92,7 @@ fn friendly_status(check: CheckId) -> &'static str {
         CheckId::Kvm => "Not available",
         CheckId::Podman => "Not found",
         CheckId::KrunRuntime => "Not found",
+        CheckId::Betterleaks => "Not found",
     }
 }
 
@@ -131,6 +133,10 @@ fn fix_for(check: CheckId) -> Fix {
             reason: "Installs crun-krun, the OCI runtime (backed by libkrun) Podman uses to launch each session in its own microVM instead of a shared-kernel container. Not yet packaged for Debian/Ubuntu-family hosts.",
             commands: &["sudo dnf install -y crun-krun   # AlmaLinux/Fedora/RHEL-family"],
         },
+        CheckId::Betterleaks => Fix {
+            reason: "This project's checked-in config has content-based secrets scanning turned on, but the betterleaks scanner isn't installed. Install it, or turn content scanning off in the project's config (secrets_scan.content: disabled) if that's a deliberate choice for this project.",
+            commands: &[],
+        },
     }
 }
 
@@ -151,6 +157,9 @@ fn technical_detail(check: CheckId) -> &'static str {
         }
         CheckId::KrunRuntime => {
             "Install the `crun-krun` package so `krun` (the OCI runtime binary Podman exec's, with libkrun linked directly into it -- note the package and binary are named differently) is resolvable on PATH -- there is no separate hypervisor binary to install alongside it."
+        }
+        CheckId::Betterleaks => {
+            "Install the `betterleaks` binary so it's resolvable on PATH, or set secrets_scan.content: disabled in the project's checked-in config -- this check only runs when that project has content-based secrets scanning enabled (the default)."
         }
     }
 }
@@ -380,10 +389,20 @@ fn cmd_run(verbose: bool) -> ExitCode {
     let env = SystemEnvironment;
     let audit = audit_sink();
     print_intro("Getting your session ready");
-    let statuses = preflight_report(&env);
+    // Phase 7 hasn't wired up `--config`/full CLI parsing yet, but the
+    // one config field this preflight step needs (`secrets_scan.content`)
+    // is cheap to read now: a missing `sandbox.yaml` in the current
+    // directory resolves to `ProjectConfig::default()` (both toggles
+    // enabled), same "absence is just defaults" contract as
+    // `habitat_policy::config::load` documents.
+    let secrets_scan_content_enabled =
+        habitat_policy::config::load(std::path::Path::new("sandbox.yaml"))
+            .map(|c| c.secrets_scan.content.is_enabled())
+            .unwrap_or(true);
+    let statuses = preflight_report(&env, secrets_scan_content_enabled);
     print_checklist(&statuses);
     let s = style();
-    match run_preflight(&env, &audit) {
+    match run_preflight(&env, &audit, secrets_scan_content_enabled) {
         Ok(()) => {
             // Phase 1 stops here. Phases 2-6 (disk build, VM launch,
             // two-point sync, egress, full audit) are assembled behind
@@ -442,8 +461,8 @@ mod tests {
     /// `install_missing` for.
     #[test]
     fn unrecognized_distro_plans_no_auto_install() {
-        let env = FakeEnvironment::linux()
-            .with_file("/etc/os-release", "NAME=\"Arch Linux\"\nID=arch\n");
+        let env =
+            FakeEnvironment::linux().with_file("/etc/os-release", "NAME=\"Arch Linux\"\nID=arch\n");
         assert!(matches!(
             plan_auto_install(&env),
             AutoInstallPlan::NoFamilyDetected

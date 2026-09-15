@@ -90,7 +90,21 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
         staging_dir: staging_dir.clone(),
         image_path: image_path.clone(),
         image_size_mb: 32,
-        project_config: ProjectConfig::default(),
+        // This test is about the filename blocklist specifically; content
+        // scanning has its own adversarial coverage in
+        // `content_scan_ruleset_tamper.rs` and its own exit gate in
+        // `tests/unit/workspace/content_scan_exit_gate.rs`. Disabled here
+        // so this test doesn't depend on `betterleaks` being installed
+        // (it isn't ordinary tooling guaranteed present, unlike
+        // `git`/e2fsprogs -- see `crates/install/src/checks.rs::betterleaks`).
+        project_config: ProjectConfig {
+            secrets_scan: habitat_policy::secrets_scan::SecretsScanConfig {
+                content: habitat_policy::secrets_scan::Toggle::Disabled,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };
     let outcome = pipeline::build(request, &SystemCommandRunner).expect("build should succeed");
 

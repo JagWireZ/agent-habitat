@@ -30,7 +30,7 @@ fn preflight_reports_missing_kvm_not_a_false_positive() {
     // Deliberately no `/dev/kvm` and no /proc/cpuinfo virt flag registered.
 
     let audit = MemoryAuditSink::default();
-    let result = run_preflight(&env, &audit);
+    let result = run_preflight(&env, &audit, false);
 
     let err = result.expect_err("preflight must fail closed when /dev/kvm is absent, not pass");
     assert_eq!(
@@ -67,7 +67,7 @@ fn broken_krun_runtime_install_fails_closed_with_distinct_tag() {
         .with_command_failure("krun --version", "error: no such runtime handler");
 
     let audit = MemoryAuditSink::default();
-    let err = run_preflight(&env, &audit)
+    let err = run_preflight(&env, &audit, false)
         .expect_err("a broken krun-runtime install must fail closed, not be treated as available");
     assert_eq!(err.0.check.name(), "krun-runtime");
 
@@ -89,6 +89,43 @@ fn broken_krun_runtime_install_fails_closed_with_distinct_tag() {
     assert_eq!(install_err.0.check.name(), "krun-runtime");
     let install_events = install_audit.events.lock().unwrap();
     assert_eq!(install_events[0].kind.tag(), "install-failure");
+}
+
+/// Exit gate: "preflight fails clearly when betterleaks is enabled but
+/// the binary is missing" -- content-based secrets scanning
+/// (`secrets_scan.content: enabled`, the default) must never silently
+/// degrade to no scanning at all just because the operator hasn't
+/// installed the scanner. Everything else on this host is healthy;
+/// `betterleaks` alone is absent.
+#[test]
+fn preflight_fails_closed_when_betterleaks_enabled_but_binary_missing() {
+    let env = FakeEnvironment::linux()
+        .with_existing_path("/dev/kvm")
+        .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
+        .with_command_ok("podman --version", "podman version 5.0.0")
+        .with_command_ok("podman info", "host: ...")
+        .with_command_ok("krun --version", "krun 1.14");
+    // Deliberately no `betterleaks` command configured on the fake.
+
+    let audit = MemoryAuditSink::default();
+    let err = run_preflight(&env, &audit, true).expect_err(
+        "secrets_scan.content enabled with betterleaks missing must fail closed, not silently skip scanning",
+    );
+    assert_eq!(err.0.check.name(), "betterleaks");
+
+    let events = audit.events.lock().unwrap();
+    assert_eq!(events.len(), 1, "exactly one distinctly-tagged failure");
+    assert_eq!(events[0].kind.tag(), "preflight-failure");
+    assert_eq!(events[0].check.as_deref(), Some("betterleaks"));
+
+    // The same host with content scanning left at its project's declared
+    // default of disabled must not be blocked on a binary it doesn't need.
+    let audit_disabled = MemoryAuditSink::default();
+    assert!(
+        run_preflight(&env, &audit_disabled, false).is_ok(),
+        "disabled content scanning must not require betterleaks"
+    );
+    assert!(audit_disabled.events.lock().unwrap().is_empty());
 }
 
 /// Exit gate: "installer run twice on an already-correct host produces no

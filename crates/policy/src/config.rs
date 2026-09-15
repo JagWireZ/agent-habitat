@@ -20,17 +20,30 @@
 //! error rather than a silently-ignored typo, since a operator who thinks
 //! `git_hstory:` (typo) turned a toggle on deserves a load failure, not
 //! quiet non-effect.
+//!
+//! Phase 3 adds one more top-level mapping, `resource_limits` (`cpus`,
+//! `memory_mb`) -- `crates/vm`'s launcher reads it the same way Phase 2's
+//! two fields are read here; a project only overrides what it wants to
+//! change, and either key absent keeps `ResourceLimitsConfig::default()`.
 
 use crate::git_history::{GitHistoryApproval, GitHistoryConfig};
+use crate::resource_limits::ResourceLimitsConfig;
+use crate::secrets_scan::{SecretsScanConfig, Toggle};
 use std::fmt;
 use std::path::Path;
 
 /// The Phase 2 slice of the checked-in project config. Phase 7 adds
 /// fields here; it does not replace this one.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `resource_limits` doesn't derive `Eq` (it holds an `f64`), so this
+/// struct drops the `Eq` bound Phase 2 originally had -- `PartialEq` is
+/// still enough for every test/caller that compares configs.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectConfig {
     pub blocklist_additions: Vec<String>,
     pub git_history: GitHistoryConfig,
+    pub secrets_scan: SecretsScanConfig,
+    pub resource_limits: ResourceLimitsConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +116,26 @@ pub fn parse(contents: &str) -> Result<ProjectConfig, ConfigError> {
                 }
                 let (git_history, consumed) = parse_git_history(&lines, i + 1)?;
                 config.git_history = git_history;
+                i += 1 + consumed;
+            }
+            "secrets_scan" => {
+                if !rest.trim().is_empty() {
+                    return Err(err(
+                        "secrets_scan: must be a mapping (a bare value isn't allowed)",
+                    ));
+                }
+                let (secrets_scan, consumed) = parse_secrets_scan(&lines, i + 1)?;
+                config.secrets_scan = secrets_scan;
+                i += 1 + consumed;
+            }
+            "resource_limits" => {
+                if !rest.trim().is_empty() {
+                    return Err(err(
+                        "resource_limits: must be a mapping (a bare value isn't allowed)",
+                    ));
+                }
+                let (resource_limits, consumed) = parse_resource_limits(&lines, i + 1)?;
+                config.resource_limits = resource_limits;
                 i += 1 + consumed;
             }
             other => {
@@ -211,6 +244,80 @@ fn parse_git_history(
     Ok((GitHistoryConfig { enabled, approval }, i - start))
 }
 
+/// Parses the `secrets_scan:` mapping's nested `filenames` / `content` /
+/// `content_rules_path` keys. Both toggles default to
+/// [`Toggle::Enabled`] (via [`SecretsScanConfig::default`]) if their key
+/// is absent -- only an explicit `disabled` in the checked-in config
+/// turns either one off.
+fn parse_secrets_scan(
+    lines: &[&str],
+    start: usize,
+) -> Result<(SecretsScanConfig, usize), ConfigError> {
+    let mut config = SecretsScanConfig::default();
+
+    let mut i = start;
+    while i < lines.len() && indent_of(lines[i]) > 0 {
+        let (key, rest) = split_key(lines[i].trim_start())?;
+        let value = unquote(rest);
+        match key {
+            "filenames" => {
+                config.filenames = Toggle::parse(&value)
+                    .map_err(|e| err(format!("secrets_scan.filenames: {e}")))?;
+            }
+            "content" => {
+                config.content =
+                    Toggle::parse(&value).map_err(|e| err(format!("secrets_scan.content: {e}")))?;
+            }
+            "content_rules_path" => {
+                config.content_rules_path = Some(value);
+            }
+            other => {
+                return Err(err(format!(
+                    "unrecognized key {other:?} under secrets_scan"
+                )))
+            }
+        }
+        i += 1;
+    }
+
+    Ok((config, i - start))
+}
+
+/// Parses the `resource_limits:` mapping's nested `cpus` / `memory_mb`
+/// keys. Either key absent leaves that field at
+/// `ResourceLimitsConfig::default()`'s value -- a project only overrides
+/// what it wants to change, same shape as `secrets_scan`'s toggles.
+fn parse_resource_limits(
+    lines: &[&str],
+    start: usize,
+) -> Result<(ResourceLimitsConfig, usize), ConfigError> {
+    let mut config = ResourceLimitsConfig::default();
+
+    let mut i = start;
+    while i < lines.len() && indent_of(lines[i]) > 0 {
+        let (key, rest) = split_key(lines[i].trim_start())?;
+        let value = unquote(rest);
+        match key {
+            "cpus" => {
+                config.cpus =
+                    ResourceLimitsConfig::parse_cpus(&value).map_err(|e| err(e.to_string()))?;
+            }
+            "memory_mb" => {
+                config.memory_mb = ResourceLimitsConfig::parse_memory_mb(&value)
+                    .map_err(|e| err(e.to_string()))?;
+            }
+            other => {
+                return Err(err(format!(
+                    "unrecognized key {other:?} under resource_limits"
+                )))
+            }
+        }
+        i += 1;
+    }
+
+    Ok((config, i - start))
+}
+
 fn parse_bool(value: &str) -> Result<bool, ConfigError> {
     match value {
         "true" => Ok(true),
@@ -300,5 +407,67 @@ mod tests {
     fn malformed_list_entry_is_a_hard_error() {
         let err = parse("blocklist_additions:\n  not_a_list_item\n").unwrap_err();
         assert!(err.message.contains("list entry"));
+    }
+
+    #[test]
+    fn secrets_scan_defaults_both_toggles_enabled_when_absent() {
+        let config = parse("").unwrap();
+        assert!(config.secrets_scan.filenames.is_enabled());
+        assert!(config.secrets_scan.content.is_enabled());
+    }
+
+    #[test]
+    fn parses_secrets_scan_explicit_toggles_and_rules_path() {
+        let src = "secrets_scan:\n  filenames: enabled\n  content: disabled\n  content_rules_path: \"./custom-betterleaks.toml\"\n";
+        let config = parse(src).unwrap();
+        assert!(config.secrets_scan.filenames.is_enabled());
+        assert!(!config.secrets_scan.content.is_enabled());
+        assert_eq!(
+            config.secrets_scan.content_rules_path.as_deref(),
+            Some("./custom-betterleaks.toml")
+        );
+    }
+
+    #[test]
+    fn secrets_scan_rejects_a_non_enabled_disabled_value() {
+        let err = parse("secrets_scan:\n  content: sometimes\n").unwrap_err();
+        assert!(err.message.contains("enabled") && err.message.contains("disabled"));
+    }
+
+    #[test]
+    fn unrecognized_secrets_scan_key_is_a_hard_error() {
+        let err = parse("secrets_scan:\n  contnet: disabled\n").unwrap_err();
+        assert!(err.message.contains("unrecognized"));
+    }
+
+    #[test]
+    fn resource_limits_default_when_absent() {
+        let config = parse("").unwrap();
+        assert_eq!(config.resource_limits, ResourceLimitsConfig::default());
+    }
+
+    #[test]
+    fn parses_resource_limits_overrides() {
+        let config = parse("resource_limits:\n  cpus: 4\n  memory_mb: 8192\n").unwrap();
+        assert_eq!(config.resource_limits.cpus, 4.0);
+        assert_eq!(config.resource_limits.memory_mb, 8192);
+    }
+
+    #[test]
+    fn resource_limits_rejects_non_positive_cpus() {
+        let err = parse("resource_limits:\n  cpus: 0\n").unwrap_err();
+        assert!(err.message.contains("cpus"));
+    }
+
+    #[test]
+    fn resource_limits_rejects_zero_memory_mb() {
+        let err = parse("resource_limits:\n  memory_mb: 0\n").unwrap_err();
+        assert!(err.message.contains("memory_mb"));
+    }
+
+    #[test]
+    fn unrecognized_resource_limits_key_is_a_hard_error() {
+        let err = parse("resource_limits:\n  cpsu: 2\n").unwrap_err();
+        assert!(err.message.contains("unrecognized"));
     }
 }

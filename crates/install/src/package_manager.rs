@@ -76,6 +76,13 @@ pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str
         (CheckId::KrunRuntime, PackageFamily::Dnf) => Some("crun-krun"),
         (CheckId::KrunRuntime, PackageFamily::Apt) => None,
         (CheckId::HostOs, _) | (CheckId::Kvm, _) => None,
+        // `betterleaks` isn't a dnf/apt-distributed package this codebase
+        // has confirmed a name for on either family -- no guessed package
+        // name here (same "None, never a guess" posture as the
+        // unrecognized-distro case above). `habitat install`'s auto-install
+        // step won't offer to fix this check; the preflight failure message
+        // in `checks::betterleaks` tells the operator what to do instead.
+        (CheckId::Betterleaks, _) => None,
     }
 }
 
@@ -170,6 +177,13 @@ mod tests {
         for family in [PackageFamily::Dnf, PackageFamily::Apt] {
             assert_eq!(package_for(CheckId::HostOs, family), None);
             assert_eq!(package_for(CheckId::Kvm, family), None);
+        }
+    }
+
+    #[test]
+    fn betterleaks_has_no_package_fix_on_any_family() {
+        for family in [PackageFamily::Dnf, PackageFamily::Apt] {
+            assert_eq!(package_for(CheckId::Betterleaks, family), None);
         }
     }
 }

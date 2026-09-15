@@ -20,3 +20,12 @@ manager, a real `sudo` prompt).
   `habitat run` behave correctly on a real dnf-family host (AlmaLinux/
   Fedora) with virtualization enabled. Reused, not duplicated, at Phase
   8's validation run-book.
+
+- `validate-vm-launch.sh` -- Phase 3's real-hardware exit gate: launches
+  a real session through Podman + `krun` against a throwaway disk image,
+  walks the three required escape attempts (host files, host processes,
+  host network namespace) from inside the guest, confirms teardown
+  leaves no residual container or disk image, and doubles as the
+  confirmation (or correction) point for `launcher.rs`'s
+  `WORKSPACE_DISK_ANNOTATION` real-hardware caveat. Reused, not
+  duplicated, at Phase 8's validation run-book.

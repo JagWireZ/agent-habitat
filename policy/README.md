@@ -20,6 +20,16 @@ Populated so far:
 - **Phase 5** (`docs/plan.md` Section 2.3 / AGENTS.md Section 2 invariant
   7) -- not yet populated: the default egress allowlist (major AI
   provider APIs, standard package registries).
+- **Content-based secrets scanning** (Betterleaks) -- done:
+  `betterleaks-baseline.toml` holds the bundled baseline content-scan
+  ruleset, parsed by `crates/policy/src/secrets_scan.rs` (baked into the
+  binary via `include_str!`, same "not re-read from disk at runtime"
+  contract as `blocklist.txt`) and merged, additively only, with a
+  project's own `betterleaks.toml` (per-project extension mechanism
+  named explicitly under `secrets_scan.content_rules_path` in the
+  checked-in config, resolution order documented in `secrets_scan.rs`).
+  `crates/workspace` is what actually shells out to the `betterleaks`
+  binary against the merged result; nothing here runs a process.
 
 Resource-limit defaults and the git-history toggle live in the
 operator-facing checked-in config file (Phase 7), not here -- this

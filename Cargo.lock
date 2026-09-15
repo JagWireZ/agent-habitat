@@ -34,6 +34,9 @@ version = "0.1.0"
 [[package]]
 name = "habitat-vm"
 version = "0.1.0"
+dependencies = [
+ "habitat-policy",
+]
 
 [[package]]
 name = "habitat-workspace"

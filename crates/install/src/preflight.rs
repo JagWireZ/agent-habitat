@@ -103,7 +103,16 @@ pub fn install_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
 
 /// The same idea as [`install_report`], but over the checks `habitat run`'s
 /// preflight uses (adds the `kvm` check `habitat install` doesn't run).
-pub fn preflight_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
+///
+/// `secrets_scan_content_enabled` mirrors `run_preflight`'s parameter of
+/// the same name: the `betterleaks` check only appears in the report when
+/// the project's checked-in config has `secrets_scan.content` enabled
+/// (the default) -- a project that has explicitly opted out shouldn't see
+/// a checklist item for a binary it doesn't need.
+pub fn preflight_report<E: Environment>(
+    env: &E,
+    secrets_scan_content_enabled: bool,
+) -> Vec<CheckStatus> {
     let host_os = checks::host_os(env);
     let host_os_failed = host_os.is_err();
     let mut statuses = vec![CheckStatus {
@@ -125,6 +134,12 @@ pub fn preflight_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
         check: checks::CheckId::KrunRuntime,
         result: checks::krun_runtime(env),
     });
+    if secrets_scan_content_enabled {
+        statuses.push(CheckStatus {
+            check: checks::CheckId::Betterleaks,
+            result: checks::betterleaks(env),
+        });
+    }
     statuses
 }
 
@@ -144,11 +159,30 @@ pub fn run_install_checks<E: Environment>(
 /// `habitat run`'s preflight subroutine, executed at the start of every
 /// session before any disk-build/VM-launch logic (Phases 2/3 hook in
 /// after this returns `Ok`, never around it).
-pub fn run_preflight<E: Environment>(env: &E, audit: &dyn AuditSink) -> Result<(), PreflightError> {
+///
+/// `secrets_scan_content_enabled` reflects the project's checked-in
+/// config (`habitat_policy::config::ProjectConfig::secrets_scan.content`,
+/// default enabled). When true, the `betterleaks` binary is checked for
+/// on `PATH` in this same pass, right alongside the KVM/Podman/krun-
+/// runtime checks -- a project that wants content-based secrets scanning
+/// must not be able to silently end up without it because the binary
+/// isn't installed; that's a hard preflight failure, same fail-closed
+/// posture as every other check here (AGENTS.md Section 2 invariant 11).
+/// When false (the project explicitly opted out), the check is skipped
+/// entirely rather than run-and-ignored.
+pub fn run_preflight<E: Environment>(
+    env: &E,
+    audit: &dyn AuditSink,
+    secrets_scan_content_enabled: bool,
+) -> Result<(), PreflightError> {
     checks::host_os(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     checks::kvm(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     checks::podman(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     checks::krun_runtime(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    if secrets_scan_content_enabled {
+        checks::betterleaks(env)
+            .map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    }
     Ok(())
 }
 
@@ -198,8 +232,34 @@ mod tests {
             .with_command_ok("podman info", "host: ...")
             .with_command_ok("krun --version", "krun 1.14");
         let audit = MemoryAuditSink::default();
-        assert!(run_preflight(&env, &audit).is_ok());
+        assert!(run_preflight(&env, &audit, false).is_ok());
         assert!(audit.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn preflight_checks_betterleaks_only_when_content_scanning_is_enabled() {
+        let env = FakeEnvironment::linux()
+            .with_existing_path("/dev/kvm")
+            .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_ok("podman info", "host: ...")
+            .with_command_ok("krun --version", "krun 1.14");
+        // Deliberately no `betterleaks` command configured on the fake.
+
+        let audit = MemoryAuditSink::default();
+        assert!(
+            run_preflight(&env, &audit, false).is_ok(),
+            "disabled content scanning must not require betterleaks at all"
+        );
+
+        let audit = MemoryAuditSink::default();
+        let err = run_preflight(&env, &audit, true)
+            .expect_err("enabled content scanning without betterleaks installed must fail closed");
+        assert_eq!(err.0.check.name(), "betterleaks");
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.tag(), "preflight-failure");
+        assert_eq!(events[0].check.as_deref(), Some("betterleaks"));
     }
 
     #[test]
@@ -245,10 +305,22 @@ mod tests {
     #[test]
     fn preflight_report_includes_kvm() {
         let env = FakeEnvironment::linux();
-        let report = preflight_report(&env);
+        let report = preflight_report(&env, false);
         assert_eq!(report.len(), 4, "host-os, kvm, podman, krun-runtime");
         assert_eq!(report[1].check.name(), "kvm");
         assert!(!report[1].passed());
+    }
+
+    #[test]
+    fn preflight_report_includes_betterleaks_only_when_content_scanning_enabled() {
+        let env = FakeEnvironment::linux();
+        let without = preflight_report(&env, false);
+        assert_eq!(without.len(), 4, "host-os, kvm, podman, krun-runtime");
+        assert!(!without.iter().any(|s| s.check.name() == "betterleaks"));
+
+        let with = preflight_report(&env, true);
+        assert_eq!(with.len(), 5, "+ betterleaks");
+        assert_eq!(with[4].check.name(), "betterleaks");
     }
 
     /// Audit-sink failures (e.g. an unwritable log path) must not soften
