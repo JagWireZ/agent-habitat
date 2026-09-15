@@ -8,7 +8,7 @@
 //! knows how to run the commands once told to, and reports what
 //! happened).
 
-use crate::checks::CheckId;
+use crate::checks::{self, CheckId};
 use crate::environment::Environment;
 use crate::package_manager::{self, PackageFamily};
 use habitat_audit::{AuditEvent, AuditSink, EventKind};
@@ -59,75 +59,129 @@ fn attempt_one<E: Environment>(
     let Some(package) = package_manager::package_for(check, family) else {
         return InstallAttempt::NotAvailable { check };
     };
-    let primary = run_package_command(env, audit, check, family, package, package);
-    if matches!(primary, InstallAttempt::Succeeded { .. }) {
+    let primary = run_package_command(env, audit, check, family, &[package], package);
+
+    // Whether the primary attempt actually fixed anything. For most
+    // checks, trusting the install command's own exit code is enough --
+    // but `crun-version` can't be: `dnf install crun-krun` reports
+    // success against an *already-installed* package with no upgrade
+    // available (exactly AlmaLinux 10's situation, where AppStream's
+    // `crun-krun-1.27-2.el10_2` is already the newest version that repo
+    // carries), which is a same-version no-op, not a fix. Re-running the
+    // real check is the only way to tell those apart.
+    let primary_worked = match check {
+        CheckId::CrunVersion => {
+            matches!(primary, InstallAttempt::Succeeded { .. }) && checks::crun_version(env).is_ok()
+        }
+        _ => matches!(primary, InstallAttempt::Succeeded { .. }),
+    };
+    if primary_worked {
         return primary;
     }
 
-    // `libkrunfw` fallback (Dnf family only): the primary attempt above
-    // just tried `dnf install libkrunfw` and it didn't work -- on
-    // AlmaLinux 10 today that's because EPEL has no `libkrunfw` package
-    // under any name to resolve (confirmed real-hardware,
-    // `tmp/wip/vm-launch-validation`), not a transient failure worth
-    // retrying as-is. Fall back to a pinned, already-confirmed-working
-    // binary from Fedora's own build system rather than leaving the
-    // operator stuck on a package name that will never resolve here.
-    // Never reached on a genuine Fedora host: `crun-krun` there already
-    // pulls in a matching `libkrunfw`, so `checks::libkrunfw` passes and
-    // `install_missing` never calls this function for this check at all.
-    //
-    // `display_name` stays `"libkrunfw"` here even though the actual `dnf
-    // install` argument is the fallback URL: the operator-facing "what
-    // got installed" line should read like every other check's (a
-    // package name), not spill a Koji URL into the checklist -- the full
-    // URL is still there in the audit log below, not hidden.
-    if check == CheckId::Libkrunfw && family == PackageFamily::Dnf {
-        log(
-            audit,
-            check,
-            format!(
-                "`dnf install libkrunfw` didn't resolve -- falling back to {}",
-                package_manager::LIBKRUNFW_FALLBACK_URL
-            ),
-        );
-        return run_package_command(
-            env,
-            audit,
-            check,
-            family,
-            package_manager::LIBKRUNFW_FALLBACK_URL,
-            "libkrunfw",
-        );
+    match (check, family) {
+        // `libkrunfw` fallback (Dnf family only): the primary attempt
+        // above just tried `dnf install libkrunfw` and it didn't work --
+        // on AlmaLinux 10 today that's because EPEL has no `libkrunfw`
+        // package under any name to resolve (confirmed real-hardware,
+        // `tmp/wip/vm-launch-validation`), not a transient failure worth
+        // retrying as-is. Fall back to a pinned, already-confirmed-working
+        // binary from Fedora's own build system rather than leaving the
+        // operator stuck on a package name that will never resolve here.
+        // Never reached on a genuine Fedora host: `crun-krun` there
+        // already pulls in a matching `libkrunfw`, so `checks::libkrunfw`
+        // passes and `install_missing` never calls this function for
+        // this check at all.
+        //
+        // `display_name` stays `"libkrunfw"` here even though the actual
+        // `dnf install` argument is the fallback URL: the operator-facing
+        // "what got installed" line should read like every other check's
+        // (a package name), not spill a Koji URL into the checklist --
+        // the full URL is still there in the audit log below, not hidden.
+        (CheckId::Libkrunfw, PackageFamily::Dnf) => {
+            log(
+                audit,
+                check,
+                format!(
+                    "`dnf install libkrunfw` didn't resolve -- falling back to {}",
+                    package_manager::LIBKRUNFW_FALLBACK_URL
+                ),
+            );
+            run_package_command(
+                env,
+                audit,
+                check,
+                family,
+                &[package_manager::LIBKRUNFW_FALLBACK_URL],
+                "libkrunfw",
+            )
+        }
+        // `crun`/`crun-krun` fallback (Dnf family only): the primary
+        // attempt either failed outright, or "succeeded" against an
+        // already-installed, too-old package with no newer version in
+        // this host's own repos to upgrade to -- AlmaLinux 10's situation
+        // today (`crun-krun-1.27-2.el10_2` predates the 1.27.1 cutoff for
+        // `krun.use_passt`; see `checks::crun_version`'s doc comment).
+        // Both packages install together in one `dnf install` invocation,
+        // never separately -- `crun-krun` needs the exact matching `crun`
+        // version (`package_manager::CRUN_FALLBACK_URL`'s doc comment).
+        // Never reached on a genuine Fedora host: Fedora's own repos
+        // already carry a new-enough `crun-krun` for `checks::
+        // crun_version` to pass without any auto-install attempt at all.
+        (CheckId::CrunVersion, PackageFamily::Dnf) => {
+            log(
+                audit,
+                check,
+                format!(
+                    "`dnf install crun-krun` didn't get a version new enough for \
+                     krun.use_passt -- falling back to {} + {}",
+                    package_manager::CRUN_FALLBACK_URL,
+                    package_manager::CRUN_KRUN_FALLBACK_URL
+                ),
+            );
+            run_package_command(
+                env,
+                audit,
+                check,
+                family,
+                &[
+                    package_manager::CRUN_FALLBACK_URL,
+                    package_manager::CRUN_KRUN_FALLBACK_URL,
+                ],
+                "crun-krun",
+            )
+        }
+        _ => primary,
     }
-
-    primary
 }
 
-/// Runs one `dnf`/`apt-get install` (or, for the `libkrunfw` fallback, a
-/// direct URL `dnf install` accepts the same way) and reports the
-/// outcome. Split out of [`attempt_one`] so the `libkrunfw` fallback
-/// above can run this same logic a second time, against a different
-/// `package` argument, without duplicating the command-construction and
+/// Runs one `dnf`/`apt-get install` against one or more `packages` (more
+/// than one only for the `crun`+`crun-krun` fallback, which must install
+/// both together -- see `package_manager::CRUN_FALLBACK_URL`'s doc
+/// comment) and reports the outcome. Split out of [`attempt_one`] so
+/// every fallback above can run this same logic again, against different
+/// packages, without duplicating the command-construction and
 /// audit-logging shape.
 ///
-/// `package` is what actually gets passed to `dnf`/`apt-get install`
+/// `packages` is what actually gets passed to `dnf`/`apt-get install`
 /// (and is what the audit log's `running:`/`succeeded:` lines show, in
 /// full -- never truncated, since that log is the accurate record of
 /// what really ran as `sudo`). `display_name` is what the returned
 /// [`InstallAttempt`] carries for the operator-facing checklist; the two
-/// differ only for the `libkrunfw` fallback, where `package` is a Koji
-/// URL but the checklist should still read as a plain package name.
+/// differ for the fallback cases, where `packages` are Koji URLs but the
+/// checklist should still read as a plain package name.
 fn run_package_command<E: Environment>(
     env: &E,
     audit: &dyn AuditSink,
     check: CheckId,
     family: PackageFamily,
-    package: &str,
+    packages: &[&str],
     display_name: &str,
 ) -> InstallAttempt {
-    let (program, args) = package_manager::install_command(family, package);
+    let (program, args) = package_manager::install_command(family, packages);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let cmd_line = format!("{program} {}", arg_refs.join(" "));
+    let packages_joined = packages.join(" ");
 
     log(audit, check, format!("running: {cmd_line}"));
     match env.run_command_inherited(program, &arg_refs) {
@@ -142,14 +196,14 @@ fn run_package_command<E: Environment>(
             log(audit, check, format!("failed (non-zero exit): {cmd_line}"));
             InstallAttempt::Failed {
                 check,
-                package: package.to_string(),
+                package: packages_joined,
             }
         }
         Err(e) => {
             log(audit, check, format!("failed to start: {cmd_line} ({e})"));
             InstallAttempt::Failed {
                 check,
-                package: package.to_string(),
+                package: packages_joined,
             }
         }
     }
@@ -306,6 +360,109 @@ mod tests {
             attempts,
             vec![InstallAttempt::NotAvailable {
                 check: CheckId::Libkrunfw
+            }]
+        );
+        assert!(env.inherited_invocations.borrow().is_empty());
+    }
+
+    #[test]
+    fn crun_version_falls_back_to_the_pinned_pair_when_the_repo_package_is_too_old() {
+        // Mirrors real AlmaLinux 10 hardware: `dnf install crun-krun`
+        // reports SUCCESS (the package is already installed, and this
+        // repo has no newer version to offer) even though the underlying
+        // version problem is completely unfixed -- re-verifying via the
+        // real check, not trusting the exit code, is what catches this.
+        let fallback_cmd = format!(
+            "sudo dnf install -y {} {}",
+            package_manager::CRUN_FALLBACK_URL,
+            package_manager::CRUN_KRUN_FALLBACK_URL
+        );
+        let env = FakeEnvironment::linux()
+            .with_inherited_command_ok("sudo dnf install -y crun-krun")
+            .with_inherited_command_ok(&fallback_cmd)
+            // Still too old after the primary "success" -- forces the
+            // re-verification path to actually run the fallback.
+            .with_command_ok("krun --version", "crun version 1.27\ncommit: abc\n");
+        let audit = MemoryAuditSink::default();
+
+        let attempts = install_missing(&env, &audit, PackageFamily::Dnf, &[CheckId::CrunVersion]);
+
+        assert_eq!(
+            attempts,
+            vec![InstallAttempt::Succeeded {
+                check: CheckId::CrunVersion,
+                package: "crun-krun".to_string(),
+            }]
+        );
+        assert_eq!(
+            *env.inherited_invocations.borrow(),
+            vec!["sudo dnf install -y crun-krun".to_string(), fallback_cmd]
+        );
+    }
+
+    #[test]
+    fn crun_version_trusts_the_primary_attempt_when_the_recheck_actually_passes() {
+        // A genuine Fedora host: `dnf install crun-krun` gets a real,
+        // new-enough version, and the fallback is never attempted at all.
+        let env = FakeEnvironment::linux()
+            .with_inherited_command_ok("sudo dnf install -y crun-krun")
+            .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n");
+        let audit = MemoryAuditSink::default();
+
+        let attempts = install_missing(&env, &audit, PackageFamily::Dnf, &[CheckId::CrunVersion]);
+
+        assert_eq!(
+            attempts,
+            vec![InstallAttempt::Succeeded {
+                check: CheckId::CrunVersion,
+                package: "crun-krun".to_string(),
+            }]
+        );
+        // The fallback URLs were never invoked.
+        assert_eq!(
+            *env.inherited_invocations.borrow(),
+            vec!["sudo dnf install -y crun-krun".to_string()]
+        );
+    }
+
+    #[test]
+    fn crun_version_reports_failed_when_both_the_named_package_and_the_fallback_fail() {
+        let fallback_cmd = format!(
+            "sudo dnf install -y {} {}",
+            package_manager::CRUN_FALLBACK_URL,
+            package_manager::CRUN_KRUN_FALLBACK_URL
+        );
+        let env = FakeEnvironment::linux()
+            .with_inherited_command_failure("sudo dnf install -y crun-krun")
+            .with_inherited_command_failure(&fallback_cmd);
+        let audit = MemoryAuditSink::default();
+
+        let attempts = install_missing(&env, &audit, PackageFamily::Dnf, &[CheckId::CrunVersion]);
+
+        assert_eq!(
+            attempts,
+            vec![InstallAttempt::Failed {
+                check: CheckId::CrunVersion,
+                package: format!(
+                    "{} {}",
+                    package_manager::CRUN_FALLBACK_URL,
+                    package_manager::CRUN_KRUN_FALLBACK_URL
+                ),
+            }]
+        );
+    }
+
+    #[test]
+    fn crun_version_never_falls_back_on_the_apt_family() {
+        let env = FakeEnvironment::linux();
+        let audit = MemoryAuditSink::default();
+
+        let attempts = install_missing(&env, &audit, PackageFamily::Apt, &[CheckId::CrunVersion]);
+
+        assert_eq!(
+            attempts,
+            vec![InstallAttempt::NotAvailable {
+                check: CheckId::CrunVersion
             }]
         );
         assert!(env.inherited_invocations.borrow().is_empty());

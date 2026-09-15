@@ -75,6 +75,20 @@ pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str
         (CheckId::Podman, PackageFamily::Apt) => Some("podman"),
         (CheckId::KrunRuntime, PackageFamily::Dnf) => Some("crun-krun"),
         (CheckId::KrunRuntime, PackageFamily::Apt) => None,
+        // `crun-krun` again, by the same name -- the primary attempt for
+        // the version check. On a genuine Fedora host this is enough by
+        // itself (Fedora's own repos already carry a new-enough build);
+        // `installer.rs` falls back to CRUN_FALLBACK_URL/
+        // CRUN_KRUN_FALLBACK_URL when the check still fails afterward,
+        // which is what actually happens on AlmaLinux 10 today -- its
+        // AppStream `crun-krun-1.27-2.el10_2` is already the newest
+        // version that repo carries, so re-running `dnf install crun-krun`
+        // against an already-installed package is a same-version no-op,
+        // not a fix (see `installer.rs::attempt_one`'s re-verification
+        // step, which exists specifically because this case can't be told
+        // apart from a real fix by the install command's exit code alone).
+        (CheckId::CrunVersion, PackageFamily::Dnf) => Some("crun-krun"),
+        (CheckId::CrunVersion, PackageFamily::Apt) => None,
         // `libkrunfw` under its own upstream package name -- the primary
         // attempt. On a genuine Fedora host this check never even gets
         // this far: installing `crun-krun` there already pulls in a
@@ -134,33 +148,51 @@ pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str
 pub const LIBKRUNFW_FALLBACK_URL: &str =
     "https://kojipkgs.fedoraproject.org/packages/libkrunfw/5.5.0/1.fc43/x86_64/libkrunfw-5.5.0-1.fc43.x86_64.rpm";
 
-/// The command (program + args) that installs `package` as root on
-/// `family`. Always non-interactive on the package manager's own prompts
-/// (`-y`) -- `habitat install` already got the operator's confirmation
-/// before calling this; `sudo` still prompts for a password itself, which
-/// is why this runs through `Environment::run_command_inherited` rather
-/// than the captured `run_command`.
-pub fn install_command(family: PackageFamily, package: &str) -> (&'static str, Vec<String>) {
-    match family {
-        PackageFamily::Dnf => (
-            "sudo",
-            vec![
-                "dnf".to_string(),
-                "install".to_string(),
-                "-y".to_string(),
-                package.to_string(),
-            ],
-        ),
-        PackageFamily::Apt => (
-            "sudo",
-            vec![
-                "apt-get".to_string(),
-                "install".to_string(),
-                "-y".to_string(),
-                package.to_string(),
-            ],
-        ),
-    }
+/// Pinned Koji URLs for `crun` + `crun-krun` together -- the fallback
+/// when the installed `crun-krun` is too old to support the
+/// `krun.use_passt` OCI annotation (`checks::crun_version`,
+/// `checks::MIN_CRUN_VERSION_FOR_PASST`). Both packages must be installed
+/// in the same `dnf install` invocation: `crun-krun` needs the exact
+/// matching `crun` version, and installing them separately risks leaving
+/// a mismatched pair (`installer::run_package_command` always passes both
+/// together, never one at a time).
+///
+/// Same real-hardware-confirmed status and caveats as
+/// [`LIBKRUNFW_FALLBACK_URL`]: a Fedora 43 binary running on a
+/// RHEL-family host, not an officially supported combination, but the
+/// only practical unblock while AlmaLinux's own AppStream package stays
+/// at `crun-krun-1.27-2.el10_2` (one patch release behind the 1.27.1
+/// cutoff). Confirmed end-to-end on real AlmaLinux 10.2 hardware
+/// (`tmp/wip/egress-validation`): installs cleanly, `crun --version`
+/// reports 1.29.1 afterward, and a real `--annotation krun.use_passt=1`
+/// session actually gets `passt`-backed networking (no more
+/// `tsi_hijack`).
+///
+/// **This will eventually go stale**, same as `LIBKRUNFW_FALLBACK_URL` --
+/// see that constant's doc comment for what to do when `habitat install`
+/// starts reporting this fallback as `Failed`.
+pub const CRUN_FALLBACK_URL: &str =
+    "https://kojipkgs.fedoraproject.org/packages/crun/1.29.1/1.fc43/x86_64/crun-1.29.1-1.fc43.x86_64.rpm";
+pub const CRUN_KRUN_FALLBACK_URL: &str =
+    "https://kojipkgs.fedoraproject.org/packages/crun/1.29.1/1.fc43/x86_64/crun-krun-1.29.1-1.fc43.x86_64.rpm";
+
+/// The command (program + args) that installs `packages` as root on
+/// `family`, all in one invocation -- `crun`+`crun-krun`'s fallback needs
+/// both installed together so they stay a matching pair (see
+/// `CRUN_FALLBACK_URL`'s doc comment); every other caller just passes a
+/// single-element slice. Always non-interactive on the package manager's
+/// own prompts (`-y`) -- `habitat install` already got the operator's
+/// confirmation before calling this; `sudo` still prompts for a password
+/// itself, which is why this runs through `Environment::
+/// run_command_inherited` rather than the captured `run_command`.
+pub fn install_command(family: PackageFamily, packages: &[&str]) -> (&'static str, Vec<String>) {
+    let manager = match family {
+        PackageFamily::Dnf => "dnf",
+        PackageFamily::Apt => "apt-get",
+    };
+    let mut args = vec![manager.to_string(), "install".to_string(), "-y".to_string()];
+    args.extend(packages.iter().map(|p| p.to_string()));
+    ("sudo", args)
 }
 
 #[cfg(test)]
@@ -235,6 +267,44 @@ mod tests {
             Some("libkrunfw")
         );
         assert_eq!(package_for(CheckId::Libkrunfw, PackageFamily::Apt), None);
+    }
+
+    #[test]
+    fn crun_version_has_a_dnf_package_name_but_no_confirmed_apt_package_yet() {
+        assert_eq!(
+            package_for(CheckId::CrunVersion, PackageFamily::Dnf),
+            Some("crun-krun")
+        );
+        assert_eq!(package_for(CheckId::CrunVersion, PackageFamily::Apt), None);
+    }
+
+    #[test]
+    fn crun_fallback_urls_are_dnf_installable_https_urls_for_a_matching_pair() {
+        for url in [CRUN_FALLBACK_URL, CRUN_KRUN_FALLBACK_URL] {
+            assert!(url.starts_with("https://"));
+            assert!(url.ends_with(".rpm"));
+        }
+        // Same version number in both -- a mismatched crun/crun-krun pair
+        // is exactly the failure mode this fallback exists to avoid.
+        assert!(CRUN_FALLBACK_URL.contains("/1.29.1/"));
+        assert!(CRUN_KRUN_FALLBACK_URL.contains("/1.29.1/"));
+    }
+
+    #[test]
+    fn install_command_accepts_multiple_packages_in_one_invocation() {
+        let (program, args) =
+            install_command(PackageFamily::Dnf, &["crun-1.29.1.rpm", "crun-krun-1.29.1.rpm"]);
+        assert_eq!(program, "sudo");
+        assert_eq!(
+            args,
+            vec![
+                "dnf".to_string(),
+                "install".to_string(),
+                "-y".to_string(),
+                "crun-1.29.1.rpm".to_string(),
+                "crun-krun-1.29.1.rpm".to_string(),
+            ]
+        );
     }
 
     #[test]

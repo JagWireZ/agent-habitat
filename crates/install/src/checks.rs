@@ -16,6 +16,7 @@ pub enum CheckId {
     Kvm,
     Podman,
     KrunRuntime,
+    CrunVersion,
     Libkrunfw,
     Betterleaks,
 }
@@ -27,6 +28,7 @@ impl CheckId {
             CheckId::Kvm => "kvm",
             CheckId::Podman => "podman",
             CheckId::KrunRuntime => "krun-runtime",
+            CheckId::CrunVersion => "crun-version",
             CheckId::Libkrunfw => "libkrunfw",
             CheckId::Betterleaks => "betterleaks",
         }
@@ -198,6 +200,105 @@ pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
             format!("krun not runnable (is the crun-krun package installed?): {e}"),
         ),
     }
+}
+
+/// The minimum `crun` version that supports the `krun.use_passt` OCI
+/// annotation -- see [`crun_version`]'s doc comment. Added in crun
+/// 1.27.1 (confirmed via upstream's own 1.27.1 release notes: "krun: add
+/// support for passt-based networking in microVMs via the krun.use_passt
+/// annotation").
+pub const MIN_CRUN_VERSION_FOR_PASST: (u32, u32, u32) = (1, 27, 1);
+
+/// `krun`'s underlying `crun` version is new enough to support the
+/// `krun.use_passt` OCI annotation -- i.e. new enough for a session to
+/// actually get real `passt`-backed networking instead of silently
+/// falling back to libkrun's default TSI mode.
+///
+/// **Why this is a separate check from [`krun_runtime`], not folded into
+/// it**: confirmed on real AlmaLinux 10.2 hardware
+/// (`tmp/wip/vm-launch-validation`, `tmp/wip/egress-validation`) --
+/// `krun --version` succeeding says nothing about whether this specific
+/// build is new enough for real networking. AlmaLinux 10's own
+/// `crun-krun-1.27-2.el10_2` package (from AppStream, not EPEL) is
+/// exactly one patch release behind the 1.27.1 cutoff: `krun --version`
+/// passes, `--network pasta` is accepted without error, and the guest
+/// still silently boots under TSI (`tsi_hijack` on the kernel command
+/// line, `PF_TSI`/`PF_TSI6`/`PF_TSIU` registered, no virtio-net device at
+/// all) -- with no error message anywhere pointing at the actual cause.
+/// This check exists so `habitat install` catches that gap before a
+/// session launch ever gets that far.
+///
+/// Parses the first line of `krun --version`'s output (`"crun version
+/// X.Y.Z"`) rather than trusting a package manager's own version query --
+/// `crun`/`krun` are the same binary under different names
+/// (`checks::krun_runtime`'s doc comment), and the binary's own
+/// self-report is the one source of truth that doesn't depend on which
+/// package manager, if any, actually installed it (a from-source build or
+/// a manually-dropped-in Koji RPM has no package-manager record to query
+/// at all).
+pub fn crun_version<E: Environment>(env: &E) -> CheckResult {
+    let output = match env.run_command("krun", &["--version"]) {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => {
+            return fail(
+                CheckId::CrunVersion,
+                format!(
+                    "krun --version exited non-zero: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            )
+        }
+        Err(e) => {
+            return fail(
+                CheckId::CrunVersion,
+                format!("could not run krun --version: {e}"),
+            )
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let Some(version) = parse_crun_version(&stdout) else {
+        return fail(
+            CheckId::CrunVersion,
+            format!(
+                "could not parse a version number from krun --version's output: {:?}",
+                stdout.lines().next().unwrap_or_default()
+            ),
+        );
+    };
+    if version >= MIN_CRUN_VERSION_FOR_PASST {
+        Ok(())
+    } else {
+        fail(
+            CheckId::CrunVersion,
+            format!(
+                "crun {}.{}.{} is older than {}.{}.{}, the version that added the \
+                 krun.use_passt annotation -- without it, a session silently boots under \
+                 libkrun's default TSI networking instead of real passt-backed networking, \
+                 with no error message pointing at why",
+                version.0,
+                version.1,
+                version.2,
+                MIN_CRUN_VERSION_FOR_PASST.0,
+                MIN_CRUN_VERSION_FOR_PASST.1,
+                MIN_CRUN_VERSION_FOR_PASST.2,
+            ),
+        )
+    }
+}
+
+/// Parses `"crun version X.Y.Z"` (crun's own `--version` banner, first
+/// line) into `(major, minor, patch)`. A missing patch component (e.g.
+/// `"crun version 1.27"`) is treated as `.0` rather than a parse failure
+/// -- crun's own version scheme drops a trailing `.0` on whole-minor
+/// releases.
+fn parse_crun_version(text: &str) -> Option<(u32, u32, u32)> {
+    let line = text.lines().next()?;
+    let version_str = line.strip_prefix("crun version ")?;
+    let mut parts = version_str.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
 }
 
 /// `libkrunfw` (the shared library bundling the actual guest kernel
@@ -385,6 +486,56 @@ mod tests {
     fn krun_runtime_passes_when_present() {
         let env = FakeEnvironment::linux().with_command_ok("krun --version", "krun 1.14");
         assert!(krun_runtime(&env).is_ok());
+    }
+
+    #[test]
+    fn crun_version_fails_when_older_than_1_27_1() {
+        // Mirrors the real AlmaLinux 10.2 finding: crun-krun-1.27-2.el10_2.
+        let env = FakeEnvironment::linux().with_command_ok(
+            "krun --version",
+            "crun version 1.27\ncommit: a718a92cc9a94955a5a550b6fdec1378c247ec50\n",
+        );
+        let err = crun_version(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::CrunVersion);
+        assert!(err.message.contains("krun.use_passt"));
+    }
+
+    #[test]
+    fn crun_version_passes_at_exactly_the_minimum() {
+        let env = FakeEnvironment::linux()
+            .with_command_ok("krun --version", "crun version 1.27.1\ncommit: abc\n");
+        assert!(crun_version(&env).is_ok());
+    }
+
+    #[test]
+    fn crun_version_passes_when_newer() {
+        let env = FakeEnvironment::linux().with_command_ok(
+            "krun --version",
+            "crun version 1.29.1\ncommit: f0d911de5587342cfeb16473bf32ecdfeaf25957\n",
+        );
+        assert!(crun_version(&env).is_ok());
+    }
+
+    #[test]
+    fn crun_version_fails_closed_on_an_unparseable_banner() {
+        let env = FakeEnvironment::linux().with_command_ok("krun --version", "not a version line");
+        let err = crun_version(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::CrunVersion);
+    }
+
+    #[test]
+    fn crun_version_fails_closed_when_krun_is_missing() {
+        let env = FakeEnvironment::linux();
+        let err = crun_version(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::CrunVersion);
+    }
+
+    #[test]
+    fn parse_crun_version_treats_a_missing_patch_as_zero() {
+        assert_eq!(
+            parse_crun_version("crun version 1.27\ncommit: abc"),
+            Some((1, 27, 0))
+        );
     }
 
     #[test]

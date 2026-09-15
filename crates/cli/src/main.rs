@@ -80,6 +80,7 @@ fn friendly_name(check: CheckId) -> &'static str {
         CheckId::Kvm => "Hardware virtualization",
         CheckId::Podman => "Container runtime",
         CheckId::KrunRuntime => "Sandbox isolation layer",
+        CheckId::CrunVersion => "Sandbox networking",
         CheckId::Libkrunfw => "Virtual machine kernel",
         CheckId::Betterleaks => "Content secrets scanner",
     }
@@ -93,6 +94,7 @@ fn friendly_status(check: CheckId) -> &'static str {
         CheckId::Kvm => "Not available",
         CheckId::Podman => "Not found",
         CheckId::KrunRuntime => "Not found",
+        CheckId::CrunVersion => "Too old",
         CheckId::Libkrunfw => "Not found",
         CheckId::Betterleaks => "Not found",
     }
@@ -135,6 +137,10 @@ fn fix_for(check: CheckId) -> Fix {
             reason: "Installs crun-krun, the OCI runtime (backed by libkrun) Podman uses to launch each session in its own microVM instead of a shared-kernel container. Not yet packaged for Debian/Ubuntu-family hosts.",
             commands: &["sudo dnf install -y crun-krun   # AlmaLinux/Fedora/RHEL-family"],
         },
+        CheckId::CrunVersion => Fix {
+            reason: "This host's crun/krun build is too old to support real sandboxed networking (the krun.use_passt annotation, added in crun 1.27.1) -- without it, a session silently falls back to a networking mode this project doesn't restrict at all. (`habitat install` can run this for you -- see the prompt above.) On Fedora, a plain update is enough; on AlmaLinux/RHEL-family hosts, `habitat install` falls back to a direct Fedora build automatically when the host's own repo package is too old. Not yet packaged for Debian/Ubuntu-family hosts.",
+            commands: &["sudo dnf install -y crun-krun   # Fedora hosts; AlmaLinux/RHEL-family falls back automatically"],
+        },
         CheckId::Libkrunfw => Fix {
             reason: "Installs libkrunfw, the library bundling the actual guest kernel `krun` boots -- required for any session to launch even though `krun --version` alone doesn't check for it. (`habitat install` can run this for you -- see the prompt above.) On AlmaLinux/RHEL-family hosts, EPEL doesn't carry this package under any name; `habitat install` falls back to a direct Fedora build automatically when that happens. Not yet packaged for Debian/Ubuntu-family hosts.",
             commands: &["sudo dnf install -y libkrunfw   # Fedora hosts; AlmaLinux/RHEL-family falls back automatically"],
@@ -163,6 +169,9 @@ fn technical_detail(check: CheckId) -> &'static str {
         }
         CheckId::KrunRuntime => {
             "Install the `crun-krun` package so `krun` (the OCI runtime binary Podman exec's, with libkrun linked directly into it -- note the package and binary are named differently) is resolvable on PATH -- there is no separate hypervisor binary to install alongside it."
+        }
+        CheckId::CrunVersion => {
+            "Confirm `krun --version`'s reported crun version is >= 1.27.1 (checks::MIN_CRUN_VERSION_FOR_PASST) -- the version that added the krun.use_passt OCI annotation. Without it, `--network pasta` is silently accepted but never actually honored: the guest boots under libkrun's default TSI networking instead (`tsi_hijack` on its kernel command line, PF_TSI*/PF_TSIU registered, no virtio-net device at all), with no error pointing at the real cause. AlmaLinux 10's AppStream `crun-krun-1.27-2.el10_2` is exactly one patch release behind this cutoff; `habitat install`'s auto-install step falls back to `package_manager::CRUN_FALLBACK_URL`/`CRUN_KRUN_FALLBACK_URL` (a pinned, matching Fedora Koji build pair) when re-checking after `dnf install crun-krun` still shows a too-old version."
         }
         CheckId::Libkrunfw => {
             "Confirm `libkrunfw` resolves via `ldconfig -p` (not just that `krun --version` runs -- that path never dlopen's libkrunfw, so it passes even when this is missing entirely). Fedora's own `crun-krun`/`libkrun` packages pull in a matching `libkrunfw` automatically; EPEL's AlmaLinux/RHEL-family build of `libkrun` does not declare it as a dependency at all, and EPEL carries no `libkrunfw` package under any name regardless -- `habitat install`'s auto-install step falls back to `package_manager::LIBKRUNFW_FALLBACK_URL` (a pinned Fedora Koji build) on that family when the plain `dnf install libkrunfw` attempt fails."
@@ -269,17 +278,23 @@ fn print_required_steps(statuses: &[CheckStatus], verbose: bool) {
 /// Checks with a real package-manager fix -- the only ones the
 /// auto-install step ever offers to run something for. `HostOs` (no fix
 /// on this host at all) and `Kvm` (a firmware setting, not a package) are
-/// never included. `Libkrunfw` and `Betterleaks` each have a package on
-/// the Dnf family only (`package_manager::package_for` returns `None` for
-/// either on Apt); the auto-install step already reports `NotAvailable`
-/// rather than guessing there, so it's safe to list them here alongside
-/// the other two. `Libkrunfw` additionally has a same-family fallback
-/// (`installer::attempt_one`) for hosts where the plain package name
-/// doesn't resolve at all -- see `package_manager::LIBKRUNFW_FALLBACK_URL`.
+/// never included. `CrunVersion`, `Libkrunfw`, and `Betterleaks` each have
+/// a package on the Dnf family only (`package_manager::package_for`
+/// returns `None` for any of them on Apt); the auto-install step already
+/// reports `NotAvailable` rather than guessing there, so it's safe to
+/// list them here alongside the other two. `CrunVersion` and `Libkrunfw`
+/// additionally have a same-family fallback (`installer::attempt_one`)
+/// for hosts where the plain package name doesn't resolve to a
+/// new-enough version at all -- see `package_manager::
+/// CRUN_FALLBACK_URL`/`CRUN_KRUN_FALLBACK_URL` and `LIBKRUNFW_FALLBACK_URL`.
 fn is_installable(check: CheckId) -> bool {
     matches!(
         check,
-        CheckId::Podman | CheckId::KrunRuntime | CheckId::Libkrunfw | CheckId::Betterleaks
+        CheckId::Podman
+            | CheckId::KrunRuntime
+            | CheckId::CrunVersion
+            | CheckId::Libkrunfw
+            | CheckId::Betterleaks
     )
 }
 

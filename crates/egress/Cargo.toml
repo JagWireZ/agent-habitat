@@ -9,6 +9,16 @@ description = "Local egress proxy enforcing a default-deny, SNI-based allowlist 
 habitat-policy = { path = "../policy" }
 habitat-audit = { path = "../audit" }
 
+# `habitat-vm` only as a dev-dependency, for tests/adversarial/
+# egress_bypass.rs below, which confirms `habitat_vm::launcher::
+# build_run_args`'s output against this crate's own network_setup
+# constants. Safe despite habitat-vm's own normal dependency on
+# habitat-egress: dev-dependencies aren't part of the library's real
+# dependency graph, only pulled in for building this crate's own test
+# binaries, so this isn't a cycle.
+[dev-dependencies]
+habitat-vm = { path = "../vm" }
+
 # Exit-gate and adversarial tests live under the top-level tests/unit/
 # and tests/adversarial/ (mirroring the source tree, per
 # file-structure.md) rather than as inline #[cfg(test)] modules, since
