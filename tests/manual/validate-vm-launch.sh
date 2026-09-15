@@ -11,6 +11,14 @@
 # manual, host-dependent runbook, not a `cargo test` target -- see
 # tests/manual/README.md.
 #
+# Step 4's escape attempts run automatically, from this script, against
+# the still-live session -- they are not printed as instructions for a
+# human to copy into a second terminal. An earlier version did exactly
+# that, and teardown ran before anyone had a window to act on them, so
+# the checkboxes stayed unchecked with nothing actually verified. Only
+# the network-route comparison still needs a human's eyes (there's no
+# single substring that reliably proves "not the host's real routes").
+#
 # This script drives the launch/teardown machinery directly through
 # `podman` (the same commands `habitat-vm::launcher` builds -- see
 # crates/vm/src/launcher.rs's `build_run_args`), since Phase 7 hasn't
@@ -143,27 +151,72 @@ fi
 record "- CONFIRMED: session launched."
 
 # --- Step 4: escape attempts (the actual exit gate) ---------------------
+# Run for real, from this script, against the still-live session -- not
+# printed as instructions for a human to type into a second terminal
+# before teardown races ahead. An earlier version of this script did
+# exactly that, and the session was gone by the time anyone could act on
+# it: the checkboxes below stayed unchecked because there was never a
+# window in which to actually run anything. Capturing real output here,
+# from both sides, is what makes this the real verification rather than
+# "looks correct from inspection" (AGENTS.md Section 3).
 say "Step 4: escape attempts from inside the guest"
+
+# 1. Host files: a marker with a random, single-run token the guest has
+# no legitimate way to know in advance -- proves there is no shared
+# filesystem to find it on, not just that one specific path is empty.
+HOST_MARKER="$LOG_DIR/host-marker-$$"
+HOST_TOKEN="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+echo "$HOST_TOKEN" > "$HOST_MARKER"
+GUEST_FILE_OUTPUT="$(podman exec "$SESSION_NAME" sh -c "cat '$HOST_MARKER' 2>&1 || echo BLOCKED")"
 record ""
-record "Run each of these against the running session and confirm they all FAIL to reach the host:"
+record "- Host files: wrote a random token to $HOST_MARKER on the host, then ran"
+record "  \`podman exec $SESSION_NAME sh -c \"cat '$HOST_MARKER'\"\` from inside the guest."
+record "  Guest saw: \`$GUEST_FILE_OUTPUT\`"
+if [[ "$GUEST_FILE_OUTPUT" == *"$HOST_TOKEN"* ]]; then
+    record "  **FAILED**: the guest read the host's own file -- a shared filesystem path exists."
+else
+    record "  CONFIRMED BLOCKED: the guest could not read the host's file."
+fi
+rm -f "$HOST_MARKER"
+
+# 2. Host processes: capture this shell's own PID (a process that only
+# exists in the host's process table) and confirm it's absent from what
+# the guest sees.
+HOST_PID="$$"
+GUEST_PS_OUTPUT="$(podman exec "$SESSION_NAME" sh -c 'ps aux 2>&1 || echo BLOCKED')"
+record ""
+record "- Host processes: this script's own host PID is $HOST_PID. Guest's \`ps aux\`:"
 record '```'
-record "# host files"
-record "podman exec $SESSION_NAME sh -c 'cat /etc/habitat-host-marker 2>&1 || echo BLOCKED'"
+record "$GUEST_PS_OUTPUT"
+record '```'
+if echo "$GUEST_PS_OUTPUT" | grep -qw "$HOST_PID"; then
+    record "  **FAILED**: the host's PID $HOST_PID is visible inside the guest's process table."
+else
+    record "  CONFIRMED BLOCKED: the host's PID is not visible inside the guest."
+fi
+
+# 3. Host network namespace: capture the host's real routing table and
+# the guest's, side by side -- the guest must not show the host's actual
+# routes/interfaces.
+HOST_ROUTE_OUTPUT="$(ip route 2>&1 || echo "(ip route unavailable on host)")"
+GUEST_ROUTE_OUTPUT="$(podman exec "$SESSION_NAME" sh -c 'ip route 2>&1 || echo BLOCKED')"
 record ""
-record "# host processes"
-record "podman exec $SESSION_NAME sh -c 'ps aux 2>&1 | grep -v habitat || echo BLOCKED'"
-record ""
-record "# host network namespace"
-record "podman exec $SESSION_NAME sh -c 'ip route 2>&1 || echo BLOCKED'"
+record "- Host network namespace. Host's \`ip route\`:"
+record '```'
+record "$HOST_ROUTE_OUTPUT"
+record '```'
+record "  Guest's \`ip route\`:"
+record '```'
+record "$GUEST_ROUTE_OUTPUT"
 record '```'
 record ""
-record "MANUAL: run the three commands above, confirm each is BLOCKED (or otherwise shows no host-side"
-record "data), and record the actual output here before continuing. This is the real verification --"
-record "do not check this box from inspection of the launch command alone."
+record "MANUAL: compare the two route tables above by eye -- the guest's must be its own"
+record "minimal virtual network, never the host's real routes/gateway/interfaces. This one"
+record "needs a human judgment call, not a substring match."
 record ""
-record "- [ ] Host files unreachable"
-record "- [ ] Host processes unreachable"
-record "- [ ] Host network namespace unreachable"
+record "- [ ] Host files unreachable (see automated result above)"
+record "- [ ] Host processes unreachable (see automated result above)"
+record "- [ ] Host network namespace shows no host routes (compare the two tables above)"
 
 # --- Step 5: teardown -----------------------------------------------------
 say "Step 5: teardown"
@@ -184,4 +237,5 @@ fi
 record "- CONFIRMED: no residual container or disk image after teardown."
 
 say "Done"
-echo "Summary written to $SUMMARY -- fold the escape-attempt results from Step 4 into it by hand."
+echo "Summary written to $SUMMARY -- Step 4's file/process checks ran automatically and are"
+echo "recorded above; only the network-route comparison and the final checkboxes need a human look."

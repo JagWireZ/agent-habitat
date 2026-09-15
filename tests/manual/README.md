@@ -32,12 +32,16 @@ manager, a real `sudo` prompt).
 
 - `validate-vm-launch.sh` -- Phase 3's real-hardware exit gate: launches
   a real session through Podman + `krun` against a throwaway disk image,
-  walks the three required escape attempts (host files, host processes,
-  host network namespace) from inside the guest, confirms teardown
-  leaves no residual container or disk image, and doubles as the
-  confirmation (or correction) point for `launcher.rs`'s
-  `WORKSPACE_DISK_ANNOTATION` real-hardware caveat. Reused, not
-  duplicated, at Phase 8's validation run-book.
+  then runs the three required escape attempts (host files, host
+  processes, host network namespace) itself, against the still-live
+  session, capturing real output on both sides -- not printed as
+  instructions for a human to copy into a second terminal (an earlier
+  version did that, and teardown ran before anyone had a window to act
+  on it). Only the network-route comparison still needs a human's
+  judgment. Confirms teardown leaves no residual container or disk
+  image, and doubles as the confirmation (or correction) point for
+  `launcher.rs`'s `WORKSPACE_DISK_ANNOTATION` real-hardware caveat.
+  Reused, not duplicated, at Phase 8's validation run-book.
 
 - `validate-sync.sh` -- Phase 4's real-hardware exit gate: the one part
   of the two-point sync mechanism (`habitat_workspace::sync`) that needs
