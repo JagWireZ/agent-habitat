@@ -15,22 +15,50 @@
 //! background sync daemon exists beyond the two discrete invocations" --
 //! needs an actually-running session, so it's `tests/manual/
 //! validate-sync.sh`'s job instead; everything here uses
-//! `FakeCommandRunner` to stand in for the guest side (`podman
-//! exec`/`podman cp`), which is exactly the seam `habitat-vm`'s own tests
-//! use for the same reason.
+//! `FakeCommandRunner` to stand in for the guest side (`ssh`/`scp`,
+//! `docs/decisions/0008-guest-exec-channel.md` -- `podman exec`/`podman
+//! cp` through this phase's first implementation, confirmed on real
+//! hardware not to work against the `krun` runtime at all), which is
+//! exactly the seam `habitat-vm`'s own tests use for the same reason.
 
 use habitat_audit::{EventKind, MemoryAuditSink};
 use habitat_policy::blocklist;
-use habitat_vm::session::SessionId;
 use habitat_workspace::command_runner::testing::FakeCommandRunner;
 use habitat_workspace::command_runner::SystemCommandRunner;
+use habitat_workspace::guest_exec::{ssh_exec_args, GuestEndpoint};
 use habitat_workspace::sync::{
     self, FlagReason, FlaggedPatchStore, HostToSandboxRequest, SandboxToHostRequest, SyncOutcome,
     GUEST_WORKSPACE_DIR,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const GUEST_ADDR: &str = "10.0.2.5";
+const GUEST_KEY_PATH: &str = "/tmp/habitat-sync-exit-gate-key";
+
+fn guest_endpoint() -> GuestEndpoint<'static> {
+    GuestEndpoint {
+        addr: GUEST_ADDR,
+        private_key_path: Path::new(GUEST_KEY_PATH),
+    }
+}
+
+/// Builds the exact `ssh ...` invocation string a `FakeCommandRunner`
+/// mock needs to key against, via the same construction
+/// `GuestExecRunner` itself uses (`habitat_workspace::guest_exec`) --
+/// never a hand-typed copy that could quietly drift from the real argv.
+fn ssh_invocation(env: &[(&str, &str)], program: &str, args: &[&str]) -> String {
+    let full = ssh_exec_args(&guest_endpoint(), env, program, args);
+    format!("ssh {}", full.join(" "))
+}
+
+const SYNC_IDENTITY_ENV: [(&str, &str); 4] = [
+    ("GIT_AUTHOR_NAME", "Agent Habitat"),
+    ("GIT_AUTHOR_EMAIL", "sandbox@agent-habitat.invalid"),
+    ("GIT_COMMITTER_NAME", "Agent Habitat"),
+    ("GIT_COMMITTER_EMAIL", "sandbox@agent-habitat.invalid"),
+];
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -81,12 +109,11 @@ fn host_to_sandbox_no_op_when_nothing_changed() {
     fs::write(mirror.join("main.rs"), "fn main() {}").unwrap();
     git_init_committed(&mirror);
 
-    let session_id = SessionId::from_name("habitat-sync-noop").unwrap();
     let store = FlaggedPatchStore::new(temp_dir("h2s-noop-flagged"));
     let request = HostToSandboxRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: guest_endpoint(),
         patterns: &[],
         flagged_store: &store,
     };
@@ -111,12 +138,13 @@ fn host_to_sandbox_no_op_when_nothing_changed() {
 fn sandbox_to_host_no_op_when_guest_reports_clean() {
     let project = temp_dir("s2h-noop-project");
     let mirror = temp_dir("s2h-noop-mirror");
-    let session_id = SessionId::from_name("habitat-sync-s2h-noop").unwrap();
     let store = FlaggedPatchStore::new(temp_dir("s2h-noop-flagged"));
 
     let runner = FakeCommandRunner::default().with_ok(
-        &format!(
-            "podman exec habitat-sync-s2h-noop git -C {GUEST_WORKSPACE_DIR} status --porcelain"
+        &ssh_invocation(
+            &[],
+            "git",
+            &["-C", GUEST_WORKSPACE_DIR, "status", "--porcelain"],
         ),
         "",
     );
@@ -124,7 +152,7 @@ fn sandbox_to_host_no_op_when_guest_reports_clean() {
     let request = SandboxToHostRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: guest_endpoint(),
         patterns: &[],
         flagged_store: &store,
     };
@@ -148,37 +176,54 @@ fn sandbox_to_host_flags_a_malformed_patch_instead_of_applying_it() {
     let project = temp_dir("s2h-malformed-project");
     fs::write(project.join("real.txt"), "original\n").unwrap();
     let mirror = temp_dir("s2h-malformed-mirror");
-    let session_id = SessionId::from_name("habitat-sync-s2h-malformed").unwrap();
     let flagged_dir = temp_dir("s2h-malformed-flagged");
     let store = FlaggedPatchStore::new(&flagged_dir);
 
-    let name = "habitat-sync-s2h-malformed";
     let runner = FakeCommandRunner::default()
         .with_ok(
-            &format!("podman exec {name} git -C {GUEST_WORKSPACE_DIR} status --porcelain"),
+            &ssh_invocation(
+                &[],
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "status", "--porcelain"],
+            ),
             " M real.txt\n",
         )
         .with_ok(
-            &format!(
-                "podman exec --env GIT_AUTHOR_NAME=Agent Habitat --env GIT_AUTHOR_EMAIL=sandbox@agent-habitat.invalid --env GIT_COMMITTER_NAME=Agent Habitat --env GIT_COMMITTER_EMAIL=sandbox@agent-habitat.invalid {name} git -C {GUEST_WORKSPACE_DIR} add -A"
+            &ssh_invocation(
+                &SYNC_IDENTITY_ENV,
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "add", "-A"],
             ),
             "",
         )
         .with_ok(
-            &format!(
-                "podman exec --env GIT_AUTHOR_NAME=Agent Habitat --env GIT_AUTHOR_EMAIL=sandbox@agent-habitat.invalid --env GIT_COMMITTER_NAME=Agent Habitat --env GIT_COMMITTER_EMAIL=sandbox@agent-habitat.invalid {name} git -C {GUEST_WORKSPACE_DIR} commit --quiet -m habitat sync"
+            &ssh_invocation(
+                &SYNC_IDENTITY_ENV,
+                "git",
+                &[
+                    "-C",
+                    GUEST_WORKSPACE_DIR,
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "habitat sync",
+                ],
             ),
             "",
         )
         .with_ok(
-            &format!("podman exec {name} git -C {GUEST_WORKSPACE_DIR} diff HEAD~1 HEAD"),
+            &ssh_invocation(
+                &[],
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "diff", "HEAD~1", "HEAD"],
+            ),
             "this is not a real unified diff -- just noise\n",
         );
     let audit = MemoryAuditSink::default();
     let request = SandboxToHostRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: guest_endpoint(),
         patterns: &[],
         flagged_store: &store,
     };
@@ -219,12 +264,10 @@ fn sandbox_to_host_flags_a_malformed_patch_instead_of_applying_it() {
 fn sandbox_to_host_flags_a_patch_reintroducing_a_blocklisted_file() {
     let project = temp_dir("s2h-smuggle-project");
     let mirror = temp_dir("s2h-smuggle-mirror");
-    let session_id = SessionId::from_name("habitat-sync-s2h-smuggle").unwrap();
     let flagged_dir = temp_dir("s2h-smuggle-flagged");
     let store = FlaggedPatchStore::new(&flagged_dir);
     let patterns = blocklist::default_patterns();
 
-    let name = "habitat-sync-s2h-smuggle";
     let smuggled_patch = "diff --git a/.env b/.env\n\
 new file mode 100644\n\
 index 0000000..1111111\n\
@@ -234,30 +277,49 @@ index 0000000..1111111\n\
 +SECRET=smuggled\n";
     let runner = FakeCommandRunner::default()
         .with_ok(
-            &format!("podman exec {name} git -C {GUEST_WORKSPACE_DIR} status --porcelain"),
+            &ssh_invocation(
+                &[],
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "status", "--porcelain"],
+            ),
             "?? .env\n",
         )
         .with_ok(
-            &format!(
-                "podman exec --env GIT_AUTHOR_NAME=Agent Habitat --env GIT_AUTHOR_EMAIL=sandbox@agent-habitat.invalid --env GIT_COMMITTER_NAME=Agent Habitat --env GIT_COMMITTER_EMAIL=sandbox@agent-habitat.invalid {name} git -C {GUEST_WORKSPACE_DIR} add -A"
+            &ssh_invocation(
+                &SYNC_IDENTITY_ENV,
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "add", "-A"],
             ),
             "",
         )
         .with_ok(
-            &format!(
-                "podman exec --env GIT_AUTHOR_NAME=Agent Habitat --env GIT_AUTHOR_EMAIL=sandbox@agent-habitat.invalid --env GIT_COMMITTER_NAME=Agent Habitat --env GIT_COMMITTER_EMAIL=sandbox@agent-habitat.invalid {name} git -C {GUEST_WORKSPACE_DIR} commit --quiet -m habitat sync"
+            &ssh_invocation(
+                &SYNC_IDENTITY_ENV,
+                "git",
+                &[
+                    "-C",
+                    GUEST_WORKSPACE_DIR,
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "habitat sync",
+                ],
             ),
             "",
         )
         .with_ok(
-            &format!("podman exec {name} git -C {GUEST_WORKSPACE_DIR} diff HEAD~1 HEAD"),
+            &ssh_invocation(
+                &[],
+                "git",
+                &["-C", GUEST_WORKSPACE_DIR, "diff", "HEAD~1", "HEAD"],
+            ),
             smuggled_patch,
         );
     let audit = MemoryAuditSink::default();
     let request = SandboxToHostRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: guest_endpoint(),
         patterns: &patterns,
         flagged_store: &store,
     };
@@ -322,12 +384,11 @@ fn sync_perf_is_measured_against_a_monorepo_scale_fixture_with_real_numbers() {
     copy_recursive(&project, &mirror);
     git_init_committed(&mirror);
 
-    let session_id = SessionId::from_name("habitat-sync-perf").unwrap();
     let store = FlaggedPatchStore::new(temp_dir("perf-flagged"));
     let request = HostToSandboxRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: guest_endpoint(),
         patterns: &[],
         flagged_store: &store,
     };
@@ -390,12 +451,11 @@ fn sync_perf_is_measured_against_a_large_binary_fixture_with_real_numbers() {
     }
     git_init_committed(&mirror);
 
-    let session_id = SessionId::from_name("habitat-sync-perf-binary").unwrap();
     let store = FlaggedPatchStore::new(temp_dir("perf-binary-flagged"));
     let request = HostToSandboxRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: guest_endpoint(),
         patterns: &[],
         flagged_store: &store,
     };

@@ -29,3 +29,8 @@ current, standalone decision for its layer.
   once per session/build, never re-read on sync; records what Phase 4's
   sync/patch validation must do with a mid-session `betterleaks.toml`
   edit once that phase is built.
+- [`0008-guest-exec-channel.md`](0008-guest-exec-channel.md) -- `podman
+  exec` does not work against the `krun` runtime at all (confirmed on
+  real hardware, and by upstream); the guest exec channel is per-session
+  SSH over the same `passt` network Phase 5 already requires, not a
+  custom protocol and not a revisit of `0003`'s runtime choice.

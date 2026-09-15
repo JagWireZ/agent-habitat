@@ -26,6 +26,8 @@ fn request_with_limits(cpus: f64, memory_mb: u64) -> LaunchRequest {
         guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: ResourceLimitsConfig { cpus, memory_mb },
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
+        guest_ssh_public_key: "ssh-ed25519 AAAAtest habitat-session".to_string(),
+        guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-exit-gate-session-key"),
     }
 }
 
@@ -40,7 +42,12 @@ fn resource_limits_from_config_reach_the_launch_command() {
     let args = build_run_args(&request);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let invocation = format!("podman {}", arg_refs.join(" "));
-    let runner = FakeCommandRunner::default().with_ok(&invocation, "containerid123\n");
+    let runner = FakeCommandRunner::default()
+        .with_ok(&invocation, "containerid123\n")
+        .with_ok(
+            "podman inspect --format {{.NetworkSettings.IPAddress}} habitat-exit-gate-session",
+            "10.0.2.5\n",
+        );
 
     let launched = launcher::launch(&request, &runner).expect("launch must succeed");
     assert_eq!(launched.session_id, request.session_id);
@@ -73,6 +80,8 @@ fn teardown_leaves_no_residual_disk_image_or_container() {
     let session = LaunchedSession {
         session_id: SessionId::from_name("habitat-exit-gate-teardown").unwrap(),
         workspace_disk_path: image_path.clone(),
+        guest_addr: "10.0.2.5".to_string(),
+        guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-exit-gate-teardown-key"),
     };
     let runner = FakeCommandRunner::default().with_ok(
         "podman rm --force --ignore habitat-exit-gate-teardown",
@@ -106,6 +115,8 @@ fn teardown_run_twice_makes_no_further_changes() {
     let session = LaunchedSession {
         session_id: SessionId::from_name("habitat-exit-gate-idempotent").unwrap(),
         workspace_disk_path: PathBuf::from("/tmp/habitat-exit-gate-idempotent-gone.img"),
+        guest_addr: "10.0.2.5".to_string(),
+        guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-exit-gate-idempotent-gone-key"),
     };
     let runner = FakeCommandRunner::default().with_ok(
         "podman rm --force --ignore habitat-exit-gate-idempotent",

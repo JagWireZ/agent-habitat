@@ -85,6 +85,20 @@ pub struct LaunchRequest {
     /// 2, invariant 7 -- fail closed on missing egress control, never
     /// open by default).
     pub egress_proxy_addr: SocketAddr,
+    /// This session's ephemeral SSH public key content
+    /// (`habitat_vm::guest_ssh::SessionKeypair::public_key`), baked into
+    /// the guest via an environment variable at launch
+    /// (`docs/decisions/0008-guest-exec-channel.md`) since `podman exec`
+    /// does not work against the `krun` runtime at all. Not a secret --
+    /// the corresponding private key stays host-side and is never part
+    /// of this request.
+    pub guest_ssh_public_key: String,
+    /// Where the private half of `guest_ssh_public_key`'s keypair lives
+    /// on the host (`habitat_vm::guest_ssh::generate`) -- carried through
+    /// so `launch` can copy it onto the returned `LaunchedSession` for
+    /// `teardown` to clean up. This request never needs to *read* the
+    /// private key itself, only remember where it is.
+    pub guest_ssh_private_key_path: PathBuf,
 }
 
 /// What a successful launch hands back -- enough to tear the session
@@ -94,6 +108,23 @@ pub struct LaunchRequest {
 pub struct LaunchedSession {
     pub session_id: SessionId,
     pub workspace_disk_path: PathBuf,
+    /// Address the guest is reachable at over the `passt`-provided
+    /// network, for `habitat-workspace`'s SSH-based guest exec channel
+    /// (`docs/decisions/0008-guest-exec-channel.md`). Resolved by
+    /// `launcher::guest_address` after a successful launch.
+    ///
+    /// **Real-hardware caveat**, same shape as `launcher::
+    /// WORKSPACE_DISK_ANNOTATION`: whether `podman inspect`'s reported
+    /// address is actually reachable from the host for a `pasta`-backed
+    /// `krun` guest is this field's best current understanding, not yet
+    /// confirmed -- `tests/manual/validate-vm-launch.sh` is where that
+    /// gets confirmed or corrected.
+    pub guest_addr: String,
+    /// Where this session's ephemeral private SSH key lives on the host
+    /// (`habitat_vm::guest_ssh`) -- carried here so `teardown` can delete
+    /// it alongside the disk image, never leaving a session's credential
+    /// behind after the session it authorized is gone.
+    pub guest_ssh_private_key_path: PathBuf,
 }
 
 #[cfg(test)]

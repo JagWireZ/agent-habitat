@@ -29,6 +29,8 @@ fn sample_request() -> LaunchRequest {
         guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: ResourceLimitsConfig::default(),
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
+        guest_ssh_public_key: "ssh-ed25519 AAAAtest habitat-session".to_string(),
+        guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-adversarial-session-key"),
     }
 }
 
@@ -136,5 +138,24 @@ fn workspace_disk_and_guest_image_are_passed_as_distinct_arguments() {
         args.iter()
             .any(|a| a.contains(&request.workspace_disk_path.display().to_string())),
         "the workspace disk path must appear (via the annotation), separately from the image ref"
+    );
+}
+
+/// `docs/decisions/0008-guest-exec-channel.md`: only the *public* half of
+/// the session's SSH keypair may ever reach the guest via
+/// `AUTHORIZED_KEY_ENV` -- a defense-in-depth guard against a future bug
+/// that accidentally hands the guest the private key instead. An ed25519
+/// private key's OpenSSH text encoding is always PEM-shaped
+/// (`-----BEGIN OPENSSH PRIVATE KEY-----`); a public key never contains
+/// that marker.
+#[test]
+fn launch_command_never_leaks_a_private_key_shaped_value_into_the_env() {
+    let mut request = sample_request();
+    request.guest_ssh_public_key = "ssh-ed25519 AAAAtest habitat-session".to_string();
+    let args = build_run_args(&request);
+    let joined = args.join(" ");
+    assert!(
+        !joined.contains("PRIVATE KEY"),
+        "no private-key-shaped value may ever appear in the launch argv: {args:?}"
     );
 }

@@ -30,6 +30,12 @@
 # shows the flag or ruleset isn't doing what's documented, fix
 # network_setup.rs and re-run.
 #
+# **Guest exec channel is SSH, not `podman exec`**
+# (docs/decisions/0008-guest-exec-channel.md): `podman exec` does not
+# work against the `krun` runtime at all -- this script's connection
+# trace (Step 5) runs each check over SSH into the guest, exactly as
+# `validate-vm-launch.sh` and `validate-sync.sh` do.
+#
 # Requires: an AlmaLinux/Fedora host (dnf-family) with Podman + crun-krun
 # + passt installed and /dev/kvm exposed -- i.e. a host that already
 # passes tests/manual/validate-real-hardware.sh and
@@ -48,12 +54,15 @@ GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:alpine}"
 WORKSPACE_DISK="$LOG_DIR/session.img"
 PROXY_ADDR="127.0.0.1:8443"
 DNS_ADDR="127.0.0.1:5300"
+SSH_KEY_PATH="$LOG_DIR/session-key"
 
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.md"
 
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
+
+SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes)
 
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
@@ -80,7 +89,7 @@ if [[ ! -e /dev/kvm ]]; then
     record "- **ABORTED**: no /dev/kvm on this host."
     exit 1
 fi
-for bin in podman krun passt nft; do
+for bin in podman krun passt nft ssh ssh-keygen; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         fail "$bin not found on PATH."
         record "- **ABORTED**: $bin not installed."
@@ -122,6 +131,12 @@ dd if=/dev/zero of="$WORKSPACE_DISK" bs=1M count=64 status=none
 mkfs.ext4 -q -F "$WORKSPACE_DISK"
 record "- Built a 64MB throwaway workspace disk at $WORKSPACE_DISK"
 
+rm -f "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
+ssh-keygen -t ed25519 -N '' -f "$SSH_KEY_PATH" -C habitat-session -q
+AUTHORIZED_KEY="$(cat "$SSH_KEY_PATH.pub")"
+record "- Generated a fresh session SSH keypair at $SSH_KEY_PATH (guest exec channel,"
+record "  docs/decisions/0008-guest-exec-channel.md)"
+
 PODMAN_ARGS=(
     run --detach --rm --name "$SESSION_NAME"
     --runtime krun
@@ -129,6 +144,7 @@ PODMAN_ARGS=(
     --dns "${PROXY_ADDR%%:*}"
     --cpus 2 --memory 2048m
     --annotation "io.habitat.vm.workspace-disk=${WORKSPACE_DISK}"
+    --env "HABITAT_AUTHORIZED_KEY=${AUTHORIZED_KEY}"
     "$GUEST_IMAGE"
 )
 
@@ -142,10 +158,19 @@ if [[ "$LAUNCH_EXIT" -ne 0 ]]; then
     record "- **FAILED**: session did not launch with \`--network pasta\` -- if the log shows"
     record "  pasta/crun-krun rejected the flag, network_setup.rs's NETWORK_MODE constant needs"
     record "  correcting, then re-run this script."
-    rm -f "$WORKSPACE_DISK"
+    rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
 record "- CONFIRMED: session launched with a pasta-backed network."
+
+GUEST_ADDR="$(podman inspect --format '{{.NetworkSettings.IPAddress}}' "$SESSION_NAME" | tr -d '[:space:]')"
+record "- Guest address: $GUEST_ADDR"
+for _ in $(seq 1 30); do
+    if ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" true 2>/dev/null; then
+        break
+    fi
+    sleep 1
+done
 
 # --- Step 4: apply the reachability-restricting firewall ruleset --------
 say "Step 4: restrict the guest's pasta interface to the proxy only"
@@ -162,26 +187,42 @@ record "- [ ] \`nft -f\` applied successfully, no elevated privilege required"
 # --- Step 5: connection trace (the actual exit gate) ---------------------
 say "Step 5: connection trace from inside the guest"
 record ""
-record "Run each of these against the running session and record the actual result --"
-record "do not check a box from inspection of the ruleset alone:"
+record "Running each of these over SSH against the guest and recording the actual result --"
+record "not checking a box from inspection of the ruleset alone (docs/decisions/"
+record "0008-guest-exec-channel.md -- podman exec does not work against krun at all):"
 record '```'
-record "# allowlisted destination -- must succeed"
-record "podman exec $SESSION_NAME sh -c 'curl -sS -o /dev/null -w \"%{http_code}\\n\" https://pypi.org/'"
+
+run_trace() {
+    ssh "${SSH_OPTS[@]}" "habitat@$GUEST_ADDR" "$1" 2>&1 || echo BLOCKED
+}
+
+record "\$ curl -sS -o /dev/null -w '%{http_code}\\n' https://pypi.org/   # allowlisted -- must succeed"
+ALLOWED_RESULT="$(run_trace "curl -sS -o /dev/null -w '%{http_code}\\n' https://pypi.org/")"
+record "$ALLOWED_RESULT"
 record ""
-record "# non-allowlisted destination -- must be blocked"
-record "podman exec $SESSION_NAME sh -c 'curl -sS -m 5 https://example.com/ || echo BLOCKED'"
+record "\$ curl -sS -m 5 https://example.com/   # non-allowlisted -- must be blocked"
+DENIED_RESULT="$(run_trace "curl -sS -m 5 https://example.com/")"
+record "$DENIED_RESULT"
 record ""
-record "# allowlist-lookalike hostname -- must be blocked"
-record "podman exec $SESSION_NAME sh -c 'curl -sS -m 5 https://githubusercontent.com.attacker.example/ || echo BLOCKED'"
+record "\$ curl -sS -m 5 https://githubusercontent.com.attacker.example/   # lookalike -- must be blocked"
+LOOKALIKE_RESULT="$(run_trace "curl -sS -m 5 https://githubusercontent.com.attacker.example/")"
+record "$LOOKALIKE_RESULT"
 record ""
-record "# direct-IP bypass, skipping DNS and any hostname entirely -- must be blocked"
-record "podman exec $SESSION_NAME sh -c 'curl -sS -m 5 --resolve pypi.org:443:1.2.3.4 https://pypi.org/ || echo BLOCKED'"
+record "\$ curl -sS -m 5 --resolve pypi.org:443:1.2.3.4 https://pypi.org/   # direct-IP bypass -- must be blocked"
+IP_BYPASS_RESULT="$(run_trace "curl -sS -m 5 --resolve pypi.org:443:1.2.3.4 https://pypi.org/")"
+record "$IP_BYPASS_RESULT"
 record ""
-record "# DNS bypass attempt: query a resolver other than the pinned proxy path directly -- must be blocked"
-record "podman exec $SESSION_NAME sh -c 'timeout 5 nslookup pypi.org 8.8.8.8 || echo BLOCKED'"
+record "\$ nslookup pypi.org 8.8.8.8   # DNS bypass, resolver other than the pinned proxy path -- must be blocked"
+DNS_BYPASS_RESULT="$(run_trace "timeout 5 nslookup pypi.org 8.8.8.8")"
+record "$DNS_BYPASS_RESULT"
 record '```'
 record ""
-record "- [ ] Allowlisted destination succeeded (recorded HTTP status: ______)"
+record "MANUAL: confirm each result above actually shows what its label says (a real HTTP"
+record "200/301-class status for the allowed case; BLOCKED, a connection error, or a timeout"
+record "for every denied case) -- these are captured automatically but still need a human"
+record "read, since a curl/nslookup error message's exact shape varies."
+record ""
+record "- [ ] Allowlisted destination succeeded (recorded HTTP status above)"
 record "- [ ] Non-allowlisted destination was blocked"
 record "- [ ] Allowlist-lookalike hostname was blocked"
 record "- [ ] Direct-IP bypass was blocked"
@@ -194,7 +235,7 @@ set +e
 podman rm --force --ignore "$SESSION_NAME" > "$LOG_DIR/teardown.log" 2>&1
 TEARDOWN_EXIT=$?
 set -e
-rm -f "$WORKSPACE_DISK"
+rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
 record "- Teardown exit: $TEARDOWN_EXIT (log: $LOG_DIR/teardown.log)"
 record "MANUAL: also stop the proxy and DNS forwarder processes started in Step 2, and"
 record "remove the nftables table applied in Step 4 (\`nft delete table inet habitat_egress\`)."

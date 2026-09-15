@@ -10,14 +10,25 @@
 
 use habitat_audit::{EventKind, MemoryAuditSink};
 use habitat_policy::blocklist;
-use habitat_vm::session::SessionId;
 use habitat_workspace::command_runner::SystemCommandRunner;
+use habitat_workspace::guest_exec::GuestEndpoint;
 use habitat_workspace::sync::{
     self, FlagReason, FlaggedPatchStore, HostToSandboxRequest, SyncOutcome,
 };
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Both tests below resolve as `NoOp`/`Flagged` before ever touching the
+/// guest (that's the whole point -- a blocklisted or ruleset-touching
+/// change must never even reach it), so this endpoint is never actually
+/// dialed; its values are placeholders, not exercised.
+fn unused_guest_endpoint() -> GuestEndpoint<'static> {
+    GuestEndpoint {
+        addr: "unused",
+        private_key_path: Path::new("/unused"),
+    }
+}
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -79,24 +90,23 @@ fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
     // the only change since the last sync.
     fs::write(project.join(".env"), "SECRET=leaked").unwrap();
 
-    let session_id = SessionId::from_name("habitat-sync-h2s-smuggle").unwrap();
     let flagged_dir = temp_dir("h2s-smuggle-flagged");
     let store = FlaggedPatchStore::new(&flagged_dir);
     let patterns = blocklist::default_patterns();
     let request = HostToSandboxRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: unused_guest_endpoint(),
         patterns: &patterns,
         flagged_store: &store,
     };
     // Real `SystemCommandRunner` throughout, for both host_runner and
     // guest_runner -- since `.env` is the only change and it's filtered
     // out before any diff exists, this sync must resolve as a true
-    // no-op, meaning `podman` (present on this machine, but pointed at a
-    // session that was never launched) is never actually invoked. If the
-    // code ever tried to reach the guest here, that real `podman exec`
-    // call against a nonexistent container would fail the test loudly.
+    // no-op, meaning `ssh` (present on this machine, but pointed at a
+    // guest address that was never actually launched) is never invoked.
+    // If the code ever tried to reach the guest here, that real `ssh`
+    // call against an unreachable address would fail the test loudly.
     let runner = SystemCommandRunner;
     let audit = MemoryAuditSink::default();
 
@@ -132,13 +142,12 @@ fn host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_ev
 
     fs::write(project.join("betterleaks.toml"), "# widened allowlist\n").unwrap();
 
-    let session_id = SessionId::from_name("habitat-sync-h2s-ruleset").unwrap();
     let flagged_dir = temp_dir("h2s-ruleset-flagged");
     let store = FlaggedPatchStore::new(&flagged_dir);
     let request = HostToSandboxRequest {
         project_root: &project,
         mirror_dir: &mirror,
-        session_id: &session_id,
+        guest: unused_guest_endpoint(),
         patterns: &[],
         flagged_store: &store,
     };

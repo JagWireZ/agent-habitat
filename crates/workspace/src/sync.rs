@@ -30,10 +30,15 @@
 //! the guest and the host both last agreed on."
 //!
 //! **No live/continuous channel.** Every guest-side step here is one
-//! discrete `podman exec`/`podman cp` invocation
-//! (`crate::guest_exec::GuestExecRunner`) -- there is no long-lived
-//! connection, watcher, or background process anywhere in this module
-//! (`AGENTS.md` Section 2, invariant 1).
+//! discrete `ssh`/`scp` invocation (`crate::guest_exec::GuestExecRunner`)
+//! -- there is no long-lived connection, watcher, or background process
+//! anywhere in this module (`AGENTS.md` Section 2, invariant 1). This was
+//! `podman exec`/`podman cp` through this module's first implementation;
+//! a real run against a real, booted `krun` guest confirmed `podman exec`
+//! does not work against that runtime at all -- see `docs/decisions/
+//! 0008-guest-exec-channel.md`. The design here (one discrete invocation
+//! per guest interaction, no persistent connection) is unchanged; only
+//! the transport is.
 //!
 //! **Never a real push.** No code path in this module ever runs `git
 //! push`, sets a `remote`, or otherwise reaches the user's real remote --
@@ -44,12 +49,11 @@
 
 use crate::command_runner::CommandRunner;
 use crate::gitseed::{run_git_with_identity, SYNTHETIC_AUTHOR_EMAIL, SYNTHETIC_AUTHOR_NAME};
-use crate::guest_exec::GuestExecRunner;
+use crate::guest_exec::{GuestEndpoint, GuestExecRunner};
 use crate::patch;
 use crate::staging;
 use habitat_audit::{AuditEvent, AuditSink, EventKind};
 use habitat_policy::blocklist;
-use habitat_vm::session::SessionId;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -313,7 +317,10 @@ pub struct HostToSandboxRequest<'a> {
     /// 2's staging directory, kept alive and advancing for the life of
     /// the session (see this module's doc comment).
     pub mirror_dir: &'a Path,
-    pub session_id: &'a SessionId,
+    /// This session's guest exec endpoint -- its `passt`-reachable
+    /// address and ephemeral SSH private key
+    /// (`docs/decisions/0008-guest-exec-channel.md`).
+    pub guest: GuestEndpoint<'a>,
     pub patterns: &'a [String],
     pub flagged_store: &'a FlaggedPatchStore,
 }
@@ -325,7 +332,7 @@ pub struct HostToSandboxRequest<'a> {
 /// Takes two separate `CommandRunner`s -- `host_runner` for ordinary,
 /// local `git` calls against the host-side mirror (always real tooling,
 /// same posture as `crate::gitseed`), and `guest_runner` for the
-/// `podman exec`/`podman cp` calls that reach the actual guest
+/// `ssh`/`scp` calls that reach the actual guest
 /// (`crate::guest_exec::GuestExecRunner`). In production both are the
 /// same `SystemCommandRunner`; kept distinct here (rather than one
 /// shared runner) so tests can fake the guest side with a
@@ -377,7 +384,7 @@ pub fn sync_host_to_sandbox<H: CommandRunner, G: CommandRunner, A: AuditSink>(
         });
     }
 
-    let guest = GuestExecRunner::new(guest_runner, request.session_id);
+    let guest = GuestExecRunner::new(guest_runner, request.guest);
     match apply_patch_in_guest(&guest, GUEST_WORKSPACE_DIR, &diff)? {
         GuestApplyOutcome::Applied => {}
         GuestApplyOutcome::Rejected(detail) => {
@@ -416,7 +423,9 @@ pub fn sync_host_to_sandbox<H: CommandRunner, G: CommandRunner, A: AuditSink>(
 pub struct SandboxToHostRequest<'a> {
     pub project_root: &'a Path,
     pub mirror_dir: &'a Path,
-    pub session_id: &'a SessionId,
+    /// This session's guest exec endpoint -- see
+    /// [`HostToSandboxRequest::guest`].
+    pub guest: GuestEndpoint<'a>,
     pub patterns: &'a [String],
     pub flagged_store: &'a FlaggedPatchStore,
 }
@@ -428,14 +437,14 @@ pub struct SandboxToHostRequest<'a> {
 /// push to any real remote).
 /// Same two-runner split as [`sync_host_to_sandbox`]: `host_runner` for
 /// real `git` calls against `project_root`/`mirror_dir`, `guest_runner`
-/// for the `podman exec` calls that reach the guest.
+/// for the `ssh` calls that reach the guest.
 pub fn sync_sandbox_to_host<H: CommandRunner, G: CommandRunner, A: AuditSink>(
     request: &SandboxToHostRequest<'_>,
     host_runner: &H,
     guest_runner: &G,
     audit: &A,
 ) -> Result<SyncOutcome, SyncError> {
-    let guest = GuestExecRunner::new(guest_runner, request.session_id);
+    let guest = GuestExecRunner::new(guest_runner, request.guest);
 
     let status = guest
         .exec("git", &["-C", GUEST_WORKSPACE_DIR, "status", "--porcelain"])
@@ -586,10 +595,10 @@ fn apply_patch_in_guest<R: CommandRunner>(
 
         let cp = guest
             .copy_in(host_path, &guest_path)
-            .map_err(|e| err(format!("could not `podman cp` patch into guest: {e}")))?;
+            .map_err(|e| err(format!("could not `scp` patch into guest: {e}")))?;
         if !cp.status.success() {
             return Err(err(format!(
-                "`podman cp` into guest exited non-zero: {}",
+                "`scp` into guest exited non-zero: {}",
                 String::from_utf8_lossy(&cp.stderr)
             )));
         }

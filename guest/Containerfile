@@ -9,14 +9,18 @@
 # runbook) can succeed.
 #
 # Deliberately minimal (ADR 0002's "little for an attacker to work with
-# even if something went wrong inside it"): only `git` is installed
-# beyond the base image, because that is the only guest-side binary the
-# two-point sync mechanism actually invokes via `podman exec`
-# (`crates/workspace/src/{sync,guest_exec}.rs`) -- `rm` and `sh` are
-# already provided by Alpine's built-in BusyBox. Add a package here only
-# when a concrete phase's guest-exec call actually needs it; this is not
-# a place for speculative "might be useful later" tooling
-# (AGENTS.md Section 4 -- deferred items are noted, not built ahead).
+# even if something went wrong inside it"): `git` (the only guest-side
+# binary the two-point sync mechanism actually invokes), `openssh` --
+# because `podman exec` does not work against the `krun` runtime at all
+# (`docs/decisions/0008-guest-exec-channel.md`), so SSH is this project's
+# real guest exec channel, not an optional extra -- and `curl`, which
+# `tests/manual/validate-egress.sh`'s connection-trace exit gate actually
+# runs from inside the guest (a concrete, already-existing need, not
+# speculative tooling). `rm`/`sh`/`nslookup` are already provided by
+# Alpine's built-in BusyBox. Add a package here only when a concrete
+# phase or runbook actually needs it; this is not a place for
+# speculative "might be useful later" tooling (AGENTS.md Section 4 --
+# deferred items are noted, not built ahead).
 #
 # Pin the Alpine version explicitly and bump it deliberately -- never
 # `alpine:latest`, so a build today and a build in six months produce
@@ -24,19 +28,33 @@
 ARG ALPINE_VERSION=3.20
 FROM alpine:${ALPINE_VERSION}
 
-RUN apk add --no-cache git
+RUN apk add --no-cache git openssh-server curl \
+    && adduser -D -s /bin/sh habitat \
+    && ssh-keygen -A \
+    && printf 'PasswordAuthentication no\nChallengeResponseAuthentication no\nPermitRootLogin no\nAllowUsers habitat\nUsePAM no\n' >> /etc/ssh/sshd_config
 
-# No entrypoint of substance: every guest-side action in this project
-# goes through `podman exec` against an already-running container
-# (`crates/workspace::guest_exec`), never through whatever this image
-# itself would run on start. `sleep infinity` is this image's only job --
-# stay up between launch and the first `podman exec`.
+COPY entrypoint.sh /usr/local/bin/habitat-entrypoint.sh
+RUN chmod +x /usr/local/bin/habitat-entrypoint.sh
+
+# The per-session authorized key is injected at launch time via this env
+# var (habitat_vm::launcher, docs/decisions/0008-guest-exec-channel.md).
+# Declared here (empty default) purely for self-documentation -- the
+# real value always comes from `podman run --env` at launch, never baked
+# into the image itself, since it's different for every session.
+ENV HABITAT_AUTHORIZED_KEY=""
+
+# This image's only job on start is entrypoint.sh: install this
+# session's authorized key, then run sshd in the foreground -- never
+# whatever a bare `sleep infinity` placeholder or another default
+# command would do. `podman exec` cannot reach this guest at all
+# (see the doc comment above), so an actually-running sshd is load-
+# bearing, not a convenience.
 #
 # **Real-hardware caveat**, same shape as `launcher.rs`'s
-# `WORKSPACE_DISK_ANNOTATION`: whether a plain `CMD` like this is the
-# right way to keep a crun-krun/libkrun-booted guest alive for `podman
-# exec` to reach (as opposed to needing an explicit init process) is this
-# file's best current understanding, not yet confirmed against real
-# crun-krun -- `tests/manual/validate-vm-launch.sh` is where that gets
-# confirmed or corrected.
-CMD ["sleep", "infinity"]
+# `WORKSPACE_DISK_ANNOTATION`: whether crun-krun/libkrun boots this
+# image's `CMD` the same way plain crun would (as opposed to needing an
+# explicit init process for a microVM) is this file's best current
+# understanding, not yet confirmed against real crun-krun --
+# `tests/manual/validate-vm-launch.sh` is where that gets confirmed or
+# corrected.
+CMD ["/usr/local/bin/habitat-entrypoint.sh"]

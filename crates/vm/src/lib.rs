@@ -39,7 +39,16 @@
 //! policy itself (the allowlist, the proxy, the reachability-restricting
 //! firewall ruleset) lives in `crates/egress`, per `file-structure.md`
 //! Section 2's "not duplicated per-domain" rule.
+//!
+//! [`guest_ssh`] (`docs/decisions/0008-guest-exec-channel.md`): generates
+//! each session's ephemeral SSH keypair -- `podman exec` does not work
+//! against the `krun` runtime at all, so `launcher::build_run_args` bakes
+//! the session's public key into the guest via an environment variable
+//! (not a secret; the private half never leaves the host), and
+//! `launcher::launch` resolves the guest's address so
+//! `habitat-workspace`'s guest-exec channel can actually reach it.
 
 pub mod command_runner;
+pub mod guest_ssh;
 pub mod launcher;
 pub mod session;
