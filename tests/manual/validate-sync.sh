@@ -21,6 +21,19 @@
 # sync_sandbox_to_host) actually running when they're supposed to and
 # nothing running in between.
 #
+# Steps 4-5 run for real, from this script, against the still-live
+# session -- not printed as instructions for a human to act on in a
+# second terminal before teardown races ahead. An earlier version of this
+# script did exactly that (the same mistake an earlier version of
+# `validate-vm-launch.sh` made for its own Step 4, see that script's
+# history) -- teardown ran immediately after printing the instructions,
+# so there was never a window to actually act on them. `habitat run`
+# doesn't wire up the sync calls yet (Phase 7 territory), so this script
+# drives `crates/workspace/examples/manual_sync_round.rs`, a small example
+# binary that exists solely for this runbook and makes one real,
+# discrete `sync_host_to_sandbox`/`sync_sandbox_to_host` call against a
+# real guest.
+#
 # **Guest exec channel is SSH, not `podman exec`, reached by published
 # port, not a distinct guest IP** (docs/decisions/0008-guest-exec-channel.md):
 # a real run against `validate-vm-launch.sh` confirmed `podman exec` does
@@ -139,43 +152,64 @@ record "- Seeded a git repo at $GUEST_WORKSPACE_DIR inside the guest (over SSH)"
 # --- Step 3: baseline process inventory (idle, between syncs) -----------
 say "Step 3: baseline process inventory -- idle, no sync in progress"
 BASELINE="$LOG_DIR/ps-baseline.txt"
-ps -eo pid,ppid,cmd --no-headers | grep -iE 'podman|habitat|ssh|scp' | grep -v "$$" > "$BASELINE" || true
+ps -eo pid,ppid,cmd --no-headers | grep -iE '[p]odman|[h]abitat|[s]sh|[s]cp' | grep -v "$$" > "$BASELINE" || true
 record "- Baseline process snapshot written to $BASELINE"
 record '```'
 cat "$BASELINE" | tee -a "$SUMMARY"
 record '```'
 
-# --- Step 4: run a host->sandbox sync round and re-inventory ------------
-say "Step 4: host->sandbox sync (one discrete invocation) then re-check"
-record ""
-record "MANUAL: run one host->sandbox sync round here (e.g. via a debug binary or"
-record "\`cargo run\` invocation that calls habitat_workspace::sync::sync_host_to_sandbox"
-record "against session $SESSION_NAME at $GUEST_SSH_HOST:$GUEST_SSH_PORT using $SSH_KEY_PATH), then"
-record "immediately re-run:"
-record '```'
-record "ps -eo pid,ppid,cmd --no-headers | grep -iE 'podman|habitat|ssh|scp' | grep -v \$\$"
-record '```'
-record "and confirm the resulting process list matches the baseline above once the sync"
-record "round has returned -- no leftover \`ssh\`/\`scp\` process, no new long-lived process"
-record "of any kind still running."
-record ""
-record "- [ ] Process list after a host->sandbox sync round matches the idle baseline"
+# --- Steps 4-5: real sync rounds, each immediately re-inventoried -------
+STATE_DIR="$LOG_DIR/sync-state"
+rm -rf "$STATE_DIR"
+mkdir -p "$STATE_DIR"
 
-# --- Step 5: run a sandbox->host sync round and re-inventory ------------
-say "Step 5: sandbox->host sync (one discrete invocation) then re-check"
+# Runs one sync round for real via the manual_sync_round example, then
+# immediately re-inventories processes and compares against the idle
+# baseline -- exactly the check an earlier version of this script left
+# for a human to do by hand in a race against teardown.
+run_sync_round() {
+    local step_label="$1" direction="$2" checklist_label="$3"
+    say "$step_label: $direction sync (one discrete invocation) then re-check"
+    record ""
+    set +e
+    SYNC_OUTPUT="$(cd "$REPO_ROOT" && cargo run --quiet -p habitat-workspace --example manual_sync_round -- \
+        "$direction" "$GUEST_SSH_HOST" "$GUEST_SSH_PORT" "$SSH_KEY_PATH" "$STATE_DIR" 2>&1)"
+    SYNC_EXIT=$?
+    set -e
+    record "- \`manual_sync_round $direction\` (exit $SYNC_EXIT): \`$SYNC_OUTPUT\`"
+    AFTER="$(ps -eo pid,ppid,cmd --no-headers | grep -iE '[p]odman|[h]abitat|[s]sh|[s]cp' | grep -v "$$" || true)"
+    if [[ "$AFTER" == "$(cat "$BASELINE")" ]]; then
+        record "  CONFIRMED: process list after this round matches the idle baseline."
+        record "- [x] $checklist_label"
+    else
+        record "  **FAILED**: process list after this round differs from the idle baseline:"
+        record '```'
+        record "$AFTER"
+        record '```'
+        record "- [ ] $checklist_label"
+    fi
+}
+
+run_sync_round "Step 4" "host-to-sandbox" "Process list after a host->sandbox sync round matches the idle baseline"
+run_sync_round "Step 5" "sandbox-to-host" "Process list after a sandbox->host sync round matches the idle baseline"
+
+# --- Aggregate check: several rounds back-to-back, re-inventoried after
+# each one -- the exit gate's actual claim is about the whole sequence,
+# not just one round in each direction.
+say "Step 5b: aggregate check -- several rounds back-to-back"
 record ""
-record "MANUAL: same as Step 4, but for sync_sandbox_to_host. Confirm the process list"
-record "again matches the idle baseline once the round has returned."
-record ""
-record "- [ ] Process list after a sandbox->host sync round matches the idle baseline"
-record ""
-record "MANUAL: also confirm the *aggregate* claim this whole exit gate is about: across"
-record "several rounds of both sync directions run back-to-back, at no point does a"
-record "process inventory show anything beyond the two discrete invocations plus whatever"
-record "they call inside a normal invocation's lifetime (git, ssh, scp) -- no persistent"
-record "watcher, poller, or background bridge process appears at any point between rounds."
-record ""
-record "- [ ] No continuous/background sync process observed across multiple rounds"
+AGGREGATE_OK=1
+for round in 1 2; do
+    run_sync_round "Step 5b round $round (host->sandbox)" "host-to-sandbox" "round $round host->sandbox matches baseline"
+    [[ "$AFTER" == "$(cat "$BASELINE")" ]] || AGGREGATE_OK=0
+    run_sync_round "Step 5b round $round (sandbox->host)" "sandbox-to-host" "round $round sandbox->host matches baseline"
+    [[ "$AFTER" == "$(cat "$BASELINE")" ]] || AGGREGATE_OK=0
+done
+if [[ "$AGGREGATE_OK" -eq 1 ]]; then
+    record "- [x] No continuous/background sync process observed across multiple rounds"
+else
+    record "- [ ] No continuous/background sync process observed across multiple rounds"
+fi
 
 # --- Step 6: teardown -----------------------------------------------------
 say "Step 6: teardown"
