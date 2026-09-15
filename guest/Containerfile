@@ -30,8 +30,15 @@ FROM alpine:${ALPINE_VERSION}
 
 RUN apk add --no-cache git openssh-server curl \
     && adduser -D -s /bin/sh habitat \
+    # adduser -D leaves the account password-locked ("!" in /etc/shadow);
+    # OpenSSH's own allowed_user() check refuses a locked account
+    # regardless of auth method -- including pubkey -- so this must be
+    # unlocked even though PasswordAuthentication stays off below.
+    && passwd -u habitat \
     && ssh-keygen -A \
-    && printf 'PasswordAuthentication no\nChallengeResponseAuthentication no\nPermitRootLogin no\nAllowUsers habitat\nUsePAM no\n' >> /etc/ssh/sshd_config
+    # No UsePAM here: Alpine's openssh-server isn't built with PAM
+    # support, so that directive just logs "Unsupported option" noise.
+    && printf 'PasswordAuthentication no\nChallengeResponseAuthentication no\nPermitRootLogin no\nAllowUsers habitat\n' >> /etc/ssh/sshd_config
 
 COPY entrypoint.sh /usr/local/bin/habitat-entrypoint.sh
 RUN chmod +x /usr/local/bin/habitat-entrypoint.sh

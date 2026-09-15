@@ -212,6 +212,10 @@ for _ in $(seq 1 30); do
 done
 if [[ "$SSH_READY" -ne 1 ]]; then
     record "- **FAILED**: could not SSH into the guest at $GUEST_SSH_HOST:$GUEST_SSH_PORT within 30s -- confirm guest/entrypoint.sh actually starts sshd."
+    record "  Guest logs (\`podman logs $SESSION_NAME\`):"
+    record '```'
+    record "$(podman logs "$SESSION_NAME" 2>&1 || echo '(podman logs failed)')"
+    record '```'
     podman rm --force --ignore "$SESSION_NAME" >/dev/null 2>&1 || true
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1

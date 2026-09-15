@@ -22,4 +22,11 @@ chmod 700 "$SSH_DIR"
 chmod 600 "$SSH_DIR/authorized_keys"
 chown -R habitat:habitat "$SSH_DIR"
 
+# sshd's privilege-separation directory: normally created by Alpine's
+# sshd OpenRC init script before sshd starts. This entrypoint execs sshd
+# directly instead of going through OpenRC, and /run is a fresh tmpfs
+# every boot, so nothing else creates this -- without it sshd refuses to
+# start at all ("Missing privilege separation directory").
+mkdir -p /run/sshd
+
 exec /usr/sbin/sshd -D -e
