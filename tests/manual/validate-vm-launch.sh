@@ -40,7 +40,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/tmp/wip/vm-launch-validation"
 SESSION_NAME="habitat-manual-validation-$$"
-GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:almalinux}"
+GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:alpine}"
 WORKSPACE_DISK="$LOG_DIR/session.img"
 ANNOTATION_KEY="io.habitat.vm.workspace-disk"
 

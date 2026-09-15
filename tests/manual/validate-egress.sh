@@ -44,7 +44,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/tmp/wip/egress-validation"
 SESSION_NAME="habitat-manual-egress-$$"
-GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:almalinux}"
+GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:alpine}"
 WORKSPACE_DISK="$LOG_DIR/session.img"
 PROXY_ADDR="127.0.0.1:8443"
 DNS_ADDR="127.0.0.1:5300"

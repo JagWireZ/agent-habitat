@@ -190,7 +190,7 @@ mod tests {
         LaunchRequest {
             session_id: SessionId::from_name("habitat-test-session").unwrap(),
             workspace_disk_path: PathBuf::from("/tmp/habitat-test-session.img"),
-            guest_image: "localhost/habitat-guest:almalinux".to_string(),
+            guest_image: "localhost/habitat-guest:alpine".to_string(),
             resource_limits: ResourceLimitsConfig {
                 cpus: 2.0,
                 memory_mb: 2048,
@@ -208,7 +208,7 @@ mod tests {
         assert!(args.contains(&"habitat-test-session".to_string()));
         assert_eq!(
             args.last(),
-            Some(&"localhost/habitat-guest:almalinux".to_string())
+            Some(&"localhost/habitat-guest:alpine".to_string())
         );
     }
 

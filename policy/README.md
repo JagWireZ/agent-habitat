@@ -19,8 +19,10 @@ Populated so far:
   from or merged with it.
 - **Phase 5** (`docs/plan.md` Section 2.3 / AGENTS.md Section 2 invariant
   7) -- done: `egress_allowlist.txt` holds the default egress allowlist
-  (major AI provider APIs, standard package registries, scoped to the v1
-  AlmaLinux platform target), parsed by
+  (major AI provider APIs, standard package registries, and the fixed
+  Alpine guest's own `apk` mirror -- `docs/decisions/
+  0002-guest-os-layer.md` -- rather than the host's package family),
+  parsed by
   `crates/policy/src/egress_allowlist.rs` (baked into the binary via
   `include_str!`, same "not re-read from disk at runtime" contract as
   `blocklist.txt`) and extended per project via that project's checked-in

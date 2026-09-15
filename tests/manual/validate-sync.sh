@@ -34,7 +34,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="$REPO_ROOT/tmp/wip/sync-validation"
 SESSION_NAME="habitat-manual-sync-$$"
-GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:almalinux}"
+GUEST_IMAGE="${HABITAT_GUEST_IMAGE:-localhost/habitat-guest:alpine}"
 GUEST_WORKSPACE_DIR="/workspace"
 WORKSPACE_DISK="$LOG_DIR/session.img"
 ANNOTATION_KEY="io.habitat.vm.workspace-disk"

@@ -19,10 +19,13 @@
 # can be removed or overridden per-project (same rule as
 # `policy/blocklist.txt`).
 #
-# v1 platform target is AlmaLinux only (`docs/decisions/
-# 0001-host-os-layer.md`) -- package-registry entries below are scoped to
-# that; Fedora/Ubuntu registry mirrors are added when those roadmap
-# stages actually start, not built ahead.
+# This is the *guest's* egress -- and the guest is a fixed Alpine image,
+# independent of whichever host platform `habitat` itself is validated
+# against at a given roadmap stage (`docs/decisions/
+# 0002-guest-os-layer.md`, corrected 2026-09-15). So the guest-side
+# package-registry entries below are Alpine's own (`apk`) mirrors, not
+# the host's package family (dnf/AlmaLinux, or later apt/Ubuntu) -- the
+# guest never changes package family when the host roadmap advances.
 
 # Major AI provider APIs
 api.anthropic.com
@@ -48,7 +51,7 @@ rubygems.org
 proxy.golang.org
 sum.golang.org
 
-# AlmaLinux (v1 platform target) package mirrors
-repo.almalinux.org
-mirrors.almalinux.org
-*.mirror.almalinux.org
+# Alpine (the fixed guest platform) package mirrors -- dl-cdn is the
+# actual host `apk` (Alpine's package manager) is configured against by
+# default.
+dl-cdn.alpinelinux.org

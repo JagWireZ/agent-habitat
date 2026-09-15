@@ -103,6 +103,7 @@ system as a whole is validated on.
 - `0006-distribution-packaging-layer.md`'s packaging cadence
   (`.rpm` for AlmaLinux/Fedora, `.deb` when Ubuntu starts) follows this
   sequence.
-- The guest OS layer's platform, per `0002-guest-os-layer.md`, tracks
-  whichever stage of this roadmap `habitat` currently targets -- it is not
-  an independent choice.
+- The guest OS layer's platform is *not* tied to this roadmap: per
+  `0002-guest-os-layer.md` (corrected 2026-09-15), the guest is a fixed
+  Alpine image throughout every stage above -- an independent choice made
+  once, not one that advances alongside AlmaLinux -> Fedora -> Ubuntu.

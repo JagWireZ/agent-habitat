@@ -26,7 +26,7 @@ fn sample_request() -> LaunchRequest {
     LaunchRequest {
         session_id: SessionId::from_name("habitat-adversarial-session").unwrap(),
         workspace_disk_path: PathBuf::from("/tmp/habitat-adversarial-session.img"),
-        guest_image: "localhost/habitat-guest:almalinux".to_string(),
+        guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: ResourceLimitsConfig::default(),
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
     }

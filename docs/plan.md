@@ -14,7 +14,7 @@ Three things make this safe in practice:
 
 Everything the agent does is logged, so there's always a clear record of what happened in a session.
 
-**v1 targets AlmaLinux**, with Fedora expected to follow easily and Ubuntu planned for later once the core is proven.
+**v1 targets AlmaLinux as the host platform**, with Fedora expected to follow easily and Ubuntu planned for later once the core is proven. The guest is a separate choice: it always runs Alpine, independent of that host roadmap (see below).
 
 Here's how the pieces fit together:
 
@@ -44,7 +44,7 @@ The rest of this document goes into the technical details behind each part.
 
 Each session gets its own lightweight virtual machine (via Podman's `krun` runtime, backed by libkrun), not just a Linux container. That matters because containers share a kernel with the host — a real VM boundary, backed by hardware virtualization, is a much harder wall to break through.
 
-- The guest runs a minimal Linux image — small, fast to boot, and with little for an attacker to work with even if something went wrong inside it.
+- The guest runs a minimal Linux image — Alpine, fixed regardless of which host platform `habitat` itself is currently validated against — small, fast to boot, and with little for an attacker to work with even if something went wrong inside it.
 - libkrun intentionally supports very little hardware emulation, which keeps its exposed surface small.
 - **Nothing about launching a session requires root or any other elevated host privilege.** Podman runs entirely in rootless mode; the only host-side prerequisite is the launching user belonging to the `kvm` group, which is a one-time setup step, not a per-session elevation. This is a deliberately narrower privilege footprint than typical container/VM launchers — Agent Habitat has no other need to touch the host system, so there's no reason for it to run as anything other than the calling user.
 - **Two things need to be true on your machine first:** hardware virtualization support (this can be silently unavailable on some cloud VMs — we'll check for it up front) and `podman` with the `crun-krun` package installed. No separate daemon or second piece of host infrastructure is required — on Fedora and AlmaLinux both, this is a single package on top of tooling most teams already have.

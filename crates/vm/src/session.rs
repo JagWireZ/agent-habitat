@@ -72,8 +72,9 @@ pub struct LaunchRequest {
     /// the guest's root filesystem itself.
     pub workspace_disk_path: PathBuf,
     /// The guest OS container image reference (`0002-guest-os-layer.md`)
-    /// -- built for the current host roadmap stage (AlmaLinux for v1),
-    /// never chosen independently per project or per session.
+    /// -- a fixed Alpine image, independent of the host roadmap stage
+    /// (never AlmaLinux/Fedora/Ubuntu, and never chosen independently
+    /// per project or per session).
     pub guest_image: String,
     pub resource_limits: ResourceLimitsConfig,
     /// The local egress proxy's bound address for this session

@@ -34,11 +34,15 @@ single-host constructs, not placeholders waiting to be generalized.
 
 **The host machine is Linux-only, and the platform roadmap is a single
 sequential line: v1 targets AlmaLinux, v1.1 Fedora, v2 Ubuntu** -- not
-two host families validated in parallel with a separately fixed guest
+two host families validated in parallel
 (see Section 5, and `docs/decisions/0001-host-os-layer.md`).
-There is no separate guest-distro axis to track: the guest image is built
-from whichever platform the current roadmap stage targets. Don't build
-host-OS-detection branches, nested-VM workarounds, or "best effort" paths
+The guest is a separate axis from that roadmap: it is a fixed Alpine
+image throughout every host stage, chosen independently of whatever the
+host currently is (`docs/decisions/0002-guest-os-layer.md`) -- it does
+not advance alongside AlmaLinux -> Fedora -> Ubuntu, and no guest-side
+distro-conditional branching should ever be added for a host roadmap
+transition. Don't build host-OS-detection branches, nested-VM
+workarounds, or "best effort" paths
 for macOS/Windows, or for any other Linux distro family (Arch, openSUSE,
 etc.), or for Fedora/Ubuntu ahead of their own roadmap stage,
 preemptively. macOS/Windows host support is future work, not yet
@@ -189,13 +193,15 @@ Windows host support is a separate, later effort that hasn't been
 designed yet -- it is not part of the sequence below, and no code path
 should assume or special-case a non-Linux host in the meantime.
 
-The platform roadmap is a single sequential line, not a host-family-
-parallel / guest-fixed split (`docs/decisions/0001-host-os-layer.md`,
-`docs/decisions/0002-guest-os-layer.md`).
-Each stage covers both what `habitat` runs on and what the guest image is
-built from -- there's no separate guest-distro axis to track:
+The **host** platform roadmap is a single sequential line, not multiple
+host families validated in parallel (`docs/decisions/0001-host-os-layer.md`).
+The **guest** is a separate, fixed axis that does not move with this
+roadmap at all -- it is Alpine throughout every stage below, an
+independent choice made once, not one of these stages'
+concerns (`docs/decisions/0002-guest-os-layer.md`, corrected 2026-09-15):
 
 ```
+host roadmap (what `habitat` itself runs on):
 v1   -- AlmaLinux
          (full system validated end-to-end on real hardware)
   -> v1.1 -- Fedora
@@ -207,6 +213,9 @@ v1   -- AlmaLinux
       -> (later, undesigned) further platform families
          (e.g. Arch, openSUSE)
         -> (later, undesigned) macOS / Windows host support
+
+guest (what the sandboxed session runs on): Alpine -- fixed, unrelated
+to whichever stage above the host roadmap is currently at.
 ```
 
 Rules that follow from this:
@@ -215,10 +224,13 @@ Rules that follow from this:
   from a later stage (e.g. a Fedora- or Ubuntu-specific path, an Arch or
   openSUSE path, or any macOS/Windows host path) that doesn't exist yet,
   flag it rather than building a one-off parallel mechanism for it now.
-- **v1 is AlmaLinux, full stop.** Distro-conditional branches for Fedora,
-  Ubuntu, or any other platform, and any host-OS branches beyond Linux,
-  don't belong in the codebase until their own roadmap stage starts --
-  there is no "ship the next stage early" shortcut.
+- **v1's host is AlmaLinux, full stop.** Distro-conditional branches for
+  Fedora, Ubuntu, or any other platform, and any host-OS branches beyond
+  Linux, don't belong in the codebase until their own roadmap stage
+  starts -- there is no "ship the next stage early" shortcut. This is a
+  host-side rule only: the guest is always Alpine, at every stage,
+  including v1 -- there is no "guest hasn't caught up to the roadmap yet"
+  state to reach.
 
 ## 6. File structure conventions
 

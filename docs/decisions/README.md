@@ -8,9 +8,10 @@ current, standalone decision for its layer.
   hardware virtualization required; sequential distro roadmap (AlmaLinux
   -> Fedora -> Ubuntu); `habitat install`'s auto-install step detects the
   dnf/apt package-manager family as a narrow, amended exception.
-- [`0002-guest-os-layer.md`](0002-guest-os-layer.md) -- guest image mirrors
-  whichever platform the host roadmap currently targets; no separate
-  guest-distro axis.
+- [`0002-guest-os-layer.md`](0002-guest-os-layer.md) -- guest image is
+  fixed to Alpine, independent of whichever platform the host roadmap
+  currently targets (corrected 2026-09-15; originally recorded the
+  opposite -- see that file's "Correction" section).
 - [`0003-container-engine-runtime-layer.md`](0003-container-engine-runtime-layer.md)
   -- rootless Podman launching each session through the `krun` OCI runtime
   (libkrun), not containerd/nerdctl + Kata Containers + Firecracker.
