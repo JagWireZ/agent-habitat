@@ -337,14 +337,40 @@ mod tests {
         assert_eq!(args[dns_idx + 1], "127.0.0.1");
     }
 
+    /// Confirmed on real hardware (`tmp/wip/vm-launch-validation`,
+    /// `tmp/wip/egress-validation`): without this annotation, `crun-krun`
+    /// silently falls back to libkrun's default TSI networking
+    /// regardless of `--network pasta` -- the guest never gets a real
+    /// virtio-net device, and everything downstream that assumes one
+    /// (DHCP, DNS pinning, the egress firewall ruleset) has nothing to
+    /// act on. This must always travel alongside `--network`/`--dns`.
+    #[test]
+    fn build_run_args_includes_the_krun_use_passt_annotation() {
+        let args = build_run_args(&sample_request());
+        let expected = format!(
+            "{}=1",
+            habitat_egress::network_setup::KRUN_USE_PASST_ANNOTATION
+        );
+        assert!(
+            args.iter().any(|a| a == &expected),
+            "expected {expected:?} somewhere in the argv, got {args:?}"
+        );
+    }
+
     #[test]
     fn build_run_args_attaches_the_workspace_disk_via_annotation() {
         let args = build_run_args(&sample_request());
-        let ann_idx = args.iter().position(|a| a == "--annotation").unwrap();
-        assert_eq!(
-            args[ann_idx + 1],
-            format!("{WORKSPACE_DISK_ANNOTATION}=/tmp/habitat-test-session.img")
-        );
+        let expected_value = format!("{WORKSPACE_DISK_ANNOTATION}=/tmp/habitat-test-session.img");
+        // `.position` alone would find the *first* `--annotation` flag --
+        // `build_network_flags` now emits one of its own
+        // (`krun.use_passt=1`) ahead of this one, so this specifically
+        // looks for the workspace-disk annotation's own value rather than
+        // assuming there's only one `--annotation` pair in the argv.
+        let ann_idx = args
+            .iter()
+            .position(|a| a == &expected_value)
+            .expect("workspace-disk annotation value must be present");
+        assert_eq!(args[ann_idx - 1], "--annotation");
     }
 
     /// No live/continuous file-share mount at any point (`AGENTS.md`

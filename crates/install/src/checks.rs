@@ -16,6 +16,7 @@ pub enum CheckId {
     Kvm,
     Podman,
     KrunRuntime,
+    Libkrunfw,
     Betterleaks,
 }
 
@@ -26,6 +27,7 @@ impl CheckId {
             CheckId::Kvm => "kvm",
             CheckId::Podman => "podman",
             CheckId::KrunRuntime => "krun-runtime",
+            CheckId::Libkrunfw => "libkrunfw",
             CheckId::Betterleaks => "betterleaks",
         }
     }
@@ -198,6 +200,65 @@ pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
     }
 }
 
+/// `libkrunfw` (the shared library bundling the actual guest kernel
+/// `libkrun` boots) resolvable by the dynamic linker.
+///
+/// **Why this is a separate check from [`krun_runtime`], not folded into
+/// it**: confirmed on real AlmaLinux 10.2 hardware
+/// (`tmp/wip/vm-launch-validation`) -- `krun --version` succeeds even
+/// with `libkrunfw` completely absent, because that code path never
+/// touches libkrun's VM-creation logic, which is the only place
+/// `libkrunfw` actually gets dlopen'd. The first real symptom without
+/// this check is a session launch itself failing outright ("Couldn't
+/// find or load libkrunfw.so.5"), which is exactly the false-confidence
+/// gap this check exists to close: `krun_runtime` passing must not be
+/// read as "a session can actually launch."
+///
+/// **Why this can't be an RPM dependency this crate relies on**: also
+/// confirmed on that same hardware -- the EPEL build of `libkrun` for
+/// AlmaLinux 10 declares no RPM `Requires` on `libkrunfw` at all (it's
+/// loaded via `dlopen`, not linked at build time, so rpm's automatic
+/// dependency generator never sees it), and EPEL carries no `libkrunfw`
+/// package under any name to depend on regardless. A genuine Fedora host
+/// doesn't hit this: Fedora's own `crun-krun`/`libkrun` packages pull in
+/// a matching `libkrunfw` automatically. See
+/// `package_manager::LIBKRUNFW_FALLBACK_URL` for what `habitat install`
+/// does about the EPEL gap.
+///
+/// `ldconfig -p` (the dynamic linker's own cache) is the most direct
+/// real-hardware-confirmed way to ask "will `krun` actually be able to
+/// find this at VM-boot time" -- `ldd krun` doesn't show it (it's not a
+/// direct ELF dependency of the `krun`/`libkrun` binaries, since it's
+/// dlopen'd), and guessing a fixed install path (`/usr/lib64/...`) would
+/// break on any host that keeps it somewhere else.
+pub fn libkrunfw<E: Environment>(env: &E) -> CheckResult {
+    match env.run_command("ldconfig", &["-p"]) {
+        Ok(output) if output.status.success() => {
+            if String::from_utf8_lossy(&output.stdout).contains("libkrunfw") {
+                Ok(())
+            } else {
+                fail(
+                    CheckId::Libkrunfw,
+                    "libkrunfw not found by the dynamic linker (ldconfig -p) -- krun needs \
+                     this to actually boot a session's microVM, even though `krun --version` \
+                     alone doesn't exercise it",
+                )
+            }
+        }
+        Ok(output) => fail(
+            CheckId::Libkrunfw,
+            format!(
+                "`ldconfig -p` exited non-zero: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ),
+        Err(e) => fail(
+            CheckId::Libkrunfw,
+            format!("could not run `ldconfig -p` to check for libkrunfw: {e}"),
+        ),
+    }
+}
+
 /// The `betterleaks` binary (content-based secrets scanning) on `PATH`.
 /// Only run when a project's checked-in config has `secrets_scan.content`
 /// enabled (the default) -- see `crate::preflight::run_preflight`, which
@@ -324,6 +385,34 @@ mod tests {
     fn krun_runtime_passes_when_present() {
         let env = FakeEnvironment::linux().with_command_ok("krun --version", "krun 1.14");
         assert!(krun_runtime(&env).is_ok());
+    }
+
+    #[test]
+    fn libkrunfw_fails_when_ldconfig_does_not_list_it() {
+        // Mirrors the real AlmaLinux 10.2 finding: `ldconfig -p` runs
+        // fine but simply has no libkrunfw entry.
+        let env = FakeEnvironment::linux().with_command_ok(
+            "ldconfig -p",
+            "\tlibkrun.so.1 (libc6,x86-64) => /lib64/libkrun.so.1\n",
+        );
+        let err = libkrunfw(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::Libkrunfw);
+    }
+
+    #[test]
+    fn libkrunfw_fails_closed_when_ldconfig_itself_is_missing() {
+        let env = FakeEnvironment::linux();
+        let err = libkrunfw(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::Libkrunfw);
+    }
+
+    #[test]
+    fn libkrunfw_passes_when_ldconfig_lists_it() {
+        let env = FakeEnvironment::linux().with_command_ok(
+            "ldconfig -p",
+            "\tlibkrunfw.so.5 (libc6,x86-64) => /lib64/libkrunfw.so.5\n",
+        );
+        assert!(libkrunfw(&env).is_ok());
     }
 
     #[test]

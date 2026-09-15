@@ -126,7 +126,9 @@ say "Step 2: launch a real session to sync against"
 dd if=/dev/zero of="$WORKSPACE_DISK" bs=1M count=64 status=none
 mkfs.ext4 -q -F "$WORKSPACE_DISK"
 podman run --detach --rm --name "$SESSION_NAME" \
-    --runtime krun --network pasta --dns 127.0.0.1 --cpus 2 --memory 2048m \
+    --runtime krun --network pasta --dns 127.0.0.1 \
+    --annotation "krun.use_passt=1" \
+    --cpus 2 --memory 2048m \
     --annotation "${ANNOTATION_KEY}=${WORKSPACE_DISK}" \
     --env "HABITAT_AUTHORIZED_KEY=${AUTHORIZED_KEY}" \
     --publish "${GUEST_SSH_HOST}::22/tcp" \

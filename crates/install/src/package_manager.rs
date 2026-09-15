@@ -75,16 +75,64 @@ pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str
         (CheckId::Podman, PackageFamily::Apt) => Some("podman"),
         (CheckId::KrunRuntime, PackageFamily::Dnf) => Some("crun-krun"),
         (CheckId::KrunRuntime, PackageFamily::Apt) => None,
+        // `libkrunfw` under its own upstream package name -- the primary
+        // attempt. On a genuine Fedora host this check never even gets
+        // this far: installing `crun-krun` there already pulls in a
+        // matching `libkrunfw` automatically, so `checks::libkrunfw`
+        // already passes and `installer::install_missing` never attempts
+        // anything for this check at all. This mapping exists for hosts
+        // where a `libkrunfw` package genuinely is resolvable by name but
+        // just hadn't been installed yet -- `installer.rs` falls back to
+        // `LIBKRUNFW_FALLBACK_URL` if this attempt itself fails, which is
+        // what actually happens on AlmaLinux 10 today (no `libkrunfw`
+        // package under any name in EPEL -- confirmed real-hardware,
+        // `tmp/wip/vm-launch-validation`).
+        (CheckId::Libkrunfw, PackageFamily::Dnf) => Some("libkrunfw"),
+        (CheckId::Libkrunfw, PackageFamily::Apt) => None,
         (CheckId::HostOs, _) | (CheckId::Kvm, _) => None,
-        // `betterleaks` isn't a dnf/apt-distributed package this codebase
-        // has confirmed a name for on either family -- no guessed package
-        // name here (same "None, never a guess" posture as the
-        // unrecognized-distro case above). `habitat install`'s auto-install
-        // step won't offer to fix this check; the preflight failure message
-        // in `checks::betterleaks` tells the operator what to do instead.
-        (CheckId::Betterleaks, _) => None,
+        // `betterleaks` is EPEL-distributed under its own upstream name
+        // (`betterleaks`) on the Fedora/RHEL-family branch -- AlmaLinux
+        // rebuilds EPEL's SRPMs for EL10, so the same package name
+        // resolves there once EPEL is enabled. No confirmed `.deb` exists
+        // for Debian/Ubuntu-family hosts yet, so that side stays `None`
+        // (same "None, never a guess" posture as the unrecognized-distro
+        // case above) rather than guessing a name.
+        (CheckId::Betterleaks, PackageFamily::Dnf) => Some("betterleaks"),
+        (CheckId::Betterleaks, PackageFamily::Apt) => None,
     }
 }
+
+/// A pinned, real-hardware-confirmed fallback source for `libkrunfw` on
+/// the Dnf family, used only when the primary `package_for` attempt
+/// (`dnf install libkrunfw`) itself fails -- which is exactly what
+/// happens on AlmaLinux 10 today, since EPEL carries no `libkrunfw`
+/// package under any name (confirmed: `dnf install libkrunfw` there
+/// returns "No match for argument", not a version conflict).
+///
+/// This is a direct Koji (Fedora's own build system) URL for a Fedora 43
+/// x86_64 build of upstream `libkrunfw` v5.5.0, `dnf install`-able
+/// directly by URL. Confirmed end-to-end on real AlmaLinux 10.2 hardware
+/// (`tmp/wip/vm-launch-validation`): installs cleanly, resolves via
+/// `ldconfig -p` as `libkrunfw.so.5` (the exact SONAME the EPEL
+/// `libkrun-1.17.4` build needs), and a real `krun`-backed `podman run`
+/// boots successfully afterward. `libkrunfw` is close to a self-contained
+/// blob (it bundles a prebuilt Linux kernel behind a thin C shim), which
+/// is why a Fedora-built binary works on a RHEL-family host at all here --
+/// this is still a cross-distro binary, not an officially supported
+/// combination, and is a stopgap for exactly this gap, not a permanent
+/// answer.
+///
+/// **This will eventually go stale.** Fedora rotates old builds out of
+/// active Koji retention over time, and a newer `libkrun` build may need
+/// a newer `libkrunfw` SONAME than this one provides. If `habitat
+/// install` starts reporting this fallback as `Failed`, check
+/// <https://koji.fedoraproject.org/koji/packageinfo?packageID=35681> for
+/// a current Fedora 43 (or the then-current stable release) x86_64 build
+/// and update this constant -- and check whether EPEL or AlmaLinux itself
+/// has shipped a real `libkrunfw` package in the meantime, which would
+/// let this whole fallback (and this doc comment) be deleted.
+pub const LIBKRUNFW_FALLBACK_URL: &str =
+    "https://kojipkgs.fedoraproject.org/packages/libkrunfw/5.5.0/1.fc43/x86_64/libkrunfw-5.5.0-1.fc43.x86_64.rpm";
 
 /// The command (program + args) that installs `package` as root on
 /// `family`. Always non-interactive on the package manager's own prompts
@@ -181,9 +229,26 @@ mod tests {
     }
 
     #[test]
-    fn betterleaks_has_no_package_fix_on_any_family() {
-        for family in [PackageFamily::Dnf, PackageFamily::Apt] {
-            assert_eq!(package_for(CheckId::Betterleaks, family), None);
-        }
+    fn libkrunfw_has_a_dnf_package_name_but_no_confirmed_apt_package_yet() {
+        assert_eq!(
+            package_for(CheckId::Libkrunfw, PackageFamily::Dnf),
+            Some("libkrunfw")
+        );
+        assert_eq!(package_for(CheckId::Libkrunfw, PackageFamily::Apt), None);
+    }
+
+    #[test]
+    fn libkrunfw_fallback_url_is_a_dnf_installable_https_url() {
+        assert!(LIBKRUNFW_FALLBACK_URL.starts_with("https://"));
+        assert!(LIBKRUNFW_FALLBACK_URL.ends_with(".rpm"));
+    }
+
+    #[test]
+    fn betterleaks_has_a_dnf_package_but_no_confirmed_apt_package_yet() {
+        assert_eq!(
+            package_for(CheckId::Betterleaks, PackageFamily::Dnf),
+            Some("betterleaks")
+        );
+        assert_eq!(package_for(CheckId::Betterleaks, PackageFamily::Apt), None);
     }
 }

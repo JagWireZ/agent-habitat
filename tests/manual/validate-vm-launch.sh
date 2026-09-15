@@ -153,6 +153,14 @@ PODMAN_ARGS=(
     # doesn't affect this script's own checks.
     --network pasta
     --dns 127.0.0.1
+    # Without this, crun-krun silently falls back to libkrun's own
+    # default TSI networking regardless of `--network pasta` above --
+    # confirmed on real hardware (tmp/wip/vm-launch-validation): a
+    # session launched without this annotation booted with `tsi_hijack`
+    # on its kernel command line and no virtio-net device at all. Per
+    # crun's own krun.1.md: `krun.use_passt=NUM`, "When set to a value
+    # greater than 0, enable passt-based networking in the microVM."
+    --annotation "krun.use_passt=1"
     --cpus 2 --memory 2048m
     --annotation "${ANNOTATION_KEY}=${WORKSPACE_DISK}"
     --env "HABITAT_AUTHORIZED_KEY=${AUTHORIZED_KEY}"

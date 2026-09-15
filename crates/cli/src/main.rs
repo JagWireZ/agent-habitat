@@ -80,6 +80,7 @@ fn friendly_name(check: CheckId) -> &'static str {
         CheckId::Kvm => "Hardware virtualization",
         CheckId::Podman => "Container runtime",
         CheckId::KrunRuntime => "Sandbox isolation layer",
+        CheckId::Libkrunfw => "Virtual machine kernel",
         CheckId::Betterleaks => "Content secrets scanner",
     }
 }
@@ -92,6 +93,7 @@ fn friendly_status(check: CheckId) -> &'static str {
         CheckId::Kvm => "Not available",
         CheckId::Podman => "Not found",
         CheckId::KrunRuntime => "Not found",
+        CheckId::Libkrunfw => "Not found",
         CheckId::Betterleaks => "Not found",
     }
 }
@@ -133,9 +135,13 @@ fn fix_for(check: CheckId) -> Fix {
             reason: "Installs crun-krun, the OCI runtime (backed by libkrun) Podman uses to launch each session in its own microVM instead of a shared-kernel container. Not yet packaged for Debian/Ubuntu-family hosts.",
             commands: &["sudo dnf install -y crun-krun   # AlmaLinux/Fedora/RHEL-family"],
         },
+        CheckId::Libkrunfw => Fix {
+            reason: "Installs libkrunfw, the library bundling the actual guest kernel `krun` boots -- required for any session to launch even though `krun --version` alone doesn't check for it. (`habitat install` can run this for you -- see the prompt above.) On AlmaLinux/RHEL-family hosts, EPEL doesn't carry this package under any name; `habitat install` falls back to a direct Fedora build automatically when that happens. Not yet packaged for Debian/Ubuntu-family hosts.",
+            commands: &["sudo dnf install -y libkrunfw   # Fedora hosts; AlmaLinux/RHEL-family falls back automatically"],
+        },
         CheckId::Betterleaks => Fix {
-            reason: "This project's checked-in config has content-based secrets scanning turned on, but the betterleaks scanner isn't installed. Install it, or turn content scanning off in the project's config (secrets_scan.content: disabled) if that's a deliberate choice for this project.",
-            commands: &[],
+            reason: "Installs betterleaks, the content-based secrets scanner Agent Habitat runs against a project's files when that project's config has content scanning turned on (the default). (`habitat install` can run this for you -- see the prompt above.) Not yet packaged for Debian/Ubuntu-family hosts; on those, turn content scanning off in the project's config (secrets_scan.content: disabled) if that's a deliberate choice for this project.",
+            commands: &["sudo dnf install -y betterleaks   # AlmaLinux/Fedora/RHEL-family, via EPEL"],
         },
     }
 }
@@ -158,8 +164,11 @@ fn technical_detail(check: CheckId) -> &'static str {
         CheckId::KrunRuntime => {
             "Install the `crun-krun` package so `krun` (the OCI runtime binary Podman exec's, with libkrun linked directly into it -- note the package and binary are named differently) is resolvable on PATH -- there is no separate hypervisor binary to install alongside it."
         }
+        CheckId::Libkrunfw => {
+            "Confirm `libkrunfw` resolves via `ldconfig -p` (not just that `krun --version` runs -- that path never dlopen's libkrunfw, so it passes even when this is missing entirely). Fedora's own `crun-krun`/`libkrun` packages pull in a matching `libkrunfw` automatically; EPEL's AlmaLinux/RHEL-family build of `libkrun` does not declare it as a dependency at all, and EPEL carries no `libkrunfw` package under any name regardless -- `habitat install`'s auto-install step falls back to `package_manager::LIBKRUNFW_FALLBACK_URL` (a pinned Fedora Koji build) on that family when the plain `dnf install libkrunfw` attempt fails."
+        }
         CheckId::Betterleaks => {
-            "Install the `betterleaks` binary so it's resolvable on PATH, or set secrets_scan.content: disabled in the project's checked-in config -- this check only runs when that project has content-based secrets scanning enabled (the default)."
+            "Install the `betterleaks` binary (EPEL package `betterleaks` on the Dnf family; no confirmed Apt package yet) so it's resolvable on PATH, or set secrets_scan.content: disabled in the project's checked-in config. `habitat install` checks for it unconditionally (no project is in scope at install time), but it's only a hard `habitat run` preflight failure for a project that has content-based secrets scanning enabled (the default)."
         }
     }
 }
@@ -260,9 +269,18 @@ fn print_required_steps(statuses: &[CheckStatus], verbose: bool) {
 /// Checks with a real package-manager fix -- the only ones the
 /// auto-install step ever offers to run something for. `HostOs` (no fix
 /// on this host at all) and `Kvm` (a firmware setting, not a package) are
-/// never included.
+/// never included. `Libkrunfw` and `Betterleaks` each have a package on
+/// the Dnf family only (`package_manager::package_for` returns `None` for
+/// either on Apt); the auto-install step already reports `NotAvailable`
+/// rather than guessing there, so it's safe to list them here alongside
+/// the other two. `Libkrunfw` additionally has a same-family fallback
+/// (`installer::attempt_one`) for hosts where the plain package name
+/// doesn't resolve at all -- see `package_manager::LIBKRUNFW_FALLBACK_URL`.
 fn is_installable(check: CheckId) -> bool {
-    matches!(check, CheckId::Podman | CheckId::KrunRuntime)
+    matches!(
+        check,
+        CheckId::Podman | CheckId::KrunRuntime | CheckId::Libkrunfw | CheckId::Betterleaks
+    )
 }
 
 /// Reads a yes/no answer from stdin, defaulting to "no" on anything else
