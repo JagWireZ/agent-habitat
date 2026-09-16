@@ -93,6 +93,51 @@ SUMMARY="$LOG_DIR/summary.md"
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 
+declare -a RESULTS=()
+
+# status <label> <PASS|FAIL|SKIP|MANUAL> [detail]
+status() {
+    local label="$1" state="$2" detail="${3:-}"
+    local color tag
+    case "$state" in
+        PASS)    color='\033[32m'; tag="PASS   " ;;
+        FAIL)    color='\033[31m'; tag="FAIL   " ;;
+        SKIP)    color='\033[33m'; tag="SKIP   " ;;
+        MANUAL)  color='\033[36m'; tag="MANUAL " ;;
+        *)       color='\033[0m';  tag="$state " ;;
+    esac
+    printf "${color}\033[1m[%s]\033[0m %s\n" "$tag" "$label"
+    RESULTS+=("$state|$label${detail:+ -- $detail}")
+}
+
+# result_summary: prints the colored table and appends the markdown
+# checklist version to $SUMMARY. Called at the end of every validate-*.sh
+# script in this directory, right before its final "Done" banner.
+result_summary() {
+    say "Result summary"
+    local r state label color
+    for r in "${RESULTS[@]}"; do
+        state="${r%%|*}"
+        label="${r#*|}"
+        case "$state" in
+            PASS)   color='\033[32m' ;;
+            FAIL)   color='\033[31m' ;;
+            SKIP)   color='\033[33m' ;;
+            MANUAL) color='\033[36m' ;;
+            *)      color='\033[0m'  ;;
+        esac
+        printf "${color}\033[1m%-8s\033[0m %s\n" "$state" "$label"
+    done
+    {
+        printf '\n## Result summary\n'
+        for r in "${RESULTS[@]}"; do
+            state="${r%%|*}"
+            label="${r#*|}"
+            printf '- **%s** -- %s\n' "$state" "$label"
+        done
+    } >> "$SUMMARY"
+}
+
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
         cat "$SUMMARY"
@@ -116,12 +161,14 @@ say "Step 1: host suitability"
 if [[ ! -e /dev/kvm ]]; then
     fail "This host has no /dev/kvm -- run tests/manual/validate-real-hardware.sh first."
     record "- **ABORTED**: no /dev/kvm on this host."
+    status "Step 1: host suitability" FAIL "no /dev/kvm on this host"
     exit 1
 fi
 for bin in podman ssh ssh-keygen; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         fail "$bin not found on PATH."
         record "- **ABORTED**: $bin not installed."
+        status "Step 1: host suitability" FAIL "$bin not installed"
         exit 1
     fi
 done
@@ -135,6 +182,7 @@ if ! podman image exists "$GUEST_IMAGE"; then
     else
         fail "$GUEST_IMAGE (from \$HABITAT_GUEST_IMAGE) not found locally, and it isn't the default this script knows how to build. Build or pull it yourself first."
         record "- **ABORTED**: $GUEST_IMAGE not present and not buildable by this script."
+        status "Step 1: host suitability" FAIL "$GUEST_IMAGE not present and not buildable"
         exit 1
     fi
 fi
@@ -144,6 +192,7 @@ rm -f "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
 ssh-keygen -t ed25519 -N '' -f "$SSH_KEY_PATH" -C habitat-session -q
 AUTHORIZED_KEY="$(cat "$SSH_KEY_PATH.pub")"
 record "- Generated a fresh session SSH keypair at $SSH_KEY_PATH"
+status "Step 1: host suitability" PASS
 
 # --- Step 2: launch a real session --------------------------------------
 say "Step 2: launch a real session to sync against"
@@ -174,6 +223,7 @@ done
 
 ssh "${SSH_OPTS[@]}" "habitat@$GUEST_SSH_HOST" "git init --quiet '$GUEST_WORKSPACE_DIR'" || true
 record "- Seeded a git repo at $GUEST_WORKSPACE_DIR inside the guest (over SSH)"
+status "Step 2: launch a real session" PASS
 
 # --- Step 3: baseline process inventory (idle, between syncs) -----------
 say "Step 3: baseline process inventory -- idle, no sync in progress"
@@ -183,6 +233,7 @@ record "- Baseline process snapshot written to $BASELINE"
 record '```'
 cat "$BASELINE" | tee -a "$SUMMARY"
 record '```'
+status "Step 3: baseline process inventory" PASS
 
 # --- Steps 4-5: real sync rounds, each immediately re-inventoried -------
 STATE_DIR="$LOG_DIR/sync-state"
@@ -255,8 +306,10 @@ run_sync_round() {
 
     if [[ "$ROUND_OK" -eq 1 ]]; then
         record "- [x] $checklist_label"
+        status "$step_label" PASS "$checklist_label"
     else
         record "- [ ] $checklist_label"
+        status "$step_label" FAIL "$checklist_label"
     fi
 }
 
@@ -280,9 +333,11 @@ run_sandbox_to_host_round() {
         if [[ -f "$landed" ]] && grep -q "$stamp" "$landed"; then
             record "  CONFIRMED: $landed exists on the host and contains the guest's stamp ($stamp)."
             record "- [x] $checklist_label (host file content verified)"
+            status "$step_label (host file content)" PASS
         else
             record "  **FAILED**: $landed is missing or does not contain stamp $stamp after an 'Applied' outcome."
             record "- [ ] $checklist_label (host file content verified)"
+            status "$step_label (host file content)" FAIL "missing or wrong stamp: $landed"
             ROUND_OK=0
             # Diagnostic dump -- pins down *where* the applied patch
             # actually landed (nowhere, just the mirror, or somewhere
@@ -329,8 +384,10 @@ for round in 1 2; do
 done
 if [[ "$AGGREGATE_OK" -eq 1 ]]; then
     record "- [x] No continuous/background sync process observed across multiple rounds, and every round produced its expected outcome"
+    status "Step 5b: aggregate check" PASS
 else
     record "- [ ] No continuous/background sync process observed across multiple rounds, and every round produced its expected outcome"
+    status "Step 5b: aggregate check" FAIL "one or more rounds failed -- see above"
 fi
 
 # --- Step 6: teardown -----------------------------------------------------
@@ -339,6 +396,9 @@ podman rm --force --ignore "$SESSION_NAME" > "$LOG_DIR/teardown.log" 2>&1 || tru
 rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
 record ""
 record "- Session torn down; workspace disk and session SSH key removed."
+status "Step 6: teardown" PASS
+
+result_summary
 
 say "Done"
 echo "Summary written to $SUMMARY -- fold Steps 4-5's manual results into it by hand."

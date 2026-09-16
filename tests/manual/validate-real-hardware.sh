@@ -35,6 +35,51 @@ say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 note() { printf '%s\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 
+declare -a RESULTS=()
+
+# status <label> <PASS|FAIL|SKIP|MANUAL> [detail]
+status() {
+    local label="$1" state="$2" detail="${3:-}"
+    local color tag
+    case "$state" in
+        PASS)    color='\033[32m'; tag="PASS   " ;;
+        FAIL)    color='\033[31m'; tag="FAIL   " ;;
+        SKIP)    color='\033[33m'; tag="SKIP   " ;;
+        MANUAL)  color='\033[36m'; tag="MANUAL " ;;
+        *)       color='\033[0m';  tag="$state " ;;
+    esac
+    printf "${color}\033[1m[%s]\033[0m %s\n" "$tag" "$label"
+    RESULTS+=("$state|$label${detail:+ -- $detail}")
+}
+
+# result_summary: prints the colored table and appends the markdown
+# checklist version to $SUMMARY. Called at the end of every validate-*.sh
+# script in this directory, right before its final "Done" banner.
+result_summary() {
+    say "Result summary"
+    local r state label color
+    for r in "${RESULTS[@]}"; do
+        state="${r%%|*}"
+        label="${r#*|}"
+        case "$state" in
+            PASS)   color='\033[32m' ;;
+            FAIL)   color='\033[31m' ;;
+            SKIP)   color='\033[33m' ;;
+            MANUAL) color='\033[36m' ;;
+            *)      color='\033[0m'  ;;
+        esac
+        printf "${color}\033[1m%-8s\033[0m %s\n" "$state" "$label"
+    done
+    {
+        printf '\n## Result summary\n'
+        for r in "${RESULTS[@]}"; do
+            state="${r%%|*}"
+            label="${r#*|}"
+            printf '- **%s** -- %s\n' "$state" "$label"
+        done
+    } >> "$SUMMARY"
+}
+
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
         cat "$SUMMARY"
@@ -71,6 +116,7 @@ record "- Detected package-manager family: $FAMILY"
 if [[ "$FAMILY" != "dnf" ]]; then
     fail "This host is not dnf-family ($FAMILY). Phase 1's apt-side real-hardware pass is already recorded (see tmp/wip/phase-1-tasks.md); this script's purpose is specifically the dnf side (AlmaLinux/Fedora). Re-run this on an AlmaLinux or Fedora host."
     record "- **ABORTED**: not a dnf-family host."
+    status "Step 1: host suitability" FAIL "not dnf-family ($FAMILY)"
     exit 1
 fi
 
@@ -87,11 +133,21 @@ if grep -qE 'vmx|svm' /proc/cpuinfo; then
 else
     record "- CPU virtualization flag: **absent**"
 fi
+status "Step 1: host suitability" PASS "dnf-family, kvm=$KVM_PRESENT"
 
 # --- Step 2: build ------------------------------------------------------
 say "Step 2: build habitat"
+set +e
 ( cd "$REPO_ROOT" && cargo build --release -p habitat-cli ) 2>&1 | tee "$LOG_DIR/build.log" | tail -5
+BUILD_EXIT=${PIPESTATUS[0]}
+set -e
 record "- Build: see $LOG_DIR/build.log"
+if [[ "$BUILD_EXIT" -eq 0 ]]; then
+    status "Step 2: build habitat" PASS
+else
+    status "Step 2: build habitat" FAIL "cargo build exited $BUILD_EXIT"
+    exit 1
+fi
 
 # --- Step 3: capture the starting (likely broken) state -----------------
 say "Step 3: starting state (before any install)"
@@ -100,15 +156,18 @@ set +e
 RUN_BEFORE_EXIT=$?
 set -e
 record "- \`habitat run\` before install: exit=$RUN_BEFORE_EXIT (log: $LOG_DIR/01-run-before.log)"
+status "Step 3: starting state" PASS "recorded exit=$RUN_BEFORE_EXIT"
 
 # --- Step 4: KVM-absence detection, or note it's already covered --------
 say "Step 4: KVM-absence detection"
 if [[ "$KVM_PRESENT" -eq 0 ]]; then
     if grep -q "Hardware virtualization" "$LOG_DIR/01-run-before.log" && grep -qi "not available" "$LOG_DIR/01-run-before.log"; then
         record "- CONFIRMED: real KVM absence correctly reported (not a false positive)."
+        status "Step 4: KVM-absence detection" PASS "absence correctly reported"
     else
         fail "KVM is absent but the checklist above didn't report it as failed -- investigate before going further."
         record "- **FAILED**: KVM absent but not reported as failed. See $LOG_DIR/01-run-before.log."
+        status "Step 4: KVM-absence detection" FAIL "absence not reported -- see $LOG_DIR/01-run-before.log"
         exit 1
     fi
 else
@@ -119,6 +178,7 @@ else
     record '    sudo chmod 000 /dev/kvm   # or: remove yourself from the kvm group and log out/in'
     record "    $BIN run -- true          # confirm it now reports absence"
     record '    sudo chmod 666 /dev/kvm   # restore (default on Fedora/AlmaLinux -- confirm with '"'"'stat /dev/kvm'"'"' if unsure)'
+    status "Step 4: KVM-absence detection" MANUAL "/dev/kvm present -- see printed instructions"
 fi
 
 # --- Step 5: real dnf auto-install (the actual gap this script closes) --
@@ -133,8 +193,10 @@ cat "$LOG_DIR/02-install.log"
 record "- \`habitat install\` (auto-confirmed): exit=$INSTALL_EXIT (log: $LOG_DIR/02-install.log)"
 if [[ "$INSTALL_EXIT" -eq 0 ]]; then
     record "- CONFIRMED: real dnf install of podman + crun-krun succeeded end-to-end."
+    status "Step 5: real dnf auto-install" PASS
 else
     record "- Install did not fully succeed -- see log. If this host lacks /dev/kvm, that alone will keep this at non-zero even after packages install correctly; check the log for which specific check is still failing."
+    status "Step 5: real dnf auto-install" FAIL "exit=$INSTALL_EXIT -- see $LOG_DIR/02-install.log"
 fi
 
 # --- Step 6: real success-path confirmation (only meaningful with KVM) --
@@ -147,11 +209,14 @@ if [[ "$KVM_PRESENT" -eq 1 ]]; then
     record "- \`habitat run\` after install: exit=$RUN_AFTER_EXIT (log: $LOG_DIR/03-run-after.log)"
     if grep -q "Everything looks good" "$LOG_DIR/03-run-after.log"; then
         record "- CONFIRMED: full success path (all four checks pass) reached on real hardware."
+        status "Step 6: success-path confirmation" PASS
     else
         record "- NOT YET CONFIRMED: preflight still reports a failure after install -- see log."
+        status "Step 6: success-path confirmation" FAIL "preflight still failing -- see $LOG_DIR/03-run-after.log"
     fi
 else
     record "- Skipped: this host has no /dev/kvm, so the full success path can't be reached here regardless of package installs."
+    status "Step 6: success-path confirmation" SKIP "no /dev/kvm on this host"
 fi
 
 # --- Step 7: broken-runtime negative case (manual, destructive) --------
@@ -163,6 +228,7 @@ record "sudo dnf remove -y crun-krun"
 record "$BIN run -- true   # confirm: fails closed, non-zero exit, preflight-failure/krun-runtime tagged"
 record "sudo dnf install -y crun-krun   # restore"
 record '```'
+status "Step 7: broken-runtime negative case" MANUAL "not automated -- see printed instructions"
 
 # --- Step 8: audit log ---------------------------------------------------
 say "Step 8: audit log"
@@ -170,9 +236,13 @@ if [[ -f "$AUDIT_LOG" ]]; then
     cp "$AUDIT_LOG" "$LOG_DIR/audit.log.snapshot"
     record "- Audit log snapshot saved to $LOG_DIR/audit.log.snapshot"
     record "- Distinct tags seen: $(grep -o '"kind":"[a-z-]*"' "$AUDIT_LOG" | sort -u | tr '\n' ' ')"
+    status "Step 8: audit log" PASS "snapshot saved"
 else
     record "- No audit log found at $AUDIT_LOG"
+    status "Step 8: audit log" SKIP "no audit log at $AUDIT_LOG"
 fi
+
+result_summary
 
 say "Done"
 note "Summary written to $SUMMARY -- fold the relevant lines into tmp/wip/phase-1-tasks.md's real-hardware checkbox."

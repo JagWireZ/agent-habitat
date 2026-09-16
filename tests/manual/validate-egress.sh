@@ -104,6 +104,51 @@ SUMMARY="$LOG_DIR/summary.md"
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 
+declare -a RESULTS=()
+
+# status <label> <PASS|FAIL|SKIP|MANUAL> [detail]
+status() {
+    local label="$1" state="$2" detail="${3:-}"
+    local color tag
+    case "$state" in
+        PASS)    color='\033[32m'; tag="PASS   " ;;
+        FAIL)    color='\033[31m'; tag="FAIL   " ;;
+        SKIP)    color='\033[33m'; tag="SKIP   " ;;
+        MANUAL)  color='\033[36m'; tag="MANUAL " ;;
+        *)       color='\033[0m';  tag="$state " ;;
+    esac
+    printf "${color}\033[1m[%s]\033[0m %s\n" "$tag" "$label"
+    RESULTS+=("$state|$label${detail:+ -- $detail}")
+}
+
+# result_summary: prints the colored table and appends the markdown
+# checklist version to $SUMMARY. Called at the end of every validate-*.sh
+# script in this directory, right before its final "Done" banner.
+result_summary() {
+    say "Result summary"
+    local r state label color
+    for r in "${RESULTS[@]}"; do
+        state="${r%%|*}"
+        label="${r#*|}"
+        case "$state" in
+            PASS)   color='\033[32m' ;;
+            FAIL)   color='\033[31m' ;;
+            SKIP)   color='\033[33m' ;;
+            MANUAL) color='\033[36m' ;;
+            *)      color='\033[0m'  ;;
+        esac
+        printf "${color}\033[1m%-8s\033[0m %s\n" "$state" "$label"
+    done
+    {
+        printf '\n## Result summary\n'
+        for r in "${RESULTS[@]}"; do
+            state="${r%%|*}"
+            label="${r#*|}"
+            printf '- **%s** -- %s\n' "$state" "$label"
+        done
+    } >> "$SUMMARY"
+}
+
 # Belt-and-braces: if any step below exits early (a failed launch, a
 # failed nft apply, Ctrl-C), the harness started in Step 2 must not be
 # left running past this script -- it's a throwaway validation process,
@@ -139,12 +184,14 @@ say "Step 1: host suitability"
 if [[ ! -e /dev/kvm ]]; then
     fail "This host has no /dev/kvm -- run tests/manual/validate-real-hardware.sh first."
     record "- **ABORTED**: no /dev/kvm on this host."
+    status "Step 1: host suitability" FAIL "no /dev/kvm on this host"
     exit 1
 fi
 for bin in podman krun passt nft ssh ssh-keygen; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         fail "$bin not found on PATH."
         record "- **ABORTED**: $bin not installed."
+        status "Step 1: host suitability" FAIL "$bin not installed"
         exit 1
     fi
 done
@@ -160,10 +207,12 @@ if ! podman image exists "$GUEST_IMAGE"; then
     else
         fail "$GUEST_IMAGE (from \$HABITAT_GUEST_IMAGE) not found locally, and it isn't the default this script knows how to build. Build or pull it yourself first."
         record "- **ABORTED**: $GUEST_IMAGE not present and not buildable by this script."
+        status "Step 1: host suitability" FAIL "$GUEST_IMAGE not present and not buildable"
         exit 1
     fi
 fi
 record "- guest image present: $GUEST_IMAGE"
+status "Step 1: host suitability" PASS
 
 # --- Step 2: start the local proxy and DNS forwarder on the host --------
 say "Step 2: start the local egress proxy and DNS forwarder"
@@ -238,12 +287,14 @@ if [[ -z "$HARNESS_READY" ]]; then
         record "  (\`sudo setcap cap_net_bind_service=+ep $HARNESS_BIN\`), or lower"
         record "  \`net.ipv4.ip_unprivileged_port_start\` on this host, then re-run."
     fi
+    status "Step 2: start proxy/DNS harness" FAIL "did not report READY -- see $HARNESS_LOG"
     exit 1
 fi
 record "\`$(grep '^READY' "$HARNESS_LOG")\`"
 record ""
 record "- [x] Proxy started, listening on $PROXY_ADDR"
 record "- [x] DNS forwarder started, listening on $DNS_ADDR"
+status "Step 2: start proxy/DNS harness" PASS
 
 # --- Step 3: build a session disk and launch with the pasta network ------
 say "Step 3: build a disposable session disk and launch"
@@ -289,10 +340,12 @@ if [[ "$LAUNCH_EXIT" -ne 0 ]]; then
     record "- **FAILED**: session did not launch with \`--network $PASTA_NETWORK_MODE\` -- if the"
     record "  log shows pasta/crun-krun rejected the flag, network_setup.rs's NETWORK_MODE"
     record "  constant needs correcting, then re-run this script."
+    status "Step 3: build disk and launch" FAIL "exit=$LAUNCH_EXIT -- see $LOG_DIR/launch.log"
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
 record "- CONFIRMED: session launched with a pasta-backed network."
+status "Step 3: build disk and launch" PASS
 
 PORT_OUTPUT="$(podman port "$SESSION_NAME" 22/tcp 2>&1 || true)"
 GUEST_SSH_PORT="${PORT_OUTPUT##*:}"
@@ -364,6 +417,9 @@ fi
 if [[ -n "$DNS_OK" ]]; then
     record "  -- forwarder reachable and resolv.conf correctly pinned; Step 5's default-resolver"
     record "  lookups should work."
+    status "Step 3b: DNS-pinning diagnostics" PASS
+else
+    status "Step 3b: DNS-pinning diagnostics" FAIL "see diagnostics above"
 fi
 
 # --- Step 4: apply the reachability-restricting firewall ruleset --------
@@ -389,6 +445,7 @@ record "redirects a guest's ordinary outbound :443 connections there (no DNAT ru
 record "in-guest proxy configuration) -- if that's still true when you read this, a"
 record "genuinely allowed destination will fail closed once Step 4 is applied, which is a"
 record "real gap in network_setup.rs to fix, not a mistake in this script."
+status "Step 4: apply restricting firewall ruleset" MANUAL "not automated -- see printed instructions"
 
 # --- Step 5: connection trace (the actual exit gate) ---------------------
 say "Step 5: connection trace from inside the guest"
@@ -430,6 +487,11 @@ record "- [ ] Allowlist-lookalike hostname was blocked"
 record "- [ ] Direct-IP bypass was blocked"
 record "- [ ] Direct-to-8.8.8.8 DNS bypass was blocked (confirms DNS pinning actually holds,"
 record "      not just that the SNI proxy would have denied whatever it resolved to)"
+status "Step 5: allowlisted destination succeeds" MANUAL "recorded: $ALLOWED_RESULT"
+status "Step 5: non-allowlisted destination blocked" MANUAL "recorded: $DENIED_RESULT"
+status "Step 5: allowlist-lookalike blocked" MANUAL "recorded: $LOOKALIKE_RESULT"
+status "Step 5: direct-IP bypass blocked" MANUAL "recorded: $IP_BYPASS_RESULT"
+status "Step 5: DNS bypass (8.8.8.8) blocked" MANUAL "recorded: $DNS_BYPASS_RESULT"
 
 # --- Step 6: teardown ------------------------------------------------------
 say "Step 6: teardown"
@@ -449,6 +511,10 @@ record "see that step's own note), also remove its nftables table:"
 record "\`nft delete table inet habitat_egress\`."
 record ""
 record "- [ ] nftables ruleset removed (only applicable if Step 4 was applied)"
+status "Step 6: teardown" PASS
+status "Step 6: nftables ruleset removed" MANUAL "only applicable if Step 4 was applied"
+
+result_summary
 
 say "Done"
 echo "Summary written to $SUMMARY -- fold the connection-trace results from Step 5 into it by hand."

@@ -76,6 +76,51 @@ SUMMARY="$LOG_DIR/summary.md"
 say()  { printf '\n\033[1m== %s ==\033[0m\n' "$1"; }
 fail() { printf '\033[31m%s\033[0m\n' "$1" >&2; }
 
+declare -a RESULTS=()
+
+# status <label> <PASS|FAIL|SKIP|MANUAL> [detail]
+status() {
+    local label="$1" state="$2" detail="${3:-}"
+    local color tag
+    case "$state" in
+        PASS)    color='\033[32m'; tag="PASS   " ;;
+        FAIL)    color='\033[31m'; tag="FAIL   " ;;
+        SKIP)    color='\033[33m'; tag="SKIP   " ;;
+        MANUAL)  color='\033[36m'; tag="MANUAL " ;;
+        *)       color='\033[0m';  tag="$state " ;;
+    esac
+    printf "${color}\033[1m[%s]\033[0m %s\n" "$tag" "$label"
+    RESULTS+=("$state|$label${detail:+ -- $detail}")
+}
+
+# result_summary: prints the colored table and appends the markdown
+# checklist version to $SUMMARY. Called at the end of every validate-*.sh
+# script in this directory, right before its final "Done" banner.
+result_summary() {
+    say "Result summary"
+    local r state label color
+    for r in "${RESULTS[@]}"; do
+        state="${r%%|*}"
+        label="${r#*|}"
+        case "$state" in
+            PASS)   color='\033[32m' ;;
+            FAIL)   color='\033[31m' ;;
+            SKIP)   color='\033[33m' ;;
+            MANUAL) color='\033[36m' ;;
+            *)      color='\033[0m'  ;;
+        esac
+        printf "${color}\033[1m%-8s\033[0m %s\n" "$state" "$label"
+    done
+    {
+        printf '\n## Result summary\n'
+        for r in "${RESULTS[@]}"; do
+            state="${r%%|*}"
+            label="${r#*|}"
+            printf '- **%s** -- %s\n' "$state" "$label"
+        done
+    } >> "$SUMMARY"
+}
+
 if [[ "${1:-}" == "--report-only" ]]; then
     if [[ -f "$SUMMARY" ]]; then
         cat "$SUMMARY"
@@ -99,12 +144,14 @@ say "Step 1: host suitability"
 if [[ ! -e /dev/kvm ]]; then
     fail "This host has no /dev/kvm -- this runbook needs real hardware virtualization. Run tests/manual/validate-real-hardware.sh first."
     record "- **ABORTED**: no /dev/kvm on this host."
+    status "Step 1: host suitability" FAIL "no /dev/kvm on this host"
     exit 1
 fi
 for bin in podman krun ssh ssh-keygen; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         fail "$bin not found on PATH."
         record "- **ABORTED**: $bin not installed."
+        status "Step 1: host suitability" FAIL "$bin not installed"
         exit 1
     fi
 done
@@ -112,6 +159,7 @@ record "- /dev/kvm: present"
 record "- podman: $(podman --version)"
 record "- krun: $(krun --version 2>&1 || echo 'present (no --version output)')"
 record "- ssh: $(ssh -V 2>&1)"
+status "Step 1: host suitability" PASS
 
 # --- Step 1b: ensure the guest image actually exists locally -----------
 say "Step 1b: guest image"
@@ -122,10 +170,12 @@ if ! podman image exists "$GUEST_IMAGE"; then
     else
         fail "$GUEST_IMAGE (from \$HABITAT_GUEST_IMAGE) not found locally, and it isn't the default this script knows how to build. Build or pull it yourself first."
         record "- **ABORTED**: $GUEST_IMAGE not present and not buildable by this script."
+        status "Step 1b: guest image" FAIL "$GUEST_IMAGE not present and not buildable"
         exit 1
     fi
 fi
 record "- guest image present: $GUEST_IMAGE"
+status "Step 1b: guest image" PASS
 
 # --- Step 1c: generate this session's ephemeral SSH keypair -------------
 say "Step 1c: session SSH keypair (guest exec channel)"
@@ -133,12 +183,14 @@ rm -f "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
 ssh-keygen -t ed25519 -N '' -f "$SSH_KEY_PATH" -C habitat-session -q
 AUTHORIZED_KEY="$(cat "$SSH_KEY_PATH.pub")"
 record "- Generated a fresh ed25519 keypair at $SSH_KEY_PATH (never reused, deleted at teardown)."
+status "Step 1c: session SSH keypair" PASS
 
 # --- Step 2: build a session disk image to launch against ---------------
 say "Step 2: build a disposable session disk"
 dd if=/dev/zero of="$WORKSPACE_DISK" bs=1M count=64 status=none
 mkfs.ext4 -q -F "$WORKSPACE_DISK"
 record "- Built a 64MB throwaway workspace disk at $WORKSPACE_DISK"
+status "Step 2: build session disk" PASS
 
 PODMAN_ARGS=(
     run --detach --rm --name "$SESSION_NAME"
@@ -185,10 +237,12 @@ cat "$LOG_DIR/launch.log"
 record "- Launch exit: $LAUNCH_EXIT (log: $LOG_DIR/launch.log)"
 if [[ "$LAUNCH_EXIT" -ne 0 ]]; then
     record "- **FAILED**: session did not launch -- if the log shows the annotation was rejected or ignored, launcher.rs's WORKSPACE_DISK_ANNOTATION constant needs correcting to whatever crun-krun actually expects, then re-run this script."
+    status "Step 3: launch the session" FAIL "exit=$LAUNCH_EXIT -- see $LOG_DIR/launch.log"
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
 record "- CONFIRMED: session launched."
+status "Step 3: launch the session" PASS
 
 # --- Step 3b: resolve the guest's published SSH port ---------------------
 say "Step 3b: resolve the guest's published SSH port"
@@ -199,11 +253,13 @@ if ! [[ "$GUEST_SSH_PORT" =~ ^[0-9]+$ ]]; then
     record "- **FAILED**: could not parse a port number from \`podman port\`'s output above."
     record "  Find the actual shape of that output and fix this script's parsing (and"
     record "  \`habitat_vm::launcher::guest_ssh_port\`'s parsing) to match, then re-run."
+    status "Step 3b: resolve guest SSH port" FAIL "could not parse port from: $PORT_OUTPUT"
     podman rm --force --ignore "$SESSION_NAME" >/dev/null 2>&1 || true
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
 record "- Resolved guest SSH port: $GUEST_SSH_PORT"
+status "Step 3b: resolve guest SSH port" PASS "port=$GUEST_SSH_PORT"
 
 # Every SSH/SCP call to the guest in this script uses these options --
 # matches `habitat_workspace::guest_exec::ssh_option_args` exactly, so
@@ -225,11 +281,13 @@ if [[ "$SSH_READY" -ne 1 ]]; then
     record '```'
     record "$(podman logs "$SESSION_NAME" 2>&1 || echo '(podman logs failed)')"
     record '```'
+    status "Step 3c: wait for SSH" FAIL "no SSH within 30s"
     podman rm --force --ignore "$SESSION_NAME" >/dev/null 2>&1 || true
     rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
     exit 1
 fi
 record "- CONFIRMED: SSH exec channel reachable at habitat@$GUEST_SSH_HOST:$GUEST_SSH_PORT."
+status "Step 3c: wait for SSH" PASS
 
 # --- Step 4: escape attempts (the actual exit gate) ---------------------
 # Run for real, from this script, against the still-live session -- not
@@ -255,8 +313,10 @@ record "  \`ssh habitat@$GUEST_SSH_HOST cat '$HOST_MARKER'\` from the host into 
 record "  Guest saw: \`$GUEST_FILE_OUTPUT\`"
 if [[ "$GUEST_FILE_OUTPUT" == *"$HOST_TOKEN"* ]]; then
     record "  **FAILED**: the guest read the host's own file -- a shared filesystem path exists."
+    status "Step 4: host files unreachable" FAIL "guest read the host's token"
 else
     record "  CONFIRMED BLOCKED: the guest could not read the host's file."
+    status "Step 4: host files unreachable" PASS
 fi
 rm -f "$HOST_MARKER"
 
@@ -272,8 +332,10 @@ record "$GUEST_PS_OUTPUT"
 record '```'
 if echo "$GUEST_PS_OUTPUT" | grep -qw "$HOST_PID"; then
     record "  **FAILED**: the host's PID $HOST_PID is visible inside the guest's process table."
+    status "Step 4: host processes unreachable" FAIL "host PID $HOST_PID visible in guest"
 else
     record "  CONFIRMED BLOCKED: the host's PID is not visible inside the guest."
+    status "Step 4: host processes unreachable" PASS
 fi
 
 # 3. Host network namespace: capture the host's real routing table and
@@ -298,6 +360,7 @@ record ""
 record "- [ ] Host files unreachable (see automated result above)"
 record "- [ ] Host processes unreachable (see automated result above)"
 record "- [ ] Host network namespace shows no host routes (compare the two tables above)"
+status "Step 4: host network namespace" MANUAL "compare the two route tables above by eye"
 
 # --- Step 5: teardown -----------------------------------------------------
 say "Step 5: teardown"
@@ -309,17 +372,23 @@ rm -f "$WORKSPACE_DISK" "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub"
 record "- Teardown exit: $TEARDOWN_EXIT (log: $LOG_DIR/teardown.log)"
 if podman ps -a --format '{{.Names}}' | grep -qx "$SESSION_NAME"; then
     record "- **FAILED**: container still listed in \`podman ps -a\` after teardown."
+    status "Step 5: teardown" FAIL "container still listed after teardown"
     exit 1
 fi
 if [[ -e "$WORKSPACE_DISK" ]]; then
     record "- **FAILED**: workspace disk still present after teardown."
+    status "Step 5: teardown" FAIL "workspace disk still present after teardown"
     exit 1
 fi
 if [[ -e "$SSH_KEY_PATH" || -e "$SSH_KEY_PATH.pub" ]]; then
     record "- **FAILED**: session SSH key still present after teardown."
+    status "Step 5: teardown" FAIL "session SSH key still present after teardown"
     exit 1
 fi
 record "- CONFIRMED: no residual container, disk image, or SSH key after teardown."
+status "Step 5: teardown" PASS
+
+result_summary
 
 say "Done"
 echo "Summary written to $SUMMARY -- Step 4's file/process checks ran automatically and are"
