@@ -120,4 +120,11 @@ chown -R habitat:habitat "$SSH_DIR"
 # start at all ("Missing privilege separation directory").
 mkdir -p /run/sshd
 
-exec /usr/sbin/sshd -D -e
+# Port 2222, not the standard 22 -- confirmed on real Fedora 44 hardware
+# (2026-09-16, tmp/wip/vm-launch-validation): krun.use_passt=1's internal
+# passt forwarding cannot forward privileged ports (<1024) into the
+# guest at all (TCP handshake completes, connection resets as soon as
+# data flows -- upstream: https://github.com/containers/crun/issues/2251).
+# This exec channel is loopback-only (habitat_vm::launcher::GUEST_SSH_HOST),
+# so there's no reason to keep it on the privileged port.
+exec /usr/sbin/sshd -D -e -p 2222

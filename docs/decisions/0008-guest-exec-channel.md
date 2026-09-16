@@ -63,8 +63,13 @@ the container engine/runtime choice itself.
   Section 2 invariant 5, which is about credentials and API keys;
   an SSH public key is precisely the half of an asymmetric keypair meant
   to be exposed.
-- The guest's `sshd` port is published to an ephemeral host port on
-  `127.0.0.1` (`--publish 127.0.0.1::22/tcp`), resolved after launch via
+- The guest's `sshd` listens on `2222`, not the standard `22` -- a
+  privileged port (<1024) resets under `krun.use_passt=1`'s internal
+  `passt` forwarding (upstream: containers/crun#2251; confirmed on real
+  Fedora 44 hardware, 2026-09-16), and this loopback-only exec channel
+  has no reason to keep the privileged port. That port is published to
+  an ephemeral host port on `127.0.0.1` (`--publish 127.0.0.1::2222/tcp`),
+  resolved after launch via
   `podman port` (`habitat_vm::launcher::guest_ssh_port`) -- **not** by
   addressing the guest at a distinct IP (see "Correction" below for why).
   `crates/workspace::guest_exec::GuestExecRunner` shells out to the real
@@ -139,7 +144,7 @@ in the first place.
 
 The corrected mechanism (now reflected in the Decision section above):
 the guest's `sshd` port is explicitly published (`--publish
-127.0.0.1::22/tcp`) and the resulting ephemeral host port resolved via
+127.0.0.1::2222/tcp`) and the resulting ephemeral host port resolved via
 `podman port` -- the same reachability mechanism any other Podman
 networking mode uses for host<->container communication, rather than an
 assumption specific to `pasta`. This is a real, second instance of the

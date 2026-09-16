@@ -75,32 +75,33 @@ pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str
         (CheckId::Podman, PackageFamily::Apt) => Some("podman"),
         (CheckId::KrunRuntime, PackageFamily::Dnf) => Some("crun-krun"),
         (CheckId::KrunRuntime, PackageFamily::Apt) => None,
-        // `crun-krun` again, by the same name -- the primary attempt for
-        // the version check. On a genuine Fedora host this is enough by
-        // itself (Fedora's own repos already carry a new-enough build);
-        // `installer.rs` falls back to CRUN_FALLBACK_URL/
-        // CRUN_KRUN_FALLBACK_URL when the check still fails afterward,
-        // which is what actually happens on AlmaLinux 10 today -- its
-        // AppStream `crun-krun-1.27-2.el10_2` is already the newest
-        // version that repo carries, so re-running `dnf install crun-krun`
-        // against an already-installed package is a same-version no-op,
-        // not a fix (see `installer.rs::attempt_one`'s re-verification
-        // step, which exists specifically because this case can't be told
-        // apart from a real fix by the install command's exit code alone).
+        // `crun-krun` under its plain repo name -- kept here for
+        // `KrunRuntime`'s own use (installing *some* `crun-krun` so `krun`
+        // resolves on PATH at all) and for display/testing purposes, but
+        // `installer::attempt_one` no longer calls this for
+        // `CheckId::CrunVersion` on the Dnf family: every Dnf-family host
+        // now always installs the pinned `CRUN_FALLBACK_URL`/
+        // `CRUN_KRUN_FALLBACK_URL` pair directly instead, never `dnf
+        // install crun-krun` -- confirmed on real Fedora 44 hardware that
+        // a repo build passing `checks::crun_version`'s version-number
+        // gate can still ship a real `krun.use_passt` networking bug the
+        // pinned build doesn't have (see `attempt_one`'s doc comment).
         (CheckId::CrunVersion, PackageFamily::Dnf) => Some("crun-krun"),
         (CheckId::CrunVersion, PackageFamily::Apt) => None,
-        // `libkrunfw` under its own upstream package name -- the primary
-        // attempt. On a genuine Fedora host this check never even gets
-        // this far: installing `crun-krun` there already pulls in a
-        // matching `libkrunfw` automatically, so `checks::libkrunfw`
-        // already passes and `installer::install_missing` never attempts
-        // anything for this check at all. This mapping exists for hosts
-        // where a `libkrunfw` package genuinely is resolvable by name but
-        // just hadn't been installed yet -- `installer.rs` falls back to
-        // `LIBKRUNFW_FALLBACK_URL` if this attempt itself fails, which is
-        // what actually happens on AlmaLinux 10 today (no `libkrunfw`
-        // package under any name in EPEL -- confirmed real-hardware,
-        // `tmp/wip/vm-launch-validation`).
+        // `passt` under its own upstream/distro package name -- no known
+        // version-specific bug behind it (unlike `crun-krun` above), so
+        // this is the plain, only install path: no pinned-build fallback.
+        // Not yet confirmed packaged for Debian/Ubuntu-family hosts
+        // (this crate's whole `install`/`preflight` chain is v1-scoped to
+        // AlmaLinux/Fedora/RHEL-family regardless, `docs/decisions/
+        // 0001-host-os-layer.md`'s 2026-09-14 amendment).
+        (CheckId::Passt, PackageFamily::Dnf) => Some("passt"),
+        (CheckId::Passt, PackageFamily::Apt) => None,
+        // `libkrunfw` under its own upstream package name -- kept here for
+        // display/testing purposes, but `installer::attempt_one` no longer
+        // calls this for the Dnf family: every Dnf-family host now always
+        // installs `LIBKRUNFW_FALLBACK_URL` directly instead of `dnf
+        // install libkrunfw`, for the same reason as `CrunVersion` above.
         (CheckId::Libkrunfw, PackageFamily::Dnf) => Some("libkrunfw"),
         (CheckId::Libkrunfw, PackageFamily::Apt) => None,
         (CheckId::HostOs, _) | (CheckId::Kvm, _) => None,
@@ -116,12 +117,14 @@ pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str
     }
 }
 
-/// A pinned, real-hardware-confirmed fallback source for `libkrunfw` on
-/// the Dnf family, used only when the primary `package_for` attempt
-/// (`dnf install libkrunfw`) itself fails -- which is exactly what
-/// happens on AlmaLinux 10 today, since EPEL carries no `libkrunfw`
-/// package under any name (confirmed: `dnf install libkrunfw` there
-/// returns "No match for argument", not a version conflict).
+/// A pinned, real-hardware-confirmed source for `libkrunfw`, installed
+/// unconditionally on every Dnf-family host (`installer::attempt_one`) --
+/// not only AlmaLinux/RHEL-family, where EPEL carries no `libkrunfw`
+/// package under any name at all (confirmed: `dnf install libkrunfw`
+/// there returns "No match for argument"). Also used on Fedora, whose own
+/// repo build otherwise resolves fine but isn't trusted for this
+/// specifically enough (see `CRUN_FALLBACK_URL`'s doc comment for why
+/// "resolves fine" isn't the same guarantee as "works correctly").
 ///
 /// This is a direct Koji (Fedora's own build system) URL for a Fedora 43
 /// x86_64 build of upstream `libkrunfw` v5.5.0, `dnf install`-able
@@ -148,25 +151,35 @@ pub fn package_for(check: CheckId, family: PackageFamily) -> Option<&'static str
 pub const LIBKRUNFW_FALLBACK_URL: &str =
     "https://kojipkgs.fedoraproject.org/packages/libkrunfw/5.5.0/1.fc43/x86_64/libkrunfw-5.5.0-1.fc43.x86_64.rpm";
 
-/// Pinned Koji URLs for `crun` + `crun-krun` together -- the fallback
-/// when the installed `crun-krun` is too old to support the
-/// `krun.use_passt` OCI annotation (`checks::crun_version`,
-/// `checks::MIN_CRUN_VERSION_FOR_PASST`). Both packages must be installed
-/// in the same `dnf install` invocation: `crun-krun` needs the exact
-/// matching `crun` version, and installing them separately risks leaving
-/// a mismatched pair (`installer::run_package_command` always passes both
+/// Pinned Koji URLs for `crun` + `crun-krun` together, installed
+/// unconditionally on every Dnf-family host (`installer::attempt_one`),
+/// never `dnf install crun-krun`. Both packages must be installed in the
+/// same `dnf install` invocation: `crun-krun` needs the exact matching
+/// `crun` version, and installing them separately risks leaving a
+/// mismatched pair (`installer::run_package_command` always passes both
 /// together, never one at a time).
 ///
-/// Same real-hardware-confirmed status and caveats as
-/// [`LIBKRUNFW_FALLBACK_URL`]: a Fedora 43 binary running on a
-/// RHEL-family host, not an officially supported combination, but the
-/// only practical unblock while AlmaLinux's own AppStream package stays
-/// at `crun-krun-1.27-2.el10_2` (one patch release behind the 1.27.1
-/// cutoff). Confirmed end-to-end on real AlmaLinux 10.2 hardware
+/// Originally only a fallback for hosts whose repo `crun-krun` was too
+/// old for the `krun.use_passt` OCI annotation (`checks::crun_version`,
+/// `checks::MIN_CRUN_VERSION_FOR_PASST`) -- AlmaLinux 10's AppStream
+/// package (`crun-krun-1.27-2.el10_2`) is one patch release behind the
+/// 1.27.1 cutoff. Confirmed end-to-end on real AlmaLinux 10.2 hardware
 /// (`tmp/wip/egress-validation`): installs cleanly, `crun --version`
 /// reports 1.29.1 afterward, and a real `--annotation krun.use_passt=1`
 /// session actually gets `passt`-backed networking (no more
 /// `tsi_hijack`).
+///
+/// Now installed on every Dnf-family host regardless of the repo's own
+/// version, including genuine Fedora: confirmed on real Fedora 44
+/// hardware (2026-09-16, `tmp/wip/vm-launch-validation`) that Fedora's
+/// own repo `crun-krun` (1.28) passes the version-number gate and boots a
+/// real `passt`-backed guest, but every SSH connection into it reset
+/// mid-handshake -- a packet capture on the loopback forward showed the
+/// RST coming from `pasta`'s own splice, before the guest's sshd ever saw
+/// the connection. This pinned 1.29.1 build does not have that problem.
+/// "New enough per the version check" turned out not to mean "free of
+/// this bug," so the fallback is no longer conditional on the check
+/// failing -- see `installer::attempt_one`'s doc comment.
 ///
 /// **This will eventually go stale**, same as `LIBKRUNFW_FALLBACK_URL` --
 /// see that constant's doc comment for what to do when `habitat install`
@@ -175,6 +188,54 @@ pub const CRUN_FALLBACK_URL: &str =
     "https://kojipkgs.fedoraproject.org/packages/crun/1.29.1/1.fc43/x86_64/crun-1.29.1-1.fc43.x86_64.rpm";
 pub const CRUN_KRUN_FALLBACK_URL: &str =
     "https://kojipkgs.fedoraproject.org/packages/crun/1.29.1/1.fc43/x86_64/crun-krun-1.29.1-1.fc43.x86_64.rpm";
+
+/// The exact version [`CRUN_FALLBACK_URL`]/[`CRUN_KRUN_FALLBACK_URL`]
+/// install -- kept in sync with those URLs by
+/// `crun_fallback_urls_are_dnf_installable_https_urls_for_a_matching_pair`
+/// below. `installer::attempt_one` compares a host's
+/// [`rpm_package_version`] of `crun-krun` against this before running the
+/// pinned install, so a host that's already at this version or newer
+/// (a future Fedora repo build, or an operator's own manual install)
+/// never gets downgraded by it.
+pub const CRUN_PINNED_VERSION: (u32, u32, u32) = (1, 29, 1);
+
+/// The installed version of `package` per `rpm`'s own query database --
+/// `None` if it isn't installed at all, `rpm` itself isn't on PATH, or
+/// the version string doesn't parse. Dnf-family only: there's no `rpm`
+/// binary to ask on any other family, and callers must never invoke this
+/// off it.
+///
+/// This is the one authoritative "what's actually installed" answer for
+/// this family -- more direct than re-deriving it from a binary's own
+/// `--version` banner (`krun --version`, e.g.), which is one more hop
+/// removed from what the package manager itself has on record, and
+/// doesn't exist at all for a library like `libkrunfw` that has no
+/// executable of its own to ask (unused for it now, but kept general).
+/// `installer::attempt_one` uses this to decide whether its pinned
+/// `crun-krun` fallback build ([`CRUN_PINNED_VERSION`]) would actually
+/// be a downgrade, never installing over a host that's already at or
+/// past it.
+pub fn rpm_package_version<E: Environment>(env: &E, package: &str) -> Option<(u32, u32, u32)> {
+    let output = env
+        .run_command("rpm", &["-q", "--queryformat", "%{VERSION}\\n", package])
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_dotted_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses a bare `"X.Y.Z"` (or `"X.Y"`/`"X"`) version string's first line
+/// into `(major, minor, patch)`, treating any missing trailing component
+/// as `0` -- rpm's own `%{VERSION}` field is just the dotted number, with
+/// none of `crun --version`'s `"crun version "` prefix to strip first.
+fn parse_dotted_version(text: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = text.lines().next()?.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
 
 /// The command (program + args) that installs `packages` as root on
 /// `family`, all in one invocation -- `crun`+`crun-krun`'s fallback needs
@@ -279,6 +340,15 @@ mod tests {
     }
 
     #[test]
+    fn passt_has_a_dnf_package_name_but_no_confirmed_apt_package_yet() {
+        assert_eq!(
+            package_for(CheckId::Passt, PackageFamily::Dnf),
+            Some("passt")
+        );
+        assert_eq!(package_for(CheckId::Passt, PackageFamily::Apt), None);
+    }
+
+    #[test]
     fn crun_fallback_urls_are_dnf_installable_https_urls_for_a_matching_pair() {
         for url in [CRUN_FALLBACK_URL, CRUN_KRUN_FALLBACK_URL] {
             assert!(url.starts_with("https://"));
@@ -288,12 +358,17 @@ mod tests {
         // is exactly the failure mode this fallback exists to avoid.
         assert!(CRUN_FALLBACK_URL.contains("/1.29.1/"));
         assert!(CRUN_KRUN_FALLBACK_URL.contains("/1.29.1/"));
+        // Kept in sync with CRUN_PINNED_VERSION by hand -- both URLs and
+        // this tuple must describe the exact same release.
+        assert_eq!(CRUN_PINNED_VERSION, (1, 29, 1));
     }
 
     #[test]
     fn install_command_accepts_multiple_packages_in_one_invocation() {
-        let (program, args) =
-            install_command(PackageFamily::Dnf, &["crun-1.29.1.rpm", "crun-krun-1.29.1.rpm"]);
+        let (program, args) = install_command(
+            PackageFamily::Dnf,
+            &["crun-1.29.1.rpm", "crun-krun-1.29.1.rpm"],
+        );
         assert_eq!(program, "sudo");
         assert_eq!(
             args,
@@ -311,6 +386,30 @@ mod tests {
     fn libkrunfw_fallback_url_is_a_dnf_installable_https_url() {
         assert!(LIBKRUNFW_FALLBACK_URL.starts_with("https://"));
         assert!(LIBKRUNFW_FALLBACK_URL.ends_with(".rpm"));
+    }
+
+    #[test]
+    fn rpm_package_version_reports_the_parsed_version() {
+        let env = FakeEnvironment::linux()
+            .with_command_ok("rpm -q --queryformat %{VERSION}\\n crun-krun", "1.28\n");
+        assert_eq!(rpm_package_version(&env, "crun-krun"), Some((1, 28, 0)));
+    }
+
+    #[test]
+    fn rpm_package_version_is_none_when_the_package_is_not_installed() {
+        // `rpm -q` on a missing package exits non-zero rather than
+        // printing an empty version -- FakeEnvironment's default for an
+        // unconfigured command is exactly that "not found" shape.
+        let env = FakeEnvironment::linux();
+        assert_eq!(rpm_package_version(&env, "crun-krun"), None);
+    }
+
+    #[test]
+    fn parse_dotted_version_treats_missing_components_as_zero() {
+        assert_eq!(parse_dotted_version("5.5.0\n"), Some((5, 5, 0)));
+        assert_eq!(parse_dotted_version("1.28\n"), Some((1, 28, 0)));
+        assert_eq!(parse_dotted_version("2\n"), Some((2, 0, 0)));
+        assert_eq!(parse_dotted_version(""), None);
     }
 
     #[test]

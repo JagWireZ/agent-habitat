@@ -75,7 +75,7 @@ result_summary() {
         for r in "${RESULTS[@]}"; do
             state="${r%%|*}"
             label="${r#*|}"
-            printf '- **%s** -- %s\n' "$state" "$label"
+            printf -- '- **%s** -- %s\n' "$state" "$label"
         done
     } >> "$SUMMARY"
 }

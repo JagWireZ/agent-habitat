@@ -105,6 +105,7 @@ fn preflight_fails_closed_when_betterleaks_enabled_but_binary_missing() {
         .with_command_ok("podman --version", "podman version 5.0.0")
         .with_command_ok("podman info", "host: ...")
         .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+        .with_command_ok("passt --version", "passt 0.0~git\n")
         .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n");
     // Deliberately no `betterleaks` command configured on the fake.
 
@@ -146,6 +147,7 @@ fn install_run_twice_on_already_correct_host_makes_no_changes() {
         .with_command_ok("podman --version", "podman version 5.0.0")
         .with_command_ok("podman info", "host: ...")
         .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+        .with_command_ok("passt --version", "passt 0.0~git\n")
         .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n");
 
     let first_audit = MemoryAuditSink::default();

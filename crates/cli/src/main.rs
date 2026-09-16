@@ -22,11 +22,15 @@
 //! checklist first, then -- only if something's missing -- a separate
 //! "here's what to do" section listing one concrete fix per failed item,
 //! so the checklist itself stays scannable instead of interleaving status
-//! and remediation prose line by line.
-//! Internal component names (Podman, crun-krun, libkrun, ...) are reserved
-//! for `--verbose`/`-v` -- shown as a dimmed line under each fix -- and for
-//! the audit log, which always gets the full technical detail regardless
-//! of this flag.
+//! and remediation prose line by line. Each checklist line also carries
+//! its check's own short id (`CheckId::name()`, e.g. `crun-version`) next
+//! to the plain-English name -- the same id the audit log and
+//! `--verbose` detail use, so a line here can be matched straight to
+//! either without guessing.
+//! Everything beyond that id -- exact binaries, packages, error text --
+//! is reserved for `--verbose`/`-v` -- shown as a dimmed line under each
+//! fix -- and for the audit log, which always gets the full technical
+//! detail regardless of this flag.
 
 mod output;
 
@@ -80,7 +84,8 @@ fn friendly_name(check: CheckId) -> &'static str {
         CheckId::Kvm => "Hardware virtualization",
         CheckId::Podman => "Container runtime",
         CheckId::KrunRuntime => "Sandbox isolation layer",
-        CheckId::CrunVersion => "Sandbox networking",
+        CheckId::CrunVersion => "VM networking support",
+        CheckId::Passt => "Sandbox networking",
         CheckId::Libkrunfw => "Virtual machine kernel",
         CheckId::Betterleaks => "Content secrets scanner",
     }
@@ -95,6 +100,7 @@ fn friendly_status(check: CheckId) -> &'static str {
         CheckId::Podman => "Not found",
         CheckId::KrunRuntime => "Not found",
         CheckId::CrunVersion => "Too old",
+        CheckId::Passt => "Not found",
         CheckId::Libkrunfw => "Not found",
         CheckId::Betterleaks => "Not found",
     }
@@ -138,12 +144,16 @@ fn fix_for(check: CheckId) -> Fix {
             commands: &["sudo dnf install -y crun-krun   # AlmaLinux/Fedora/RHEL-family"],
         },
         CheckId::CrunVersion => Fix {
-            reason: "This host's crun/krun build is too old to support real sandboxed networking (the krun.use_passt annotation, added in crun 1.27.1) -- without it, a session silently falls back to a networking mode this project doesn't restrict at all. (`habitat install` can run this for you -- see the prompt above.) On Fedora, a plain update is enough; on AlmaLinux/RHEL-family hosts, `habitat install` falls back to a direct Fedora build automatically when the host's own repo package is too old. Not yet packaged for Debian/Ubuntu-family hosts.",
-            commands: &["sudo dnf install -y crun-krun   # Fedora hosts; AlmaLinux/RHEL-family falls back automatically"],
+            reason: "This host's crun/krun build needs to be this project's own pinned, confirmed-good release for real sandboxed networking to actually work -- without it, a session can silently fall back to a networking mode this project doesn't restrict at all, or (a real Fedora finding) accept the right settings but still reset every guest connection. (`habitat install` can run this for you -- see the prompt above.) On every AlmaLinux/Fedora/RHEL-family host, when this check fails, `habitat install` installs this project's own pinned crun/crun-krun build directly, never the distro's own repo package. Not yet packaged for Debian/Ubuntu-family hosts.",
+            commands: &["sudo dnf install -y crun-krun   # AlmaLinux/Fedora/RHEL-family; `habitat install` uses a pinned build instead of this"],
+        },
+        CheckId::Passt => Fix {
+            reason: "Installs passt, the actual program that gives each sandboxed session its own real virtual network interface -- a separate requirement from the crun/krun build check above, which only confirms crun-krun is new enough to hand off to passt, not that passt is actually installed. (`habitat install` can run this for you -- see the prompt above.) Not yet packaged for Debian/Ubuntu-family hosts.",
+            commands: &["sudo dnf install -y passt   # AlmaLinux/Fedora/RHEL-family"],
         },
         CheckId::Libkrunfw => Fix {
             reason: "Installs libkrunfw, the library bundling the actual guest kernel `krun` boots -- required for any session to launch even though `krun --version` alone doesn't check for it. (`habitat install` can run this for you -- see the prompt above.) On AlmaLinux/RHEL-family hosts, EPEL doesn't carry this package under any name; `habitat install` falls back to a direct Fedora build automatically when that happens. Not yet packaged for Debian/Ubuntu-family hosts.",
-            commands: &["sudo dnf install -y libkrunfw   # Fedora hosts; AlmaLinux/RHEL-family falls back automatically"],
+            commands: &["sudo dnf install -y libkrunfw   # AlmaLinux/Fedora/RHEL-family"],
         },
         CheckId::Betterleaks => Fix {
             reason: "Installs betterleaks, the content-based secrets scanner Agent Habitat runs against a project's files when that project's config has content scanning turned on (the default). (`habitat install` can run this for you -- see the prompt above.) Not yet packaged for Debian/Ubuntu-family hosts; on those, turn content scanning off in the project's config (secrets_scan.content: disabled) if that's a deliberate choice for this project.",
@@ -171,7 +181,10 @@ fn technical_detail(check: CheckId) -> &'static str {
             "Install the `crun-krun` package so `krun` (the OCI runtime binary Podman exec's, with libkrun linked directly into it -- note the package and binary are named differently) is resolvable on PATH -- there is no separate hypervisor binary to install alongside it."
         }
         CheckId::CrunVersion => {
-            "Confirm `krun --version`'s reported crun version is >= 1.27.1 (checks::MIN_CRUN_VERSION_FOR_PASST) -- the version that added the krun.use_passt OCI annotation. Without it, `--network pasta` is silently accepted but never actually honored: the guest boots under libkrun's default TSI networking instead (`tsi_hijack` on its kernel command line, PF_TSI*/PF_TSIU registered, no virtio-net device at all), with no error pointing at the real cause. AlmaLinux 10's AppStream `crun-krun-1.27-2.el10_2` is exactly one patch release behind this cutoff; `habitat install`'s auto-install step falls back to `package_manager::CRUN_FALLBACK_URL`/`CRUN_KRUN_FALLBACK_URL` (a pinned, matching Fedora Koji build pair) when re-checking after `dnf install crun-krun` still shows a too-old version."
+            "Confirm `krun --version`'s reported crun version is >= checks::MIN_CRUN_VERSION_FOR_PASST -- this project's own pinned, confirmed-good crun-krun release (1.29.1), not merely crun 1.27.1 (the version that added the krun.use_passt OCI annotation). An older build than 1.27.1 silently falls back to libkrun's default TSI networking regardless of `--network pasta` (`tsi_hijack` on the guest's kernel command line, PF_TSI*/PF_TSIU registered, no virtio-net device at all), with no error pointing at the real cause. Passing that older, looser cutoff isn't sufficient on its own, though: real Fedora 44 hardware (2026-09-16) with a repo `crun-krun` reporting 1.28 passed a >=1.27.1 check and got a real passt-backed guest, but every SSH connection into it reset mid-handshake (a loopback packet capture showed the RST coming from pasta's own splice, never reaching the guest's sshd) -- which is why the cutoff was raised to the exact pinned build. When this check fails, `habitat install`'s auto-install step installs `package_manager::CRUN_FALLBACK_URL`/`CRUN_KRUN_FALLBACK_URL` (that same pinned, matching Fedora Koji build pair) directly, on AlmaLinux and Fedora alike, skipping the plain `dnf install crun-krun` step since a failing check already means the repo package can't be new enough. This check is deliberately separate from `CheckId::Passt` below: it only tests crun-krun's *ability* to hand off to passt, never whether passt itself is installed."
+        }
+        CheckId::Passt => {
+            "Confirm `passt --version` runs successfully -- `passt` (and its `pasta` mode, the one crun-krun actually invokes per `docs/decisions/0004-networking-layer.md`) is the real userspace program that gives the guest its virtio-net device and translates its traffic; `checks::crun_version` passing says nothing about whether this package is actually present, only that crun-krun is new enough to use it if it is. Podman's own `--network pasta` driver only recommends this package on some distros rather than hard-requiring it, so a host can otherwise pass every check here and still fail to get a real network at session-launch time with no earlier warning. `habitat install`'s auto-install step installs the plain `passt` package on the Dnf family -- no pinned-build fallback, unlike crun-krun/libkrunfw, since there's no known version-specific bug behind it."
         }
         CheckId::Libkrunfw => {
             "Confirm `libkrunfw` resolves via `ldconfig -p` (not just that `krun --version` runs -- that path never dlopen's libkrunfw, so it passes even when this is missing entirely). Fedora's own `crun-krun`/`libkrun` packages pull in a matching `libkrunfw` automatically; EPEL's AlmaLinux/RHEL-family build of `libkrun` does not declare it as a dependency at all, and EPEL carries no `libkrunfw` package under any name regardless -- `habitat install`'s auto-install step falls back to `package_manager::LIBKRUNFW_FALLBACK_URL` (a pinned Fedora Koji build) on that family when the plain `dnf install libkrunfw` attempt fails."
@@ -198,13 +211,15 @@ fn print_checklist(statuses: &[CheckStatus]) {
     for status in statuses {
         match &status.result {
             Ok(()) => println!(
-                "  {} {:<26} Looks good",
+                "  {} {:<14} {:<26} Looks good",
                 s.green_bold("\u{2714}"),
+                status.check.name(),
                 friendly_name(status.check)
             ),
             Err(_) => println!(
-                "  {} {:<26} {}",
+                "  {} {:<14} {:<26} {}",
                 s.red_bold("\u{2718}"),
+                status.check.name(),
                 friendly_name(status.check),
                 friendly_status(status.check)
             ),
@@ -285,7 +300,7 @@ fn print_required_steps(statuses: &[CheckStatus], verbose: bool) {
 /// list them here alongside the other two. `CrunVersion` and `Libkrunfw`
 /// additionally have a same-family fallback (`installer::attempt_one`)
 /// for hosts where the plain package name doesn't resolve to a
-/// new-enough version at all -- see `package_manager::
+/// trusted-enough version at all -- see `package_manager::
 /// CRUN_FALLBACK_URL`/`CRUN_KRUN_FALLBACK_URL` and `LIBKRUNFW_FALLBACK_URL`.
 fn is_installable(check: CheckId) -> bool {
     matches!(
@@ -293,6 +308,7 @@ fn is_installable(check: CheckId) -> bool {
         CheckId::Podman
             | CheckId::KrunRuntime
             | CheckId::CrunVersion
+            | CheckId::Passt
             | CheckId::Libkrunfw
             | CheckId::Betterleaks
     )

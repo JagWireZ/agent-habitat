@@ -133,7 +133,7 @@ result_summary() {
         for r in "${RESULTS[@]}"; do
             state="${r%%|*}"
             label="${r#*|}"
-            printf '- **%s** -- %s\n' "$state" "$label"
+            printf -- '- **%s** -- %s\n' "$state" "$label"
         done
     } >> "$SUMMARY"
 }
@@ -204,13 +204,13 @@ podman run --detach --rm --name "$SESSION_NAME" \
     --cpus 2 --memory 2048m \
     --annotation "${ANNOTATION_KEY}=${WORKSPACE_DISK}" \
     --env "HABITAT_AUTHORIZED_KEY=${AUTHORIZED_KEY}" \
-    --publish "${GUEST_SSH_HOST}::22/tcp" \
+    --publish "${GUEST_SSH_HOST}::2222/tcp" \
     "$GUEST_IMAGE" > "$LOG_DIR/launch.log" 2>&1
 record "- Launched session $SESSION_NAME (log: $LOG_DIR/launch.log)"
 
-PORT_OUTPUT="$(podman port "$SESSION_NAME" 22/tcp 2>&1 || true)"
+PORT_OUTPUT="$(podman port "$SESSION_NAME" 2222/tcp 2>&1 || true)"
 GUEST_SSH_PORT="${PORT_OUTPUT##*:}"
-record "- \`podman port $SESSION_NAME 22/tcp\` -> \`$PORT_OUTPUT\` (port: $GUEST_SSH_PORT)"
+record "- \`podman port $SESSION_NAME 2222/tcp\` -> \`$PORT_OUTPUT\` (port: $GUEST_SSH_PORT)"
 
 SSH_OPTS=(-i "$SSH_KEY_PATH" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o BatchMode=yes -p "$GUEST_SSH_PORT")
 

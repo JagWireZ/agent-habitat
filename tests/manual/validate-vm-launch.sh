@@ -116,7 +116,7 @@ result_summary() {
         for r in "${RESULTS[@]}"; do
             state="${r%%|*}"
             label="${r#*|}"
-            printf '- **%s** -- %s\n' "$state" "$label"
+            printf -- '- **%s** -- %s\n' "$state" "$label"
         done
     } >> "$SUMMARY"
 }
@@ -223,7 +223,12 @@ PODMAN_ARGS=(
     # separate, podman-inspect-visible guest IP to dial directly
     # (confirmed on real hardware: NetworkSettings comes back empty for
     # every field), so this published port is how the host reaches in.
-    --publish "${GUEST_SSH_HOST}::22/tcp"
+    # Guest sshd listens on 2222, not 22 -- confirmed on real Fedora 44
+    # hardware (2026-09-16): krun.use_passt=1's internal passt forwarding
+    # cannot forward privileged ports (<1024) into the guest at all (TCP
+    # handshake completes, connection resets as soon as data flows --
+    # upstream: https://github.com/containers/crun/issues/2251).
+    --publish "${GUEST_SSH_HOST}::2222/tcp"
     "$GUEST_IMAGE"
 )
 
@@ -246,8 +251,8 @@ status "Step 3: launch the session" PASS
 
 # --- Step 3b: resolve the guest's published SSH port ---------------------
 say "Step 3b: resolve the guest's published SSH port"
-PORT_OUTPUT="$(podman port "$SESSION_NAME" 22/tcp 2>&1 || true)"
-record "- \`podman port $SESSION_NAME 22/tcp\` -> \`$PORT_OUTPUT\`"
+PORT_OUTPUT="$(podman port "$SESSION_NAME" 2222/tcp 2>&1 || true)"
+record "- \`podman port $SESSION_NAME 2222/tcp\` -> \`$PORT_OUTPUT\`"
 GUEST_SSH_PORT="${PORT_OUTPUT##*:}"
 if ! [[ "$GUEST_SSH_PORT" =~ ^[0-9]+$ ]]; then
     record "- **FAILED**: could not parse a port number from \`podman port\`'s output above."

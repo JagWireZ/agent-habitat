@@ -56,9 +56,20 @@ pub const WORKSPACE_DISK_ANNOTATION: &str = "io.habitat.vm.workspace-disk";
 /// forbids one for credentials/API keys.
 pub const AUTHORIZED_KEY_ENV: &str = "HABITAT_AUTHORIZED_KEY";
 
-/// The guest-side port `sshd` listens on (`guest/Containerfile`) --
-/// ordinary SSH, never chosen per session.
-const GUEST_SSH_PORT: u16 = 22;
+/// The guest-side port `sshd` listens on (`guest/entrypoint.sh`) -- not
+/// the standard port 22. Confirmed on real Fedora 44 hardware
+/// (2026-09-16, `tmp/wip/vm-launch-validation`): `krun.use_passt=1`'s
+/// internal `passt` forwarding (separate from Podman's own `pasta`
+/// network setup -- see `crates/egress/src/network_setup.rs`'s doc
+/// comment) cannot forward privileged ports (<1024) into the guest at
+/// all; the TCP handshake completes but the connection resets as soon as
+/// data flows (upstream: <https://github.com/containers/crun/issues/2251>).
+/// Port 22 hit this every time (`kex_exchange_identification: read:
+/// Connection reset by peer`, immediately after `Connection established`);
+/// 1024+ does not. This exec channel is loopback-only and never exposed
+/// externally (`GUEST_SSH_HOST`), so there's no reason it needs the
+/// privileged port at all.
+const GUEST_SSH_PORT: u16 = 2222;
 
 /// The host address the guest's SSH port is published to
 /// (`build_run_args`'s `--publish`). Always loopback -- this exec
@@ -411,7 +422,7 @@ mod tests {
     fn build_run_args_publishes_the_ssh_port_to_loopback_only() {
         let args = build_run_args(&sample_request());
         let pub_idx = args.iter().position(|a| a == "--publish").unwrap();
-        assert_eq!(args[pub_idx + 1], "127.0.0.1::22/tcp");
+        assert_eq!(args[pub_idx + 1], "127.0.0.1::2222/tcp");
     }
 
     #[test]

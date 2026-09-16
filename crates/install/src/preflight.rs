@@ -3,14 +3,18 @@
 //!
 //! - [`run_install_checks`] -- what `habitat install` runs: host-OS gate,
 //!   Podman, the `krun` runtime, whether that `crun`/`krun` build is new
-//!   enough for real `passt` networking (`checks::crun_version`), and
-//!   `libkrunfw` (the shared library `krun` needs to actually boot a
-//!   microVM, checked separately from the `krun` binary itself -- see
-//!   `checks::libkrunfw`'s doc comment for why). Verify-only, no mutation.
+//!   enough to hand off to real `passt` networking (`checks::
+//!   crun_version`), whether `passt` itself is actually installed
+//!   (`checks::passt` -- a distinct requirement from the version check
+//!   above, see that function's doc comment), and `libkrunfw` (the shared
+//!   library `krun` needs to actually boot a microVM, checked separately
+//!   from the `krun` binary itself -- see `checks::libkrunfw`'s doc
+//!   comment for why). Verify-only, no mutation.
 //! - [`run_preflight`] -- what `habitat run` runs at the start of every
 //!   session: host-OS gate, KVM/hardware-virtualization, then the same
-//!   Podman, `krun`-runtime, `crun`-version, and `libkrunfw` checks
-//!   `habitat install` uses (one implementation, reused -- not re-derived).
+//!   Podman, `krun`-runtime, `crun`-version, `passt`, and `libkrunfw`
+//!   checks `habitat install` uses (one implementation, reused -- not
+//!   re-derived).
 //!
 //! Both stop at the first failing check (fail-closed and deterministic:
 //! an operator fixes one problem at a time rather than triaging a wall of
@@ -119,6 +123,10 @@ pub fn install_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
         result: checks::crun_version(env),
     });
     statuses.push(CheckStatus {
+        check: checks::CheckId::Passt,
+        result: checks::passt(env),
+    });
+    statuses.push(CheckStatus {
         check: checks::CheckId::Libkrunfw,
         result: checks::libkrunfw(env),
     });
@@ -167,6 +175,10 @@ pub fn preflight_report<E: Environment>(
         result: checks::crun_version(env),
     });
     statuses.push(CheckStatus {
+        check: checks::CheckId::Passt,
+        result: checks::passt(env),
+    });
+    statuses.push(CheckStatus {
         check: checks::CheckId::Libkrunfw,
         result: checks::libkrunfw(env),
     });
@@ -182,11 +194,11 @@ pub fn preflight_report<E: Environment>(
 /// `habitat install`'s verification sequence. Order matters: the host-OS
 /// gate is cheapest and most fundamental, so it runs first and pre-empts
 /// checks that would be meaningless on a refused host.
-/// `libkrunfw` and `crun-version` are included here as hard, unconditional
-/// requirements (unlike `betterleaks` below) -- they're real host-level
-/// prerequisites for any session to launch with real networking at all,
-/// never something a project can opt out of, so they belong in the same
-/// pass/fail gate as Podman/`krun-runtime`.
+/// `libkrunfw`, `crun-version`, and `passt` are included here as hard,
+/// unconditional requirements (unlike `betterleaks` below) -- they're
+/// real host-level prerequisites for any session to launch with real
+/// networking at all, never something a project can opt out of, so they
+/// belong in the same pass/fail gate as Podman/`krun-runtime`.
 pub fn run_install_checks<E: Environment>(
     env: &E,
     audit: &dyn AuditSink,
@@ -195,6 +207,7 @@ pub fn run_install_checks<E: Environment>(
     checks::podman(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
     checks::krun_runtime(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
     checks::crun_version(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
+    checks::passt(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
     checks::libkrunfw(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
     Ok(())
 }
@@ -223,6 +236,7 @@ pub fn run_preflight<E: Environment>(
     checks::podman(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     checks::krun_runtime(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     checks::crun_version(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
+    checks::passt(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     checks::libkrunfw(env).map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     if secrets_scan_content_enabled {
         checks::betterleaks(env)
@@ -259,6 +273,7 @@ mod tests {
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
             .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+            .with_command_ok("passt --version", "passt 0.0~git\n")
             .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n");
         let audit = MemoryAuditSink::default();
         assert!(run_install_checks(&env, &audit).is_ok());
@@ -281,13 +296,29 @@ mod tests {
     }
 
     #[test]
+    fn install_checks_fail_closed_when_passt_is_missing_even_with_krun_present() {
+        // `crun_version` passing says nothing about whether `passt`
+        // itself is installed -- it only checks crun-krun's ability to
+        // hand off to passt, not passt's own presence.
+        let env = FakeEnvironment::linux()
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_ok("podman info", "host: ...")
+            .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n");
+        // Deliberately no `passt --version` command configured on the fake.
+        let audit = MemoryAuditSink::default();
+        let err = run_install_checks(&env, &audit).unwrap_err();
+        assert_eq!(err.0.check.name(), "passt");
+    }
+
+    #[test]
     fn install_checks_fail_closed_when_libkrunfw_is_missing_even_with_krun_present() {
         // The exact real-hardware finding this check exists for: `krun
         // --version` alone must not be read as "a session can launch."
         let env = FakeEnvironment::linux()
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
-            .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n");
+            .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+            .with_command_ok("passt --version", "passt 0.0~git\n");
         // Deliberately no `ldconfig -p` command configured on the fake.
         let audit = MemoryAuditSink::default();
         let err = run_install_checks(&env, &audit).unwrap_err();
@@ -306,6 +337,7 @@ mod tests {
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
             .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+            .with_command_ok("passt --version", "passt 0.0~git\n")
             .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n");
         let audit = MemoryAuditSink::default();
         assert!(run_preflight(&env, &audit, false).is_ok());
@@ -326,13 +358,28 @@ mod tests {
     }
 
     #[test]
-    fn preflight_fails_closed_when_libkrunfw_is_missing_even_with_krun_present() {
+    fn preflight_fails_closed_when_passt_is_missing_even_with_krun_present() {
         let env = FakeEnvironment::linux()
             .with_existing_path("/dev/kvm")
             .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
             .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n");
+        // Deliberately no `passt --version` command configured on the fake.
+        let audit = MemoryAuditSink::default();
+        let err = run_preflight(&env, &audit, false).unwrap_err();
+        assert_eq!(err.0.check.name(), "passt");
+    }
+
+    #[test]
+    fn preflight_fails_closed_when_libkrunfw_is_missing_even_with_krun_present() {
+        let env = FakeEnvironment::linux()
+            .with_existing_path("/dev/kvm")
+            .with_file("/proc/cpuinfo", "flags\t\t: fpu vme vmx tsc")
+            .with_command_ok("podman --version", "podman version 5.0.0")
+            .with_command_ok("podman info", "host: ...")
+            .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+            .with_command_ok("passt --version", "passt 0.0~git\n");
         // Deliberately no `ldconfig -p` command configured on the fake.
         let audit = MemoryAuditSink::default();
         let err = run_preflight(&env, &audit, false).unwrap_err();
@@ -347,6 +394,7 @@ mod tests {
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
             .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+            .with_command_ok("passt --version", "passt 0.0~git\n")
             .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n");
         // Deliberately no `betterleaks` command configured on the fake.
 
@@ -369,14 +417,14 @@ mod tests {
     #[test]
     fn install_report_lists_every_check_even_after_a_failure() {
         // podman missing, but that must not hide the krun-runtime/
-        // crun-version/libkrunfw/betterleaks results -- unlike the gate,
-        // the report doesn't stop at the first failure.
+        // crun-version/passt/libkrunfw/betterleaks results -- unlike the
+        // gate, the report doesn't stop at the first failure.
         let env = FakeEnvironment::linux();
         let report = install_report(&env);
         assert_eq!(
             report.len(),
-            6,
-            "host-os, podman, krun-runtime, crun-version, libkrunfw, betterleaks"
+            7,
+            "host-os, podman, krun-runtime, crun-version, passt, libkrunfw, betterleaks"
         );
         assert_eq!(report[0].check.name(), "host-os");
         assert!(report[0].passed());
@@ -386,10 +434,12 @@ mod tests {
         assert!(!report[2].passed());
         assert_eq!(report[3].check.name(), "crun-version");
         assert!(!report[3].passed());
-        assert_eq!(report[4].check.name(), "libkrunfw");
+        assert_eq!(report[4].check.name(), "passt");
         assert!(!report[4].passed());
-        assert_eq!(report[5].check.name(), "betterleaks");
+        assert_eq!(report[5].check.name(), "libkrunfw");
         assert!(!report[5].passed());
+        assert_eq!(report[6].check.name(), "betterleaks");
+        assert!(!report[6].passed());
     }
 
     #[test]
@@ -413,6 +463,7 @@ mod tests {
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
             .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
+            .with_command_ok("passt --version", "passt 0.0~git\n")
             .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n")
             .with_command_ok("betterleaks --version", "betterleaks 0.4.0");
         let report = install_report(&env);
@@ -425,12 +476,13 @@ mod tests {
         let report = preflight_report(&env, false);
         assert_eq!(
             report.len(),
-            6,
-            "host-os, kvm, podman, krun-runtime, crun-version, libkrunfw"
+            7,
+            "host-os, kvm, podman, krun-runtime, crun-version, passt, libkrunfw"
         );
         assert_eq!(report[1].check.name(), "kvm");
         assert!(!report[1].passed());
-        assert_eq!(report[5].check.name(), "libkrunfw");
+        assert_eq!(report[5].check.name(), "passt");
+        assert_eq!(report[6].check.name(), "libkrunfw");
     }
 
     #[test]
@@ -439,14 +491,14 @@ mod tests {
         let without = preflight_report(&env, false);
         assert_eq!(
             without.len(),
-            6,
-            "host-os, kvm, podman, krun-runtime, crun-version, libkrunfw"
+            7,
+            "host-os, kvm, podman, krun-runtime, crun-version, passt, libkrunfw"
         );
         assert!(!without.iter().any(|s| s.check.name() == "betterleaks"));
 
         let with = preflight_report(&env, true);
-        assert_eq!(with.len(), 7, "+ betterleaks");
-        assert_eq!(with[6].check.name(), "betterleaks");
+        assert_eq!(with.len(), 8, "+ betterleaks");
+        assert_eq!(with[7].check.name(), "betterleaks");
     }
 
     /// Audit-sink failures (e.g. an unwritable log path) must not soften

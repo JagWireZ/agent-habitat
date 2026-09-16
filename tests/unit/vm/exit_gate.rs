@@ -45,7 +45,7 @@ fn resource_limits_from_config_reach_the_launch_command() {
     let runner = FakeCommandRunner::default()
         .with_ok(&invocation, "containerid123\n")
         .with_ok(
-            "podman port habitat-exit-gate-session 22/tcp",
+            "podman port habitat-exit-gate-session 2222/tcp",
             "127.0.0.1:34567\n",
         );
 

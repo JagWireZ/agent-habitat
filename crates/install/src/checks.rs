@@ -17,6 +17,7 @@ pub enum CheckId {
     Podman,
     KrunRuntime,
     CrunVersion,
+    Passt,
     Libkrunfw,
     Betterleaks,
 }
@@ -29,6 +30,7 @@ impl CheckId {
             CheckId::Podman => "podman",
             CheckId::KrunRuntime => "krun-runtime",
             CheckId::CrunVersion => "crun-version",
+            CheckId::Passt => "passt",
             CheckId::Libkrunfw => "libkrunfw",
             CheckId::Betterleaks => "betterleaks",
         }
@@ -202,17 +204,30 @@ pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
     }
 }
 
-/// The minimum `crun` version that supports the `krun.use_passt` OCI
-/// annotation -- see [`crun_version`]'s doc comment. Added in crun
-/// 1.27.1 (confirmed via upstream's own 1.27.1 release notes: "krun: add
-/// support for passt-based networking in microVMs via the krun.use_passt
-/// annotation").
-pub const MIN_CRUN_VERSION_FOR_PASST: (u32, u32, u32) = (1, 27, 1);
+/// The minimum `crun` version this project trusts for real sandboxed
+/// networking -- pinned to the exact build `habitat install` always
+/// installs on the Dnf family (`package_manager::CRUN_PINNED_VERSION`,
+/// `installer::attempt_one`), not merely the version that added the
+/// `krun.use_passt` OCI annotation (crun 1.27.1, confirmed via upstream's
+/// own 1.27.1 release notes). Passing the annotation's own minimum isn't
+/// enough on its own: confirmed on real Fedora 44 hardware (2026-09-16,
+/// `tmp/wip/vm-launch-validation`) that its repo `crun-krun` (1.28)
+/// boots a real `passt`-backed guest with the annotation honored, but
+/// every SSH connection into it reset mid-handshake -- a loopback packet
+/// capture showed the RST coming from `pasta`'s own splice, before the
+/// guest's sshd ever saw the connection. This check exists so a passing
+/// checklist entry always means "this exact trusted build," never "new
+/// enough to accept the annotation but not necessarily working
+/// correctly" -- see [`crun_version`]'s doc comment for the check this
+/// backs.
+pub const MIN_CRUN_VERSION_FOR_PASST: (u32, u32, u32) = (1, 29, 1);
 
-/// `krun`'s underlying `crun` version is new enough to support the
-/// `krun.use_passt` OCI annotation -- i.e. new enough for a session to
-/// actually get real `passt`-backed networking instead of silently
-/// falling back to libkrun's default TSI mode.
+/// `krun`'s underlying `crun` version is at least
+/// [`MIN_CRUN_VERSION_FOR_PASST`] -- i.e. confirmed capable of real
+/// `passt`-backed networking instead of either silently falling back to
+/// libkrun's default TSI mode, or (Fedora 44's real-hardware finding)
+/// accepting `krun.use_passt` but still resetting every guest SSH
+/// connection.
 ///
 /// **Why this is a separate check from [`krun_runtime`], not folded into
 /// it**: confirmed on real AlmaLinux 10.2 hardware
@@ -220,13 +235,13 @@ pub const MIN_CRUN_VERSION_FOR_PASST: (u32, u32, u32) = (1, 27, 1);
 /// `krun --version` succeeding says nothing about whether this specific
 /// build is new enough for real networking. AlmaLinux 10's own
 /// `crun-krun-1.27-2.el10_2` package (from AppStream, not EPEL) is
-/// exactly one patch release behind the 1.27.1 cutoff: `krun --version`
-/// passes, `--network pasta` is accepted without error, and the guest
-/// still silently boots under TSI (`tsi_hijack` on the kernel command
-/// line, `PF_TSI`/`PF_TSI6`/`PF_TSIU` registered, no virtio-net device at
-/// all) -- with no error message anywhere pointing at the actual cause.
-/// This check exists so `habitat install` catches that gap before a
-/// session launch ever gets that far.
+/// behind this cutoff: `krun --version` passes, `--network pasta` is
+/// accepted without error, and the guest still silently boots under TSI
+/// (`tsi_hijack` on the kernel command line, `PF_TSI`/`PF_TSI6`/
+/// `PF_TSIU` registered, no virtio-net device at all) -- with no error
+/// message anywhere pointing at the actual cause. This check exists so
+/// `habitat install` catches that gap before a session launch ever gets
+/// that far.
 ///
 /// Parses the first line of `krun --version`'s output (`"crun version
 /// X.Y.Z"`) rather than trusting a package manager's own version query --
@@ -271,10 +286,12 @@ pub fn crun_version<E: Environment>(env: &E) -> CheckResult {
         fail(
             CheckId::CrunVersion,
             format!(
-                "crun {}.{}.{} is older than {}.{}.{}, the version that added the \
-                 krun.use_passt annotation -- without it, a session silently boots under \
-                 libkrun's default TSI networking instead of real passt-backed networking, \
-                 with no error message pointing at why",
+                "crun {}.{}.{} is older than the {}.{}.{} build this project trusts for real \
+                 sandboxed networking -- an older build may silently boot under libkrun's \
+                 default TSI networking instead of real passt-backed networking (if it predates \
+                 the krun.use_passt annotation entirely), or may accept that annotation but \
+                 still reset every guest SSH connection (confirmed on real Fedora 44 hardware \
+                 running crun-krun 1.28) -- either way, with no error message pointing at why",
                 version.0,
                 version.1,
                 version.2,
@@ -299,6 +316,40 @@ fn parse_crun_version(text: &str) -> Option<(u32, u32, u32)> {
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
     Some((major, minor, patch))
+}
+
+/// `passt` -- the actual userspace program that gives the guest its real
+/// virtual network interface and does the packet translation
+/// (`docs/decisions/0004-networking-layer.md`) -- is installed and
+/// runnable.
+///
+/// **Why this is a separate check from [`crun_version`], not folded into
+/// it**: [`crun_version`] only confirms `crun-krun` is new enough to
+/// *hand off* to `passt` via the `krun.use_passt` annotation -- it says
+/// nothing about whether `passt` (the `passt`/`pasta` package) is
+/// actually installed on this host at all. `podman`'s own `--network
+/// pasta` driver only recommends that package rather than hard-requiring
+/// it on every distro, so a host can pass every other check here while a
+/// session still fails to get a real network at launch time with no
+/// earlier warning. Checked via `passt --version` (the same binary this
+/// project's own `tests/manual/validate-egress.sh` probes) rather than
+/// `pasta --version` -- same executable, and `passt` is the name the
+/// distro package itself uses.
+pub fn passt<E: Environment>(env: &E) -> CheckResult {
+    match env.run_command("passt", &["--version"]) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => fail(
+            CheckId::Passt,
+            format!(
+                "passt --version exited non-zero: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ),
+        Err(e) => fail(
+            CheckId::Passt,
+            format!("passt not runnable (is the passt package installed?): {e}"),
+        ),
+    }
 }
 
 /// `libkrunfw` (the shared library bundling the actual guest kernel
@@ -489,8 +540,9 @@ mod tests {
     }
 
     #[test]
-    fn crun_version_fails_when_older_than_1_27_1() {
-        // Mirrors the real AlmaLinux 10.2 finding: crun-krun-1.27-2.el10_2.
+    fn crun_version_fails_when_older_than_the_annotation_cutoff() {
+        // Mirrors the real AlmaLinux 10.2 finding: crun-krun-1.27-2.el10_2,
+        // which predates the krun.use_passt annotation entirely (1.27.1).
         let env = FakeEnvironment::linux().with_command_ok(
             "krun --version",
             "crun version 1.27\ncommit: a718a92cc9a94955a5a550b6fdec1378c247ec50\n",
@@ -501,17 +553,30 @@ mod tests {
     }
 
     #[test]
-    fn crun_version_passes_at_exactly_the_minimum() {
+    fn crun_version_fails_when_new_enough_for_the_annotation_but_older_than_the_pinned_build() {
+        // Real Fedora 44 hardware (2026-09-16): crun-krun 1.28 accepts
+        // the krun.use_passt annotation (past the 1.27.1 cutoff) but
+        // still resets every guest SSH connection -- this check must
+        // fail closed on it, not treat "accepts the annotation" as
+        // "works correctly".
         let env = FakeEnvironment::linux()
-            .with_command_ok("krun --version", "crun version 1.27.1\ncommit: abc\n");
+            .with_command_ok("krun --version", "crun version 1.28\ncommit: abc\n");
+        let err = crun_version(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::CrunVersion);
+    }
+
+    #[test]
+    fn crun_version_passes_at_exactly_the_pinned_build() {
+        let env = FakeEnvironment::linux()
+            .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n");
         assert!(crun_version(&env).is_ok());
     }
 
     #[test]
-    fn crun_version_passes_when_newer() {
+    fn crun_version_passes_when_newer_than_the_pinned_build() {
         let env = FakeEnvironment::linux().with_command_ok(
             "krun --version",
-            "crun version 1.29.1\ncommit: f0d911de5587342cfeb16473bf32ecdfeaf25957\n",
+            "crun version 1.30.0\ncommit: f0d911de5587342cfeb16473bf32ecdfeaf25957\n",
         );
         assert!(crun_version(&env).is_ok());
     }
@@ -536,6 +601,27 @@ mod tests {
             parse_crun_version("crun version 1.27\ncommit: abc"),
             Some((1, 27, 0))
         );
+    }
+
+    #[test]
+    fn passt_fails_when_missing() {
+        let env = FakeEnvironment::linux();
+        let err = passt(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::Passt);
+    }
+
+    #[test]
+    fn passt_fails_when_version_exits_non_zero() {
+        let env = FakeEnvironment::linux()
+            .with_command_failure("passt --version", "passt: unrecognized option");
+        let err = passt(&env).unwrap_err();
+        assert_eq!(err.check, CheckId::Passt);
+    }
+
+    #[test]
+    fn passt_passes_when_present() {
+        let env = FakeEnvironment::linux().with_command_ok("passt --version", "passt 0.0~git\n");
+        assert!(passt(&env).is_ok());
     }
 
     #[test]
