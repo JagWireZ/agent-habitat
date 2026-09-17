@@ -262,6 +262,45 @@ const GUEST_TLS_PORT: u16 = 443;
 /// curl's own `-m` timeout) for every destination, allowlisted or not --
 /// indistinguishable from the loopback-DNAT bug above without checking
 /// which stage actually hangs.
+///
+/// Also carries a `ct state established,related accept` rule ahead of
+/// the proxy/DNS accept rules, unconditional on interface or address --
+/// the guest's SSH exec channel (`docs/decisions/0008-guest-exec-
+/// channel.md`) is *inbound*, but its reply traffic (the SYN-ACK and
+/// everything after) is still egress from the guest kernel's own point
+/// of view and passes through this same `hook output` chain. Without
+/// this rule, this ruleset's default-deny policy silently drops that
+/// reply traffic too, since it matches none of the proxy/DNS-scoped
+/// accept rules -- breaking the exec channel itself, not just non-
+/// allowlisted destinations. Confirmed on real hardware (`tmp/wip/
+/// egress-validation`): applying this ruleset to a session already
+/// reachable over SSH made every subsequent SSH connection attempt hang
+/// at the banner exchange, and every `curl` trace (including the
+/// allowlisted destination) come back with no corresponding proxy audit
+/// log entry at all -- the guest's own DNS and TLS traffic was also being
+/// dropped, but so was the SSH session running each check, which is why
+/// nothing reached the proxy for *any* destination.
+///
+/// Also carries an unconditional `oifname "lo" accept`, ahead of even the
+/// established/related rule -- `pasta` by default mirrors the host's own
+/// address (and interface name) onto its interface inside the session's
+/// netns (confirmed on real hardware: `ip addr show` inside the netns
+/// this ruleset is applied to shows the *same* IP as the host's real
+/// uplink, on an interface also named after it, e.g. `wlp1s0`), and
+/// `podman --publish`'s own port-forwarding path connects to that
+/// self-same address from a process already inside this netns to reach
+/// the guest's published port. Since source and destination are the same
+/// address, the kernel routes that connection via `lo`, not the pasta
+/// interface -- so it matches neither `oifname "{iface}"`-scoped accept
+/// rule, and, being the *first* packet of a brand new flow, doesn't match
+/// `ct state established,related` either. Confirmed on real hardware:
+/// without this rule, applying this ruleset breaks the SSH exec channel
+/// itself (docs/decisions/0008-guest-exec-channel.md) even with the
+/// established/related rule already in place, because the very SYN that
+/// establishes it never gets out. Loopback traffic never leaves this
+/// netns to reach an external destination, so accepting it unconditionally
+/// doesn't weaken the actual bypass-prevention property this ruleset
+/// exists for.
 pub fn build_egress_firewall_rules(pasta_interface: &str, proxy_addr: SocketAddr) -> String {
     let guest_visible_ip = if proxy_addr.ip().is_loopback() {
         HOST_LOOPBACK_ADDR
@@ -280,6 +319,8 @@ pub fn build_egress_firewall_rules(pasta_interface: &str, proxy_addr: SocketAddr
          table inet {table} {{\n\
          \x20   chain egress {{\n\
          \x20       type filter hook output priority 0; policy drop;\n\
+         \x20       oifname \"lo\" accept\n\
+         \x20       ct state established,related accept\n\
          \x20       oifname \"{iface}\" ip daddr {ip} tcp dport {port} accept\n\
          \x20       oifname \"{iface}\" ip daddr {ip} udp dport {port} accept\n\
          \x20       oifname \"{iface}\" ip daddr {ip} tcp dport {dns_port} accept\n\
@@ -433,6 +474,31 @@ mod tests {
     fn firewall_rules_nat_table_is_scoped_to_the_pasta_interface() {
         let rules = build_egress_firewall_rules("pasta0", proxy_addr());
         assert!(rules.contains("oifname \"pasta0\" tcp dport 443 dnat"));
+    }
+
+    #[test]
+    fn firewall_rules_accept_loopback_traffic_unconditionally() {
+        // Without this, `podman --publish`'s own port-forward into the
+        // guest's SSH port -- which pasta's host-address mirroring makes
+        // a loopback-routed connection inside this same netns -- gets
+        // dropped by the default-deny policy exactly like a bypass
+        // attempt, breaking the exec channel itself. Confirmed on real
+        // hardware: this broke even with established/related already
+        // accepted, since it's the initiating SYN that never gets out.
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains("oifname \"lo\" accept"));
+    }
+
+    #[test]
+    fn firewall_rules_accept_established_and_related_connections() {
+        // Without this, the default-deny OUTPUT policy also drops the
+        // guest's own reply traffic for its *inbound* SSH exec channel
+        // (docs/decisions/0008-guest-exec-channel.md) -- confirmed on
+        // real hardware to hang SSH at the banner exchange the moment
+        // this ruleset is applied, breaking the very channel every
+        // manual check in tests/manual/validate-egress.sh runs over.
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains("ct state established,related accept"));
     }
 
     #[test]

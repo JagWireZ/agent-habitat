@@ -543,8 +543,24 @@ record "\$ curl -sS -m 5 https://githubusercontent.com.attacker.example/   # loo
 LOOKALIKE_RESULT="$(run_trace "curl -sS -m 5 https://githubusercontent.com.attacker.example/")"
 record "$LOOKALIKE_RESULT"
 record ""
-record "\$ curl -sS -m 5 --resolve pypi.org:443:1.2.3.4 https://pypi.org/   # direct-IP bypass -- must be blocked"
-IP_BYPASS_RESULT="$(run_trace "curl -sS -m 5 --resolve pypi.org:443:1.2.3.4 https://pypi.org/")"
+record "\$ ip=\$(nslookup pypi.org | ...); curl -sS -m 5 -k \"https://\$ip/\"   # direct-IP bypass (no hostname/SNI at all) -- must be blocked"
+# Deliberately NOT \`curl --resolve pypi.org:443:<ip> https://pypi.org/\`:
+# \`--resolve\` only overrides address resolution -- curl still sends
+# \`pypi.org\` as the ClientHello's SNI, so that command is indistinguishable
+# from an ordinary allowed request and was confirmed on real hardware to
+# succeed (via the DNAT redirect + the proxy's own, correct, SNI-based
+# accept) -- not a bypass of anything. A real IP literal in the URL is
+# what actually carries no hostname to match: per \`policy/
+# egress_allowlist.txt\`, "a direct-IP connection carries no hostname to
+# match and is denied by construction" -- TLS SNI cannot carry an IP
+# literal (RFC 6066), so curl sends no SNI extension at all, and
+# \`crate::proxy\`'s \`Denied { host: None }\` path (see its
+# \`a_connection_with_no_readable_sni_is_denied\` unit test) is what this
+# actually exercises. Resolved with the guest's own (busybox) \`nslookup\`
+# rather than \`dig\` -- the guest image is deliberately minimal
+# (\`guest/Containerfile\`) and doesn't carry bind-tools.
+IP_BYPASS_CMD='ip=$(nslookup pypi.org 2>/dev/null | awk "/^Name:/{f=1} f && /^Address: /{print \$2; exit}"); curl -sS -m 5 -k "https://$ip/"'
+IP_BYPASS_RESULT="$(run_trace "$IP_BYPASS_CMD")"
 record "$IP_BYPASS_RESULT"
 record ""
 record "\$ nslookup pypi.org 8.8.8.8   # DNS bypass, resolver other than the pinned proxy path -- must be blocked"
