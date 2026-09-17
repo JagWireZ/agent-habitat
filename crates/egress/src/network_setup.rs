@@ -9,14 +9,15 @@
 //! separately" split as `habitat_vm::launcher::build_run_args` and its
 //! `WORKSPACE_DISK_ANNOTATION` caveat: everything in this module is
 //! plain string/argv construction, checkable without Podman, `passt`, or
-//! real KVM. Whether crun-krun's `--network`/`--dns` flags behave the
-//! way documented here when combined with libkrun (rather than plain
-//! crun) -- and whether the nftables ruleset below is actually the right
-//! mechanism for restricting a rootless `pasta` interface, as opposed to
-//! some other rootless-networking primitive -- is **not yet confirmed
-//! against real hardware**. `tests/manual/validate-egress.sh` is where
-//! that confirmation (or correction, same "wrong on real hardware, then
-//! fixed" pattern as the Phase 3 annotation key) happens.
+//! real KVM. **Confirmed on real hardware** (`tmp/wip/egress-validation`,
+//! 2026-09-17): crun-krun's `--network`/`--dns` flags behave as
+//! documented here when combined with libkrun, and the nftables ruleset
+//! below is the correct mechanism for restricting a rootless `pasta`
+//! interface -- `tests/manual/validate-egress.sh`'s connection trace
+//! confirmed an allowlisted destination succeeds, a non-allowlisted
+//! destination and an allowlist-lookalike are both blocked, and neither
+//! a direct-IP nor a direct-to-8.8.8.8 DNS bypass can route around the
+//! proxy.
 
 use std::net::SocketAddr;
 
