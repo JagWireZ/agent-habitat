@@ -97,6 +97,7 @@ GUEST_SSH_HOST="127.0.0.1"
 AUDIT_LOG="$LOG_DIR/audit.jsonl"
 HARNESS_LOG="$LOG_DIR/egress-harness.log"
 HARNESS_PID=""
+NFT_APPLIED=""
 
 mkdir -p "$LOG_DIR"
 SUMMARY="$LOG_DIR/summary.md"
@@ -187,7 +188,7 @@ if [[ ! -e /dev/kvm ]]; then
     status "Step 1: host suitability" FAIL "no /dev/kvm on this host"
     exit 1
 fi
-for bin in podman krun passt nft ssh ssh-keygen; do
+for bin in podman krun passt nft nsenter ssh ssh-keygen; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         fail "$bin not found on PATH."
         record "- **ABORTED**: $bin not installed."
@@ -237,7 +238,7 @@ fi
 # CAP_NET_BIND_SERVICE on that exact binary file. `cargo run` re-execs
 # through cargo itself, which is a needless extra hop for a capability
 # that's only meaningful on the file actually calling bind(2).
-cargo build --quiet -p habitat-egress --example egress_harness
+cargo build --quiet -p habitat-egress --example egress_harness --example print_firewall_rules
 HARNESS_BIN="$REPO_ROOT/target/debug/examples/egress_harness"
 record "\$ $HARNESS_BIN ${HARNESS_ARGS[*]}"
 
@@ -429,28 +430,98 @@ fi
 
 # --- Step 4: apply the reachability-restricting firewall ruleset --------
 say "Step 4: restrict the guest's pasta interface to the proxy only"
-record "MANUAL: identify the pasta-created interface for this session (e.g. via"
-record "\`ip link\` or podman's own network inspection output), generate the ruleset"
-record "via \`habitat_egress::network_setup::build_egress_firewall_rules(iface, proxy_addr)\`,"
-record "and apply it with \`nft -f <generated-ruleset>\`. Record the interface name and"
-record "whether \`nft -f\` succeeded without root (rootless nftables in this user's own"
-record "netns) or required a privilege this project's containment model does not allow:"
-record ""
-record "- [ ] pasta interface identified: ______________________"
-record "- [ ] \`nft -f\` applied successfully, no elevated privilege required"
-record ""
-record "**Until this step is actually applied, expect every check in Step 5 to reach its"
-record "real destination, allowlisted or not**: nothing before this point makes the proxy"
-record "reachable from the guest's own outbound connections, and this ruleset's accept rule"
-record "(destination = the proxy's own address) only helps once the guest's traffic is"
-record "actually forced through it. Cross-check this against network_setup.rs's own"
-record "\`build_egress_firewall_rules\` -- as written it default-denies everything except"
-record "connections the guest itself dials *to* \`$PROXY_ADDR\`, but nothing in this repo yet"
-record "redirects a guest's ordinary outbound :443 connections there (no DNAT rule, no"
-record "in-guest proxy configuration) -- if that's still true when you read this, a"
-record "genuinely allowed destination will fail closed once Step 4 is applied, which is a"
-record "real gap in network_setup.rs to fix, not a mistake in this script."
-status "Step 4: apply restricting firewall ruleset" MANUAL "not automated -- see printed instructions"
+# The ruleset's `oifname` matches only make sense evaluated from inside the
+# same netns pasta's interface actually lives in -- `podman inspect`'s
+# NetworkSettings already came back completely empty for a pasta-backed
+# container once (docs/decisions/0008-guest-exec-channel.md's Correction),
+# so this does not assume a host-visible interface name either. Instead:
+# resolve the container's own netns by PID (podman does track that
+# reliably, even for pasta) and enumerate + apply from inside it via
+# `nsenter`, which does not depend on krun/conmon exec support the way
+# `podman exec` does (already confirmed dead for krun -- 0008 above).
+#
+# Joining only the target's net namespace (`nsenter --net=/proc/<pid>/ns/net`)
+# fails with "Operation not permitted": rootless Podman puts the container in
+# its own user namespace, and a net namespace's reassociate check requires
+# CAP_SYS_ADMIN *inside the user namespace that owns it* -- which the calling
+# process doesn't have unless it also joins that same user namespace. Passing
+# `--user --net --target <pid>` together joins both atomically; since the
+# calling user is the one Podman mapped as root inside the container's own
+# userns, it becomes fully privileged there without needing real root/sudo.
+# Confirmed on real hardware (this validation run) that `--net` alone is
+# rejected this way.
+netns_run() { nsenter --user --net --target "$CONTAINER_PID" -- "$@"; }
+
+STEP4_STATE="MANUAL"
+STEP4_DETAIL="not attempted"
+CONTAINER_PID="$(podman inspect --format '{{.State.Pid}}' "$SESSION_NAME" 2>/dev/null || true)"
+if [[ -z "$CONTAINER_PID" || "$CONTAINER_PID" == "0" ]]; then
+    record "- Could not resolve a PID for \`$SESSION_NAME\` via \`podman inspect\` -- falling back to manual."
+    STEP4_DETAIL="podman inspect returned no usable PID"
+else
+    record "- Container netns resolved via PID $CONTAINER_PID (\`/proc/$CONTAINER_PID/ns/{user,net}\`)."
+    IFACE_LIST="$(netns_run ip -o link show 2>&1 || true)"
+    record "- \`nsenter --user --net --target $CONTAINER_PID -- ip -o link show\`:"
+    record '```'
+    record "$IFACE_LIST"
+    record '```'
+    # Excludes loopback -- the pasta-created interface is whatever else is
+    # in this netns. Untested against real hardware whether this is always
+    # exactly one interface, or what pasta actually names it; that's the
+    # thing this run is meant to confirm or correct.
+    PASTA_IFACE="$(echo "$IFACE_LIST" | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -v '^lo$' | head -1)"
+    if [[ -z "$PASTA_IFACE" ]]; then
+        record "- No non-loopback interface found in that netns -- falling back to manual."
+        STEP4_DETAIL="no non-loopback interface found via nsenter"
+    else
+        record "- Identified pasta interface: \`$PASTA_IFACE\`"
+        RULESET="$("$REPO_ROOT/target/debug/examples/print_firewall_rules" --iface "$PASTA_IFACE" --proxy-addr "$PROXY_ADDR")"
+        record "- Generated ruleset (\`habitat_egress::network_setup::build_egress_firewall_rules\`):"
+        record '```'
+        record "$RULESET"
+        record '```'
+        set +e
+        NFT_OUTPUT="$(echo "$RULESET" | netns_run nft -f - 2>&1)"
+        NFT_EXIT=$?
+        set -e
+        record "- \`nsenter --user --net --target $CONTAINER_PID -- nft -f -\` exit: $NFT_EXIT"
+        if [[ -n "$NFT_OUTPUT" ]]; then
+            record '```'
+            record "$NFT_OUTPUT"
+            record '```'
+        fi
+        if [[ "$NFT_EXIT" -eq 0 ]]; then
+            STEP4_STATE="PASS"
+            STEP4_DETAIL="iface=$PASTA_IFACE, applied via nsenter, no elevated privilege used"
+            NFT_APPLIED=1
+        else
+            STEP4_DETAIL="iface=$PASTA_IFACE, nft -f failed (exit $NFT_EXIT) -- see output above"
+        fi
+    fi
+fi
+if [[ "$STEP4_STATE" != "PASS" ]]; then
+    record ""
+    record "MANUAL fallback: identify the pasta-created interface for this session (e.g. via"
+    record "\`nsenter --user --net --target <container-pid> -- ip link\` -- joining only \`--net\`"
+    record "fails with \"Operation not permitted\" against a rootless container's userns),"
+    record "generate the ruleset via"
+    record "\`habitat_egress::network_setup::build_egress_firewall_rules(iface, proxy_addr)\`"
+    record "(or \`cargo run -p habitat-egress --example print_firewall_rules -- --iface <iface>"
+    record "--proxy-addr $PROXY_ADDR\`), and apply it with \`nft -f <generated-ruleset>\` inside"
+    record "that same netns. Record the interface name and whether \`nft -f\` succeeded without"
+    record "root (rootless nftables in this user's own netns) or required a privilege this"
+    record "project's containment model does not allow:"
+    record ""
+    record "- [ ] pasta interface identified: ______________________"
+    record "- [ ] \`nft -f\` applied successfully, no elevated privilege required"
+    record ""
+    record "**Until this step is actually applied, expect every check in Step 5 to reach its"
+    record "real destination, allowlisted or not**: nothing before this point makes the proxy"
+    record "reachable from the guest's own outbound connections, and this ruleset's accept rule"
+    record "(destination = the proxy's own address) only helps once the guest's traffic is"
+    record "actually forced through it."
+fi
+status "Step 4: apply restricting firewall ruleset" "$STEP4_STATE" "$STEP4_DETAIL"
 
 # --- Step 5: connection trace (the actual exit gate) ---------------------
 say "Step 5: connection trace from inside the guest"
@@ -511,13 +582,25 @@ cleanup_harness
 HARNESS_PID=""
 record "- [x] Proxy and DNS forwarder stopped (harness log: $HARNESS_LOG, audit log: $AUDIT_LOG)"
 record ""
-record "MANUAL: if Step 4 was actually applied (this script does not apply it itself --"
-record "see that step's own note), also remove its nftables table:"
-record "\`nft delete table inet habitat_egress\`."
-record ""
-record "- [ ] nftables ruleset removed (only applicable if Step 4 was applied)"
+if [[ -n "$NFT_APPLIED" ]]; then
+    # The container (and its netns) is already gone by this point --
+    # `podman rm --force` above tears down the netns Step 4's tables lived
+    # in along with it, so there is nothing left to delete here. Recorded
+    # explicitly rather than silently skipped, since a stray leftover
+    # table on a *host* netns (the wrong-oifname case this project hasn't
+    # hit, but hasn't ruled out either) would otherwise go unnoticed.
+    record "- Step 4's ruleset lived in \`$SESSION_NAME\`'s own netns, which \`podman rm\` above"
+    record "  already tore down -- nothing left to remove."
+    status "Step 6: nftables ruleset removed" PASS "torn down with the container's netns"
+else
+    record "MANUAL: if Step 4 was applied by hand outside this script's automated path (its"
+    record "own fallback instructions), also remove its nftables table:"
+    record "\`nft delete table inet habitat_egress\` (and \`habitat_egress_nat\`)."
+    record ""
+    record "- [ ] nftables ruleset removed (only applicable if Step 4 was applied manually)"
+    status "Step 6: nftables ruleset removed" MANUAL "only applicable if Step 4 was applied manually"
+fi
 status "Step 6: teardown" PASS
-status "Step 6: nftables ruleset removed" MANUAL "only applicable if Step 4 was applied"
 
 result_summary
 

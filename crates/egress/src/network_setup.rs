@@ -186,14 +186,48 @@ pub fn build_network_flags() -> Vec<String> {
 /// `habitat_vm::session::SessionId`'s fixed prefix.
 pub const FIREWALL_TABLE: &str = "habitat_egress";
 
+/// The port the guest's own outbound TLS connections actually dial
+/// (`https://` is always port 443 from the guest's point of view,
+/// regardless of what port the proxy itself listens on) -- this is the
+/// port [`build_egress_firewall_rules`]'s DNAT rule redirects to
+/// `proxy_addr`, since nothing in this project makes the guest dial the
+/// proxy's own address/port on purpose (see that function's doc comment
+/// for why that redirect is required at all).
+const GUEST_TLS_PORT: u16 = 443;
+
 /// Builds the nftables ruleset text that restricts a session's `pasta`
-/// interface to reach `proxy_addr` and nothing else: default-deny
-/// output, one explicit accept rule for the proxy's own address and
-/// port. This is the actual enforcement of "the guest cannot construct a
-/// network path that skips the proxy" -- reachability is removed at the
-/// network layer, not just at the SNI-matching layer, so there is
-/// nothing left to catch-and-redirect after the fact (`0004`'s design
-/// rationale).
+/// interface to reach `proxy_addr` and nothing else: a `nat` table that
+/// redirects the guest's own outbound `:443` connections to `proxy_addr`,
+/// followed by a default-deny filter table with one explicit accept rule
+/// for the (now-rewritten) proxy address and port. This is the actual
+/// enforcement of "the guest cannot construct a network path that skips
+/// the proxy" -- reachability is removed at the network layer, not just
+/// at the SNI-matching layer, so there is nothing left to catch-and-
+/// redirect after the fact (`0004`'s design rationale).
+///
+/// The DNAT rule is load-bearing, not optional: `crate::proxy::run` is a
+/// transparent SNI relay that expects to *be* the connection's real
+/// destination (it reads the guest's actual TLS ClientHello off the wire
+/// and dials the sniffed hostname itself) -- it has no HTTP-CONNECT or
+/// explicit-proxy mode a guest could dial on purpose. And `crate::dns`
+/// forwards every query to a real upstream and returns real answers
+/// (deliberately -- see that module's doc comment), so there is no
+/// sentinel address DNS could hand back to make the guest dial the proxy
+/// itself. Without this rule, a guest's ordinary `curl https://` dials the
+/// destination's real IP on port 443, which matches neither of the filter
+/// table's accept rules and is dropped -- including for allowlisted
+/// destinations. Found on real hardware during `tests/manual/
+/// validate-egress.sh`: with only the filter table below applied, an
+/// allowlisted destination fails closed exactly like a blocked one, which
+/// looks like a stricter-than-intended ruleset but is actually a missing
+/// redirect.
+///
+/// Both tables key off the same `hook output` + `oifname` match already
+/// confirmed to see the guest's egress on real hardware (see this
+/// function's own real-hardware validation history); the `nat` table runs
+/// at `priority -100` (nftables' conventional `dstnat` priority) so its
+/// rewrite happens before the filter table's `priority 0` chain evaluates
+/// the (by-then-rewritten) destination.
 ///
 /// Pure text construction, loaded via `nft -f` at launch time (real
 /// application, and confirming this is actually enforced against a
@@ -202,19 +236,62 @@ pub const FIREWALL_TABLE: &str = "habitat_egress";
 /// nftables application against a `pasta`-owned interface is real,
 /// hardware-and-kernel-version-dependent behavior this function cannot
 /// verify by construction alone).
+///
+/// `proxy_addr` is the proxy's real bind address, typically on the
+/// host's own loopback (e.g. `127.0.0.1:8443`) -- but this ruleset is
+/// applied *inside the guest's own netns*, where `127.0.0.1` always means
+/// the guest's own loopback, never the host's (the same trap
+/// [`HOST_LOOPBACK_ADDR`]'s doc comment describes for `--dns`). So when
+/// `proxy_addr`'s IP is loopback, both the DNAT target and the filter
+/// table's accept rule use [`HOST_LOOPBACK_ADDR`] instead, matching
+/// [`build_network_flags`]'s `--map-host-loopback` value -- confirmed on
+/// real hardware (`tmp/wip/egress-validation`) that using the literal
+/// loopback IP here makes DNAT rewrite the guest's outbound connection to
+/// its own loopback, where nothing is listening, so *every* destination
+/// fails closed identically, including allowlisted ones.
+///
+/// Also carries an accept rule for [`DNS_LISTEN_PORT`] at the same
+/// guest-visible address, alongside the proxy's own port -- without it,
+/// this ruleset's default-deny policy blocks the guest's own DNS queries
+/// to [`dns_listen_addr`] (reached via [`HOST_LOOPBACK_ADDR`], same as the
+/// proxy), not just non-allowlisted destinations. Confirmed on real
+/// hardware (`tmp/wip/egress-validation`): `tests/manual/
+/// validate-egress.sh`'s Step 3b DNS check passes because it runs
+/// *before* this ruleset is applied; once applied, a guest's ordinary
+/// `curl` hangs on DNS resolution (`getaddrinfo` isn't interrupted by
+/// curl's own `-m` timeout) for every destination, allowlisted or not --
+/// indistinguishable from the loopback-DNAT bug above without checking
+/// which stage actually hangs.
 pub fn build_egress_firewall_rules(pasta_interface: &str, proxy_addr: SocketAddr) -> String {
+    let guest_visible_ip = if proxy_addr.ip().is_loopback() {
+        HOST_LOOPBACK_ADDR
+            .parse()
+            .expect("HOST_LOOPBACK_ADDR is a valid IP literal")
+    } else {
+        proxy_addr.ip()
+    };
     format!(
-        "table inet {table} {{\n\
+        "table inet {table}_nat {{\n\
+         \x20   chain egress_nat {{\n\
+         \x20       type nat hook output priority -100; policy accept;\n\
+         \x20       oifname \"{iface}\" tcp dport {tls_port} dnat ip to {ip}:{port}\n\
+         \x20   }}\n\
+         }}\n\
+         table inet {table} {{\n\
          \x20   chain egress {{\n\
          \x20       type filter hook output priority 0; policy drop;\n\
          \x20       oifname \"{iface}\" ip daddr {ip} tcp dport {port} accept\n\
          \x20       oifname \"{iface}\" ip daddr {ip} udp dport {port} accept\n\
+         \x20       oifname \"{iface}\" ip daddr {ip} tcp dport {dns_port} accept\n\
+         \x20       oifname \"{iface}\" ip daddr {ip} udp dport {dns_port} accept\n\
          \x20   }}\n\
          }}\n",
         table = FIREWALL_TABLE,
         iface = pasta_interface,
-        ip = proxy_addr.ip(),
+        ip = guest_visible_ip,
         port = proxy_addr.port(),
+        tls_port = GUEST_TLS_PORT,
+        dns_port = DNS_LISTEN_PORT,
     )
 }
 
@@ -283,7 +360,10 @@ mod tests {
     #[test]
     fn firewall_rules_accept_only_the_proxy_address_and_port() {
         let rules = build_egress_firewall_rules("pasta0", proxy_addr());
-        assert!(rules.contains("127.0.0.1"));
+        // Not the proxy's literal bind IP (127.0.0.1) -- that means the
+        // guest's own loopback from inside its own netns. See
+        // `firewall_rules_translate_loopback_proxy_to_host_loopback_addr`.
+        assert!(rules.contains(HOST_LOOPBACK_ADDR));
         assert!(rules.contains("8443"));
         // Confirms the one accept rule is scoped to the pasta interface,
         // not left to apply host-wide.
@@ -291,8 +371,77 @@ mod tests {
     }
 
     #[test]
+    fn firewall_rules_translate_loopback_proxy_to_host_loopback_addr() {
+        // Confirmed on real hardware: DNAT-ing to the proxy's literal
+        // bind IP (127.0.0.1) sends the guest's traffic to its own
+        // loopback, where nothing is listening -- every destination fails
+        // closed identically, including allowlisted ones. The guest must
+        // dial HOST_LOOPBACK_ADDR, which `pasta`'s `--map-host-loopback`
+        // actually translates to the host's real loopback.
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(!rules.contains("127.0.0.1"));
+        assert!(rules.contains(&format!("dnat ip to {HOST_LOOPBACK_ADDR}:8443")));
+        assert!(rules.contains(&format!("ip daddr {HOST_LOOPBACK_ADDR} tcp dport 8443")));
+    }
+
+    #[test]
+    fn firewall_rules_keep_a_non_loopback_proxy_ip_unchanged() {
+        let addr: SocketAddr = "203.0.113.5:8443".parse().unwrap();
+        let rules = build_egress_firewall_rules("pasta0", addr);
+        assert!(rules.contains("203.0.113.5"));
+        assert!(!rules.contains(HOST_LOOPBACK_ADDR));
+    }
+
+    #[test]
+    fn firewall_rules_also_accept_dns_to_the_guest_visible_address() {
+        // Without this, the default-deny policy blocks the guest's own DNS
+        // queries to `dns_listen_addr` once this ruleset is actually
+        // applied -- indistinguishable from every destination being
+        // blocked, since `curl` hangs on resolution before it ever gets to
+        // dial the (correctly DNAT-able) destination. Confirmed on real
+        // hardware (tmp/wip/egress-validation): Step 3b's DNS check passes
+        // only because it runs before this ruleset is applied.
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains(&format!("ip daddr {HOST_LOOPBACK_ADDR} tcp dport 53 accept")));
+        assert!(rules.contains(&format!("ip daddr {HOST_LOOPBACK_ADDR} udp dport 53 accept")));
+    }
+
+    #[test]
     fn firewall_rules_are_scoped_to_a_distinctly_named_table() {
         let rules = build_egress_firewall_rules("pasta0", proxy_addr());
         assert!(rules.contains(&format!("table inet {FIREWALL_TABLE}")));
+    }
+
+    #[test]
+    fn firewall_rules_dnat_the_guests_own_tls_port_to_the_proxy() {
+        // Without this, the guest's own `curl https://` dials the real
+        // destination IP on 443, which matches neither filter-table accept
+        // rule and is dropped -- including for allowlisted destinations.
+        // `crate::proxy` is a transparent SNI relay with no CONNECT/
+        // explicit-proxy mode, so this redirect is the only way a guest's
+        // ordinary outbound connection ever reaches it.
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains("type nat hook output"));
+        // `dnat ip to`, not bare `dnat to` -- confirmed on real hardware
+        // that nft rejects the bare form in an `inet`-family table as
+        // ambiguous between IPv4 and IPv6 ("specify `dnat ip' or 'dnat
+        // ip6' in inet table to disambiguate").
+        assert!(rules.contains(&format!("tcp dport 443 dnat ip to {HOST_LOOPBACK_ADDR}:8443")));
+    }
+
+    #[test]
+    fn firewall_rules_nat_table_is_scoped_to_the_pasta_interface() {
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains("oifname \"pasta0\" tcp dport 443 dnat"));
+    }
+
+    #[test]
+    fn firewall_rules_dnat_disambiguates_the_address_family() {
+        // Confirmed on real hardware: nft rejects a bare `dnat to` in an
+        // `inet`-family table (which spans both IPv4 and IPv6) as
+        // ambiguous, even though proxy_addr is unambiguously IPv4 here.
+        let rules = build_egress_firewall_rules("pasta0", proxy_addr());
+        assert!(rules.contains("dnat ip to"));
+        assert!(!rules.contains("dnat to"));
     }
 }
