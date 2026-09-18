@@ -108,8 +108,8 @@ driver.
   background threads for the life of the `habitat run` process and are
   reclaimed when that process exits after teardown completes. Only the
   host-visible resources teardown is actually responsible for --
-  the podman container, the disk image, the session SSH keypair, and the
-  session's nftables rules -- are explicitly removed.
+  the podman container, the session's staging directory, the session SSH
+  keypair, and the session's nftables rules -- are explicitly removed.
 - `audit: disabled` (`habitat_policy::config::ProjectConfig::audit`,
   Phase 7's other new config key) only suppresses the audit trail's
   routine/low-signal events (`EventKind::is_suppressible_when_audit_disabled`

@@ -118,11 +118,11 @@ the container engine/runtime choice itself.
   connection or background process (`AGENTS.md` Section 2, invariant 1) --
   an SSH command that returns is exactly as discrete as a `podman exec`
   that returns.
-- `ssh`/`scp` join `git`, `mke2fs`, and `debugfs` as host-side tools this
-  project assumes are present rather than preflight-checking for
-  (`crates/install::checks` does not check for `git` either) -- a gap
-  worth closing when `habitat install`'s check list is next revisited,
-  not a blocker for this decision.
+- `ssh`/`scp` join `git` as host-side tools this project assumes are
+  present rather than preflight-checking for (`crates/install::checks`
+  does not check for `git` either) -- a gap worth closing when `habitat
+  install`'s check list is next revisited, not a blocker for this
+  decision.
 - `tests/manual/validate-vm-launch.sh`, `validate-sync.sh`, and
   `validate-egress.sh` all update their guest-interaction steps from
   `podman exec` to SSH, since every one of them was silently relying on

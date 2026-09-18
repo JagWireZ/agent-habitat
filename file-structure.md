@@ -13,7 +13,7 @@ implements, and `docs/plan.md` for what each domain is responsible for.
 |-- crates/                 # all `habitat` code, one crate per domain
 |   |-- cli/                # habitat-cli   -- the `habitat` binary entrypoint
 |   |-- install/            # habitat-install -- `habitat install` + preflight checks
-|   |-- workspace/          # habitat-workspace -- secrets blocklist, disk-build, two-point sync
+|   |-- workspace/          # habitat-workspace -- secrets blocklist, staging-directory build, two-point sync
 |   |-- vm/                 # habitat-vm    -- rootless Podman + krun runtime launch, session lifecycle
 |   |-- egress/             # habitat-egress -- local proxy, default-deny allowlist enforcement
 |   |-- audit/              # habitat-audit -- unified boundary audit log

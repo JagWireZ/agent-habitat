@@ -28,7 +28,7 @@ isn't, even though it looks like one.
 **Important scoping note:** the two-point host<->sandbox sync mechanism
 this decision partly depends on (Phase 4 of
 `tmp/wip/implementation-plan.md`, `docs/plan.md` Section 2.2) is not built
-yet -- only the Phase 2 disk-build pipeline (a single, one-shot build) 
+yet -- only the Phase 2 staging-build pipeline (a single, one-shot build)
 exists today. Per AGENTS.md Section 9 ("if a mechanism seems missing, look
 for it before building a substitute... stub it minimally and say so
 explicitly"), this ADR records the intended design for the sync-dependent
@@ -39,8 +39,8 @@ call.
 
 ## Decision
 
-1. **Snapshot once, at session start, before the first disk image is
-   built.** `crates/workspace::pipeline::build` resolves and merges the
+1. **Snapshot once, at session start, before the staging directory is
+   first built.** `crates/workspace::pipeline::build` resolves and merges the
    effective content-scan ruleset exactly once per build
    (`habitat_policy::secrets_scan::load_effective_ruleset`), writes it to
    `BuildRequest::content_ruleset_path`, and every content scan for that

@@ -31,17 +31,21 @@ manager, a real `sudo` prompt).
   8's validation run-book.
 
 - `validate-vm-launch.sh` -- Phase 3's real-hardware exit gate: launches
-  a real session through Podman + `krun` against a throwaway disk image,
-  then runs the three required escape attempts (host files, host
-  processes, host network namespace) itself, against the still-live
+  a real session through Podman + `krun` against a throwaway staging
+  directory, then runs the three required escape attempts (host files,
+  host processes, host network namespace) itself, against the still-live
   session, capturing real output on both sides -- not printed as
   instructions for a human to copy into a second terminal (an earlier
   version did that, and teardown ran before anyone had a window to act
-  on it). Only the network-route comparison still needs a human's
-  judgment. Confirms teardown leaves no residual container or disk
-  image, and doubles as the confirmation (or correction) point for
-  `launcher.rs`'s `WORKSPACE_DISK_ANNOTATION` real-hardware caveat.
-  Reused, not duplicated, at Phase 8's validation run-book.
+  on it). Also checks, from inside the guest, that `/workspace` is
+  actually populated and writable as the `habitat` user -- the exact gap
+  that let the original `virtio-blk` attachment mechanism ship broken
+  unnoticed (see `docs/decisions/0005-storage-layer.md`'s Correction).
+  Only the network-route comparison still needs a human's judgment.
+  Confirms teardown leaves no residual container or staging directory,
+  and doubles as the confirmation (or correction) point for
+  `launcher.rs`'s bind-mount flag's real-hardware caveats. Reused, not
+  duplicated, at Phase 8's validation run-book.
 
 - `validate-sync.sh` -- Phase 4's real-hardware exit gate: the one part
   of the two-point sync mechanism (`habitat_workspace::sync`) that needs
@@ -64,7 +68,8 @@ manager, a real `sudo` prompt).
   Also the confirmation (or correction) point for `network_setup.rs`'s
   `--network pasta` and nftables-ruleset real-hardware caveats, same
   "confirmed wrong on real hardware, then fixed" pattern as
-  `validate-vm-launch.sh`'s `WORKSPACE_DISK_ANNOTATION` caveat.
+  `validate-vm-launch.sh`'s bind-mount-vs-`virtio-blk` caveat
+  (`docs/decisions/0005-storage-layer.md`'s Correction).
   Everything in this phase's exit gate that doesn't need a booted guest
   (the SNI-based allow/deny decision itself, the relay, the DNS
   forwarder, the argv/ruleset construction) is exercised for real over

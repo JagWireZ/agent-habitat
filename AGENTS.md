@@ -21,8 +21,8 @@ isn't it. It has two separate locks, kept conceptually distinct:
   host.
 - **The guard's rulebook** -- permissions. Rules for what's allowed to cross
   that boundary in either direction: which files get copied into the
-  sandbox's disk in the first place, what network destinations the session
-  can reach, and what comes back out.
+  sandbox's workspace in the first place, what network destinations the
+  session can reach, and what comes back out.
 
 Never conflate the two. A change that tightens the allowlist or the secrets
 blocklist is not a substitute for a containment gap, and vice versa.
@@ -64,18 +64,28 @@ These hold regardless of which part of the system you're touching. If a
 task seems to require violating one, stop and flag it rather than
 proceeding.
 
-1. **No live, always-on file-sharing process between host and sandbox.**
-   Syncing happens only at two well-defined moments -- host to sandbox
-   before each prompt, sandbox to host after each tool call -- via the same
-   trusted patch mechanism used for final promotion. Don't build a
-   continuously-mounted live share; that reintroduces the background
-   bridging process this design deliberately avoids.
-2. **No filename-based masking applied after the sandbox's disk already
-   exists.** The secrets blocklist (`.env`, `*.pem`, `*.key`, `id_rsa*`,
-   cloud credential files, and similar) is applied *before* anything is
-   copied in, including the very first copy that builds the disk. If a
-   path shouldn't be visible to the guest, it's never included -- it's not
-   hidden after the fact.
+1. **The real project directory is never live-shared.** It is never
+   bind-mounted, never a direct link, and never otherwise continuously
+   exposed to the guest -- the two sync moments (host to sandbox before
+   each prompt, sandbox to host after each tool call, via the same trusted
+   patch mechanism used for final promotion) are the only path for a
+   change to it to reach, or come from, the sandbox. The disposable
+   staging copy is a different matter: it is intentionally, continuously
+   bind-mounted into the guest for the life of the session, but it is only
+   ever populated in the first place via the existing blocklist-gated
+   pipeline, never by a live link back to the real directory. Continuous
+   write access to that disposable copy is an accepted, deliberate
+   narrowing of the original "no live channel at all" guarantee -- stated
+   here plainly, not left implied -- not an oversight or a loophole to
+   close. Don't build a continuously-mounted live share *of the real
+   project directory*; that would reintroduce the background bridging
+   process this design deliberately avoids.
+2. **No filename-based masking applied after the sandbox's workspace
+   already exists.** The secrets blocklist (`.env`, `*.pem`, `*.key`,
+   `id_rsa*`, cloud credential files, and similar) is applied *before*
+   anything is copied in, including the very first copy that builds the
+   staging directory. If a path shouldn't be visible to the guest, it's
+   never included -- it's not hidden after the fact.
 3. **The diff/patch produced by the trusted host-side sync mechanism is the
    authoritative change record -- never the agent's own transcript.** The
    transcript is always labeled supplementary, wherever it's referenced,
@@ -103,9 +113,10 @@ proceeding.
 8. **VM/kernel containment and the secrets blocklist are independent
    mechanisms, both required.** Containment stops a compromised guest from
    reaching outside the VM. The blocklist stops sensitive files from being
-   included in the sandbox's disk at all, even though everything else on
-   that disk is fully readable/writable by the agent. Neither substitutes
-   for the other; don't drop one because the other seems to cover it.
+   included in the sandbox's workspace at all, even though everything else
+   in that workspace is fully readable/writable by the agent. Neither
+   substitutes for the other; don't drop one because the other seems to
+   cover it.
 9. **Git history exposure is an explicit, default-off toggle in the checked-
    in config file** -- synthetic repo by default, real `.git` shared
    read-only only when a project turns that on. Never silently expose real

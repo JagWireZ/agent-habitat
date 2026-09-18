@@ -19,8 +19,9 @@ current, standalone decision for its layer.
   the guest a real virtual network interface; default-deny egress,
   filtered by destination at the local proxy.
 - [`0005-storage-layer.md`](0005-storage-layer.md) -- disposable
-  per-session raw disk image attached as a `virtio-blk` block device; no
-  live share.
+  per-session staging directory, bind-mounted into the guest at
+  `/workspace` (corrected 2026-09-18; originally a raw disk image attached
+  as a `virtio-blk` block device -- see that file's "Correction" section).
 - [`0006-distribution-packaging-layer.md`](0006-distribution-packaging-layer.md)
   -- `habitat` ships as prebuilt binaries/native packages, not built from
   source by operators.
