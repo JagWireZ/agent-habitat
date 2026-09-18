@@ -29,7 +29,7 @@ use habitat_vm::guest_ssh;
 use habitat_vm::launcher;
 use habitat_vm::session::{LaunchRequest, SessionId};
 use habitat_workspace::command_runner::CommandRunner as WsCommandRunner;
-use habitat_workspace::guest_exec::{GuestEndpoint, GuestExecRunner};
+use habitat_workspace::guest_exec::{self, GuestEndpoint, GuestExecRunner};
 use habitat_workspace::pipeline::{self, BuildRequest};
 use habitat_workspace::sync::{
     self, FlaggedPatchStore, HostToSandboxRequest, SandboxToHostRequest, SyncOutcome,
@@ -38,15 +38,6 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// This session's disposable workspace disk size, absent a per-project
-/// override in the config schema (none exists yet -- `resource_limits`
-/// covers CPU/memory only, per Phase 3's own note that a separate disk-cap
-/// field would just be a second place to keep in sync with the image
-/// itself). A judgment call, recorded rather than silently picked: big
-/// enough for a typical project checkout plus working room, small enough
-/// to build quickly every session.
-pub const DEFAULT_IMAGE_SIZE_MB: u64 = 4096;
 
 /// Default path `habitat run` looks for a project config file at, absent
 /// `--config`. Matches `docs/plan.md` Section 2.5's example
@@ -66,55 +57,103 @@ pub struct AgentInvocation {
     pub args: Vec<String>,
 }
 
+/// What `habitat run` does once the sandbox is up: either drop the
+/// operator into an interactive shell inside it, or run a named agent in
+/// the discrete, one-shot prompt loop (`docs/decisions/
+/// 0009-run-driver-prompt-loop.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunMode {
+    Shell,
+    Agent(AgentInvocation),
+}
+
 /// Parsed `habitat run` arguments (everything after the `run` subcommand
 /// word itself, including any `--verbose`/`-v` that landed after it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunArgs {
     pub config_path: PathBuf,
-    pub agent: AgentInvocation,
+    pub mode: RunMode,
 }
 
-/// Parses `habitat run`'s own arguments: an optional `--config <path>`
-/// before `--`, then the agent command after it. `--verbose`/`-v` may
-/// appear anywhere before `--` (already handled separately by
-/// `main`'s own global flag scan) and are otherwise ignored here.
-pub fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
-    let sep = args.iter().position(|a| a == "--").ok_or_else(|| {
-        "expected '--' followed by the agent command, e.g. `habitat run -- claude-code`"
-            .to_string()
-    })?;
-    let (head, tail) = args.split_at(sep);
-    let agent_argv = &tail[1..];
-    let (program, rest) = agent_argv.split_first().ok_or_else(|| {
-        "expected an agent command after '--', e.g. `habitat run -- claude-code`".to_string()
-    })?;
+/// Maps a named agent shorthand (`habitat run claude`) to the actual
+/// guest-side binary the one-shot prompt loop invokes. `--
+/// <program> [args...]` remains the escape hatch for any other agent
+/// binary that supports the same one-shot invocation mode.
+fn known_agent_binary(name: &str) -> Option<&'static str> {
+    match name {
+        "claude" => Some("claude-code"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        _ => None,
+    }
+}
 
+/// The named agent shorthands `habitat run` accepts, for error messages.
+const KNOWN_AGENT_NAMES: &[&str] = &["claude", "codex", "opencode"];
+
+/// Parses `habitat run`'s own arguments: an optional `--config <path>`,
+/// then either nothing (interactive shell), a named agent shorthand
+/// (`claude`/`codex`/`opencode`) plus its own args, or `--
+/// <program> [args...]` for an arbitrary agent command. `--verbose`/`-v`
+/// may appear anywhere before the mode-selecting token (already handled
+/// separately by `main`'s own global flag scan) and are otherwise
+/// ignored here.
+pub fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut i = 0;
-    while i < head.len() {
-        match head[i].as_str() {
+    while i < args.len() {
+        match args[i].as_str() {
             "--config" => {
-                let value = head
-                    .get(i + 1)
-                    .ok_or_else(|| "--config requires a path argument".to_string())?;
+                let value = match args.get(i + 1) {
+                    Some(v) if v != "--" => v,
+                    _ => return Err("--config requires a path argument".to_string()),
+                };
                 config_path = PathBuf::from(value);
                 i += 2;
             }
             "--verbose" | "-v" => i += 1,
-            other => {
+            "--" => {
+                let agent_argv = &args[i + 1..];
+                let (program, rest) = agent_argv.split_first().ok_or_else(|| {
+                    "expected an agent command after '--', e.g. `habitat run -- my-agent`"
+                        .to_string()
+                })?;
+                return Ok(RunArgs {
+                    config_path,
+                    mode: RunMode::Agent(AgentInvocation {
+                        program: program.clone(),
+                        args: rest.to_vec(),
+                    }),
+                });
+            }
+            other if other.starts_with('-') => {
                 return Err(format!(
-                    "unrecognized argument '{other}' before '--' (expected '--config <path>')"
-                ))
+                    "unrecognized argument '{other}' (expected '--config <path>', an agent \
+                     name ({}), or '-- <command>')",
+                    KNOWN_AGENT_NAMES.join("/")
+                ));
+            }
+            name => {
+                let program = known_agent_binary(name).ok_or_else(|| {
+                    format!(
+                        "unknown agent '{name}' (expected one of: {}, or '-- <command>' for a \
+                         custom agent)",
+                        KNOWN_AGENT_NAMES.join(", ")
+                    )
+                })?;
+                return Ok(RunArgs {
+                    config_path,
+                    mode: RunMode::Agent(AgentInvocation {
+                        program: program.to_string(),
+                        args: args[i + 1..].to_vec(),
+                    }),
+                });
             }
         }
     }
-
     Ok(RunArgs {
         config_path,
-        agent: AgentInvocation {
-            program: program.clone(),
-            args: rest.to_vec(),
-        },
+        mode: RunMode::Shell,
     })
 }
 
@@ -132,9 +171,6 @@ impl SessionPaths {
     }
     pub fn staging_dir(&self) -> PathBuf {
         self.state_dir.join("staging")
-    }
-    pub fn image_path(&self) -> PathBuf {
-        self.state_dir.join("session.img")
     }
     pub fn content_ruleset_path(&self) -> PathBuf {
         self.state_dir.join("effective-betterleaks.toml")
@@ -154,6 +190,18 @@ impl SessionPaths {
     }
 }
 
+/// Removes the whole session state dir (staging copy, mirror, keys) on
+/// every exit path -- success, early return, or panic --
+/// instead of relying on each call site in `main.rs` to clean up, which
+/// previously leaked every session's state into tmpfs `/tmp` (a leftover
+/// staging dir per crashed/failed run, exhausting the per-user tmpfs
+/// quota).
+impl Drop for SessionPaths {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.state_dir);
+    }
+}
+
 /// Builds this session's disk-build request from a loaded project config
 /// -- pure mapping, no I/O of its own (Phase 7 Task 3: confirm every
 /// `ProjectConfig` field actually reaches its consumer).
@@ -161,8 +209,6 @@ pub fn build_request<'a>(project_root: &'a Path, paths: &SessionPaths, config: &
     BuildRequest {
         project_root,
         staging_dir: paths.staging_dir(),
-        image_path: paths.image_path(),
-        image_size_mb: DEFAULT_IMAGE_SIZE_MB,
         project_config: config.clone(),
         content_ruleset_path: paths.content_ruleset_path(),
     }
@@ -189,7 +235,11 @@ pub fn launch_request(
 ) -> LaunchRequest {
     LaunchRequest {
         session_id,
-        workspace_disk_path: paths.image_path(),
+        // Stopgap: the disk image is gone (task 2 of the bind-mount
+        // migration), but the launcher still expects
+        // `workspace_disk_path` to name something on disk until task 3
+        // rewires it to bind-mount `staging_dir` directly.
+        workspace_disk_path: paths.staging_dir(),
         guest_image,
         resource_limits: config.resource_limits.clone(),
         egress_proxy_addr,
@@ -338,6 +388,137 @@ where
     }
 
     Ok(summary)
+}
+
+/// How often the background sync loop runs while an interactive shell
+/// session ([`run_shell_session`]) is open. A raw shell has no "prompt"
+/// boundary to sync around, so a fixed interval stands in for it --
+/// chosen to keep changes visible on both sides without spamming a
+/// git/ssh round-trip on an idle shell.
+pub const SHELL_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What an interactive shell session did, for the caller to report.
+#[derive(Debug, Clone, Copy)]
+pub struct ShellSessionOutcome {
+    pub shell_exit_success: bool,
+}
+
+/// Runs an interactive shell session for one launched sandbox
+/// (`habitat run` with no agent named): syncs host->sandbox once, opens a
+/// real PTY-attached `ssh` session with the operator's own terminal
+/// attached (not a captured `CommandRunner` invocation) so they get a
+/// normal interactive shell inside `sync::GUEST_WORKSPACE_DIR`, keeps
+/// host<->sandbox sync running in the background on [`SHELL_SYNC_INTERVAL`]
+/// for the life of that shell, then runs one final sandbox->host sync
+/// once the shell exits.
+///
+/// Unlike [`run_prompt_loop`] (one discrete sync round per agent turn),
+/// there is no prompt boundary for a raw shell to sync around, so this
+/// bookends the whole session with sync at start/end and fills the gap
+/// with a periodic background sync instead of a live, continuously-
+/// mounted share (AGENTS.md invariant 1 still holds: each tick is its
+/// own discrete host->sandbox + sandbox->host round through the same
+/// `sync` API the prompt loop uses, not a persistent channel -- the PTY
+/// itself carries only terminal I/O, never a file share).
+pub fn run_shell_session<WH, WG, A>(
+    project_root: &Path,
+    paths: &SessionPaths,
+    guest: GuestEndpoint<'_>,
+    patterns: &[String],
+    host_runner: &WH,
+    guest_runner: &WG,
+    audit: &A,
+) -> Result<ShellSessionOutcome, RunError>
+where
+    WH: WsCommandRunner + Sync,
+    WG: WsCommandRunner + Sync,
+    A: AuditSink + Sync,
+{
+    ensure_mirror_initialized(&paths.mirror_dir(), host_runner)?;
+    let flagged_store = FlaggedPatchStore::new(paths.flagged_dir());
+    let mirror_dir = paths.mirror_dir();
+
+    let sync_round = || -> Result<(), RunError> {
+        let host_request = HostToSandboxRequest {
+            project_root,
+            mirror_dir: &mirror_dir,
+            guest,
+            patterns,
+            flagged_store: &flagged_store,
+        };
+        sync::sync_host_to_sandbox(&host_request, host_runner, guest_runner, audit)
+            .map_err(|e| run_err(format!("host->sandbox sync failed: {e}")))?;
+
+        let sandbox_request = SandboxToHostRequest {
+            project_root,
+            mirror_dir: &mirror_dir,
+            guest,
+            patterns,
+            flagged_store: &flagged_store,
+        };
+        sync::sync_sandbox_to_host(&sandbox_request, host_runner, guest_runner, audit)
+            .map_err(|e| run_err(format!("sandbox->host sync failed: {e}")))?;
+        Ok(())
+    };
+
+    // Initial sync before the shell opens, so the guest starts from the
+    // operator's current working tree.
+    sync_round()?;
+
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let shell_result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(SHELL_SYNC_INTERVAL);
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                // Best-effort: a flagged/failed periodic tick is not fatal
+                // to the still-open interactive shell -- the final sync
+                // after the shell exits still runs, and per-round failures
+                // are already visible via `audit`.
+                let _ = sync_round();
+            }
+        });
+
+        let result = spawn_interactive_shell(&guest);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        result
+    });
+
+    // Final sync once the shell exits, to catch anything the last
+    // periodic tick missed.
+    sync_round()?;
+
+    Ok(ShellSessionOutcome {
+        shell_exit_success: shell_result?,
+    })
+}
+
+/// Opens a real interactive `ssh` session against the guest, with the
+/// operator's own terminal (stdin/stdout/stderr) attached via `-tt`
+/// (force PTY allocation) -- not the captured-`Output` `CommandRunner`
+/// seam every other guest interaction uses, since that seam has no way to
+/// stream a live terminal. Blocks until the operator exits the shell.
+fn spawn_interactive_shell(guest: &GuestEndpoint<'_>) -> Result<bool, RunError> {
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new("ssh");
+    cmd.args(guest_exec::ssh_option_args(guest));
+    cmd.arg("-tt");
+    cmd.arg(format!("{}@{}", guest_exec::GUEST_SSH_USER, guest.host));
+    cmd.arg(format!(
+        "cd {} && exec $SHELL -l",
+        guest_exec::shell_quote(sync::GUEST_WORKSPACE_DIR)
+    ));
+    cmd.stdin(Stdio::inherit());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let status = cmd
+        .status()
+        .map_err(|e| run_err(format!("could not start interactive shell: {e}")))?;
+    Ok(status.success())
 }
 
 /// Everything the full session driver needs, bundled so
@@ -668,32 +849,93 @@ mod tests {
     }
 
     #[test]
-    fn parses_minimal_run_args() {
-        let parsed = parse_run_args(&args(&["--", "claude-code"])).unwrap();
+    fn parses_minimal_run_args_with_custom_agent_separator() {
+        let parsed = parse_run_args(&args(&["--", "my-agent"])).unwrap();
         assert_eq!(parsed.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
-        assert_eq!(parsed.agent.program, "claude-code");
-        assert!(parsed.agent.args.is_empty());
+        assert_eq!(
+            parsed.mode,
+            RunMode::Agent(AgentInvocation {
+                program: "my-agent".to_string(),
+                args: vec![],
+            })
+        );
     }
 
     #[test]
-    fn parses_config_flag_and_agent_args() {
+    fn parses_config_flag_and_agent_args_with_separator() {
         let parsed = parse_run_args(&args(&[
             "--config",
             "sandbox.yaml",
             "--",
-            "claude-code",
+            "my-agent",
             "--print",
         ]))
         .unwrap();
         assert_eq!(parsed.config_path, PathBuf::from("sandbox.yaml"));
-        assert_eq!(parsed.agent.program, "claude-code");
-        assert_eq!(parsed.agent.args, vec!["--print".to_string()]);
+        assert_eq!(
+            parsed.mode,
+            RunMode::Agent(AgentInvocation {
+                program: "my-agent".to_string(),
+                args: vec!["--print".to_string()],
+            })
+        );
     }
 
     #[test]
-    fn missing_separator_is_an_error() {
-        let err = parse_run_args(&args(&["--config", "sandbox.yaml"])).unwrap_err();
-        assert!(err.contains("--"));
+    fn no_agent_and_no_separator_is_shell_mode() {
+        let parsed = parse_run_args(&args(&[])).unwrap();
+        assert_eq!(parsed.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert_eq!(parsed.mode, RunMode::Shell);
+    }
+
+    #[test]
+    fn config_flag_alone_is_still_shell_mode() {
+        let parsed = parse_run_args(&args(&["--config", "sandbox.yaml"])).unwrap();
+        assert_eq!(parsed.config_path, PathBuf::from("sandbox.yaml"));
+        assert_eq!(parsed.mode, RunMode::Shell);
+    }
+
+    #[test]
+    fn named_agent_shorthand_maps_to_its_binary() {
+        let parsed = parse_run_args(&args(&["claude"])).unwrap();
+        assert_eq!(
+            parsed.mode,
+            RunMode::Agent(AgentInvocation {
+                program: "claude-code".to_string(),
+                args: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn named_agent_shorthand_forwards_its_own_args() {
+        let parsed = parse_run_args(&args(&["codex", "--print"])).unwrap();
+        assert_eq!(
+            parsed.mode,
+            RunMode::Agent(AgentInvocation {
+                program: "codex".to_string(),
+                args: vec!["--print".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn opencode_shorthand_maps_to_its_own_binary() {
+        let parsed = parse_run_args(&args(&["opencode"])).unwrap();
+        assert_eq!(
+            parsed.mode,
+            RunMode::Agent(AgentInvocation {
+                program: "opencode".to_string(),
+                args: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_agent_name_is_an_error() {
+        let err = parse_run_args(&args(&["some-unknown-agent"])).unwrap_err();
+        assert!(err.contains("some-unknown-agent"));
+        assert!(err.contains("claude"));
     }
 
     #[test]
@@ -704,22 +946,27 @@ mod tests {
 
     #[test]
     fn missing_config_value_is_an_error() {
-        // `--` is the separator, not consumable as `--config`'s value --
-        // `head` (everything before the separator) ends right after
-        // `--config` here, so there's nothing left for it to take.
+        // `--` can't double as `--config`'s value, since it's reserved as
+        // the custom-agent separator.
         let err = parse_run_args(&args(&["--config", "--", "claude-code"])).unwrap_err();
         assert!(err.contains("--config"));
     }
 
     #[test]
-    fn ignores_verbose_flags_before_the_separator() {
-        let parsed = parse_run_args(&args(&["--verbose", "--", "claude-code"])).unwrap();
-        assert_eq!(parsed.agent.program, "claude-code");
+    fn ignores_verbose_flags_before_the_mode_token() {
+        let parsed = parse_run_args(&args(&["--verbose", "--", "my-agent"])).unwrap();
+        assert_eq!(
+            parsed.mode,
+            RunMode::Agent(AgentInvocation {
+                program: "my-agent".to_string(),
+                args: vec![],
+            })
+        );
     }
 
     #[test]
-    fn unrecognized_flag_before_separator_is_an_error() {
-        let err = parse_run_args(&args(&["--bogus", "--", "claude-code"])).unwrap_err();
+    fn unrecognized_flag_is_an_error() {
+        let err = parse_run_args(&args(&["--bogus"])).unwrap_err();
         assert!(err.contains("--bogus"));
     }
 

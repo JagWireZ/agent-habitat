@@ -1,11 +1,10 @@
-//! `habitat-workspace` -- the disk-build pipeline and the two-point sync.
+//! `habitat-workspace` -- the staging pipeline and the two-point sync.
 //!
 //! [`pipeline::build`] sequences [`staging`] (project copy, filtered
 //! through `habitat_policy::blocklist`/`config` *before* the disposable
-//! disk exists -- AGENTS.md Section 2, invariant 2), [`gitseed`] (synthetic
-//! repo by default, or the real `.git` read-only per
-//! `habitat_policy::git_history`, failing closed), and [`diskimage`]
-//! (assembles the raw disk image, `docs/decisions/0005-storage-layer.md`).
+//! staging directory is bind-mounted into the guest -- AGENTS.md Section 2,
+//! invariant 2) and [`gitseed`] (synthetic repo by default, or the real
+//! `.git` read-only per `habitat_policy::git_history`, failing closed).
 //!
 //! [`sync`] implements the two-point host<->sandbox sync -- host->sandbox
 //! before each prompt, sandbox->host after each tool call, both via
@@ -23,7 +22,6 @@
 
 pub mod command_runner;
 pub mod content_scan;
-pub mod diskimage;
 pub mod gitseed;
 pub mod guest_exec;
 pub mod patch;

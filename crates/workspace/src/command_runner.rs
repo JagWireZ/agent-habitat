@@ -1,12 +1,12 @@
-//! Seam between this crate's disk-build pipeline and the external
-//! commands it shells out to (`git`, `mke2fs`, `debugfs`), mirroring
-//! `habitat-install`'s `Environment` seam so error-handling paths can be
-//! unit-tested without actually breaking those tools on the test machine.
+//! Seam between this crate's staging pipeline and the external commands
+//! it shells out to (`git`), mirroring `habitat-install`'s `Environment`
+//! seam so error-handling paths can be unit-tested without actually
+//! breaking those tools on the test machine.
 //!
-//! Unlike `habitat-install`'s KVM/Podman/krun checks, `git`/e2fsprogs have
-//! no real-hardware dependency, so exit-gate and adversarial tests run
-//! them for real via `SystemCommandRunner`; `FakeCommandRunner` is only
-//! for unit tests that need to exercise a command failing.
+//! Unlike `habitat-install`'s KVM/Podman/krun checks, `git` has no
+//! real-hardware dependency, so exit-gate and adversarial tests run it
+//! for real via `SystemCommandRunner`; `FakeCommandRunner` is only for
+//! unit tests that need to exercise a command failing.
 
 use std::io;
 use std::process::Output;

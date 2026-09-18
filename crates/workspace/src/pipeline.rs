@@ -1,13 +1,12 @@
-//! Top-level orchestration for the disk-build pipeline: project copy ->
-//! blocklist filter -> git-history seed -> disk image assembly. Just
-//! sequences the other modules in this crate.
+//! Top-level orchestration for the staging pipeline: project copy ->
+//! blocklist filter -> git-history seed. Just sequences the other modules
+//! in this crate.
 //!
 //! Order is fixed: the git-history toggle is resolved *before* anything
 //! is staged, so an invalid/unapproved toggle stops the whole build
 //! before the staging directory is ever created.
 
 use crate::command_runner::CommandRunner;
-use crate::diskimage::{self, DiskImageError};
 use crate::gitseed::{self, GitSeedError};
 use crate::staging::{self, ContentScanConfig, StagingReport};
 use habitat_policy::blocklist;
@@ -23,7 +22,6 @@ pub enum BuildError {
     ContentRulesWrite(String),
     Staging(String),
     GitSeed(GitSeedError),
-    DiskImage(DiskImageError),
 }
 
 impl std::fmt::Display for BuildError {
@@ -34,19 +32,17 @@ impl std::fmt::Display for BuildError {
             BuildError::ContentRulesWrite(msg) => write!(f, "content-scan ruleset: {msg}"),
             BuildError::Staging(msg) => write!(f, "staging: {msg}"),
             BuildError::GitSeed(e) => write!(f, "{e}"),
-            BuildError::DiskImage(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for BuildError {}
 
-/// Everything needed to build one session's disk from one project.
+/// Everything needed to build one session's staging directory from one
+/// project.
 pub struct BuildRequest<'a> {
     pub project_root: &'a Path,
     pub staging_dir: PathBuf,
-    pub image_path: PathBuf,
-    pub image_size_mb: u64,
     pub project_config: ProjectConfig,
     /// Where to write this build's resolved, merged content-scan ruleset
     /// (see `habitat_policy::secrets_scan::load_effective_ruleset`). Only
@@ -62,7 +58,6 @@ pub struct BuildRequest<'a> {
 pub struct BuildOutcome {
     pub git_history_mode: GitHistoryMode,
     pub staging_report: StagingReport,
-    pub image_path: PathBuf,
 }
 
 /// Runs the full pipeline. Fails closed at the first failing stage --
@@ -129,17 +124,8 @@ pub fn build<R: CommandRunner>(
         }
     }
 
-    diskimage::assemble_disk_image(
-        &request.staging_dir,
-        &request.image_path,
-        request.image_size_mb,
-        runner,
-    )
-    .map_err(BuildError::DiskImage)?;
-
     Ok(BuildOutcome {
         git_history_mode,
         staging_report,
-        image_path: request.image_path.clone(),
     })
 }
