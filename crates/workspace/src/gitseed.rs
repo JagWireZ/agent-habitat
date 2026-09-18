@@ -1,45 +1,33 @@
 //! Seeds the staging directory's git state, per the resolved
 //! [`habitat_policy::git_history::GitHistoryMode`]:
 //!
-//! - `Synthetic` (default): a brand-new repo, seeded with just the
-//!   current staged files, committed under a fixed synthetic identity --
-//!   never the operator's own name/email, so nothing personally
-//!   identifying leaks into history the agent can read (AGENTS.md
-//!   Section 2 invariant 9, `docs/plan.md` Section 2.2).
-//! - `RealHistoryReadOnly`: the project's real `.git` directory is copied
-//!   into staging verbatim, then everything under it is made read-only at
-//!   the filesystem level as defense in depth. **This is not the
-//!   authoritative enforcement point** -- the real, authoritative
-//!   read-only guarantee is the guest-side mount option Phase 3 attaches
-//!   this disk with; this module's chmod pass is a best-effort mirror of
-//!   that intent inside the staging artifact, not a substitute for it.
+//! - `Synthetic` (default): a brand-new repo, seeded with the current
+//!   staged files, committed under a fixed synthetic identity -- never
+//!   the operator's own name/email (AGENTS.md Section 2 invariant 9).
+//! - `RealHistoryReadOnly`: the project's real `.git` is copied into
+//!   staging verbatim, then made read-only as defense in depth. The
+//!   authoritative read-only guarantee is the guest-side mount option;
+//!   this chmod pass is a best-effort mirror, not a substitute.
 //!
-//! Either way, this only ever touches `.git` -- the ordinary file walk in
-//! `crate::staging` already applied the blocklist to every other file
-//! before this runs.
+//! Either way, this only ever touches `.git` -- `crate::staging` already
+//! applied the blocklist to every other file.
 
 use crate::command_runner::CommandRunner;
 use std::io;
 use std::path::Path;
 
 /// A fixed, non-identifying author/committer used for every synthetic
-/// commit -- deliberately not the real operator's name or email, so the
-/// agent's own `git log` never surfaces anything personal. `pub(crate)`
-/// so `crate::sync`'s host-side mirror commits (Phase 4) use the exact
-/// same identity as the initial seed, rather than a second, subtly
-/// different constant.
+/// commit, so the agent's own `git log` never surfaces anything personal.
+/// `pub(crate)` so `crate::sync`'s mirror commits reuse this exact identity.
 pub(crate) const SYNTHETIC_AUTHOR_NAME: &str = "Agent Habitat";
 pub(crate) const SYNTHETIC_AUTHOR_EMAIL: &str = "sandbox@agent-habitat.invalid";
 const SYNTHETIC_COMMIT_MESSAGE: &str = "Initial synthetic snapshot (Agent Habitat sandbox)";
 
-/// Serializes every test (in this module or `crate::sync`) that mutates
-/// the process-global `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars via
-/// [`run_git_with_identity`] -- cargo runs a crate's tests in multiple
-/// threads of the same process by default, so two such tests running
-/// concurrently could interleave their save/restore of those vars.
-/// `pub(crate)` (rather than `#[cfg(test)]`-only) so `crate::sync`'s own
-/// tests, which call the same identity-setting machinery, share this one
-/// lock instead of racing a second one.
+/// Serializes every test that mutates the process-global
+/// `GIT_AUTHOR_*`/`GIT_COMMITTER_*` env vars via [`run_git_with_identity`]
+/// -- cargo runs a crate's tests in multiple threads by default, so
+/// concurrent tests could interleave save/restore. Shared with
+/// `crate::sync`'s tests rather than a second lock.
 #[cfg(test)]
 pub(crate) static GIT_IDENTITY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -76,14 +64,9 @@ pub fn seed_synthetic<R: CommandRunner>(
 
     run_git(runner, dir, &["init", "--quiet"])?;
     run_git(runner, dir, &["add", "--all"])?;
-    // `--allow-empty`: staging can legitimately end up with nothing in it
-    // -- every file filtered by the blocklist and/or the content scanner
-    // (e.g. content scanning enabled with the scanner unavailable, which
-    // fails closed on every file -- `crate::content_scan`) is a real,
-    // if unusual, outcome, not something that should turn into a
-    // confusing "nothing to commit" git failure that masks the actual
-    // reason staging ended up empty (that reason is already recorded in
-    // `StagingReport`).
+    // --allow-empty: staging can legitimately end up empty (everything
+    // filtered by the blocklist/content scanner) -- must not turn into a
+    // confusing "nothing to commit" failure.
     run_git_with_identity(
         runner,
         dir,
@@ -99,9 +82,7 @@ pub fn seed_synthetic<R: CommandRunner>(
 }
 
 /// Copies the project's real `.git` directory into `staging_dir`
-/// verbatim, then marks everything under it read-only (see the module
-/// doc comment for why this is a best-effort mirror, not the
-/// authoritative enforcement point).
+/// verbatim, then marks everything under it read-only (see module doc).
 pub fn copy_real_history_read_only(
     project_root: &Path,
     staging_dir: &Path,
@@ -133,10 +114,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> io::Result<()> {
         let from = entry.path();
         let to = dest.join(entry.file_name());
         if file_type.is_symlink() {
-            // A real .git can contain symlinks (e.g. some hook setups);
-            // skip rather than follow, same reasoning as the ordinary
-            // staging walk in `crate::staging`.
-            continue;
+            continue; // skip rather than follow, same as crate::staging
         } else if file_type.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else {
@@ -181,22 +159,17 @@ fn run_git<R: CommandRunner>(runner: &R, dir: &str, args: &[&str]) -> Result<(),
 
 /// Same as [`run_git`], but with the fixed synthetic author/committer
 /// identity set via environment variables rather than global/repo git
-/// config -- so this never reads or depends on the operator's own
-/// `~/.gitconfig`, and never mutates it either. `pub(crate)` so
-/// `crate::sync`'s mirror-side commits (Phase 4) reuse this exact
-/// mechanism rather than re-implementing env save/restore a second time.
+/// config, so this never reads or mutates the operator's own
+/// `~/.gitconfig`. `pub(crate)` so `crate::sync`'s mirror-side commits
+/// reuse this mechanism.
 pub(crate) fn run_git_with_identity<R: CommandRunner>(
     runner: &R,
     dir: &str,
     args: &[&str],
 ) -> Result<(), GitSeedError> {
-    // `CommandRunner` doesn't carry env-var plumbing (its real
-    // implementation shells out via `std::process::Command`, which reads
-    // the *calling* process's environment by default) -- so the identity
-    // is set for the duration of this call via `std::env`, on the
-    // current process, then restored. This crate's disk-build pipeline
-    // is not expected to run these calls concurrently with other git
-    // invocations that care about author identity.
+    // CommandRunner shells out via std::process::Command, which reads the
+    // calling process's env -- so identity is set via std::env for the
+    // duration of this call, then restored.
     let restore = [
         "GIT_AUTHOR_NAME",
         "GIT_AUTHOR_EMAIL",
@@ -228,16 +201,6 @@ mod tests {
     use crate::command_runner::SystemCommandRunner;
     use std::fs;
 
-    // `seed_synthetic` mutates process-global `GIT_AUTHOR_*`/
-    // `GIT_COMMITTER_*` env vars (see `run_git_with_identity`), and cargo
-    // runs a crate's tests in multiple threads of the same process by
-    // default. Serialize every test that calls `seed_synthetic` (directly
-    // or via the pipeline) so two tests' env-var save/restore can't
-    // interleave -- same reasoning as `habitat-policy`'s `ENV_TEST_LOCK`.
-    // Defined at module scope (`super::GIT_IDENTITY_ENV_LOCK`, imported
-    // via the glob above) so `crate::sync`'s own tests share this one
-    // lock too.
-
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "habitat-workspace-gitseed-test-{name}-{}-{}",
@@ -251,9 +214,6 @@ mod tests {
         dir
     }
 
-    // `git` is ordinary, always-available tooling here (unlike KVM/podman
-    // in Phase 1) -- exercised for real, not mocked, per AGENTS.md
-    // Section 3's "verify before trusting" discipline.
     #[test]
     fn seed_synthetic_produces_a_repo_with_one_commit_under_the_synthetic_identity() {
         let _guard = GIT_IDENTITY_ENV_LOCK.lock().unwrap();
@@ -281,11 +241,6 @@ mod tests {
         fs::remove_dir_all(&staging).unwrap();
     }
 
-    /// Staging can legitimately end up empty (every file filtered out by
-    /// the blocklist and/or content scan) -- seeding a synthetic repo
-    /// over it must still succeed, not fail with a confusing "nothing to
-    /// commit" error that masks the real, already-recorded reason
-    /// staging ended up empty.
     #[test]
     fn seed_synthetic_succeeds_over_an_empty_staging_directory() {
         let _guard = GIT_IDENTITY_ENV_LOCK.lock().unwrap();

@@ -1,22 +1,9 @@
-//! Phase 5 exit-gate tests for `habitat-egress`
-//! (`tmp/wip/implementation-plan.md`).
-//!
-//! These are black-box tests of the crate's public contract with the
-//! rest of the system -- the effective allowlist actually reaching the
-//! proxy's decision, and the network-launch flags actually reflecting
-//! the proxy's own address -- run through real loopback sockets, not
-//! mocked TCP. Per `file-structure.md` Section 2 they live here under
-//! `tests/unit/egress/` rather than as inline `#[cfg(test)]` modules,
-//! since they cover this crate's contract with the rest of the system
-//! (the checked-in config, `habitat-policy`) rather than pure internal
-//! logic. Wired into `cargo test` via the `[[test]]` target in
-//! `crates/egress/Cargo.toml`.
-//!
-//! The real exit gate -- a connection trace from inside an actually
-//! booted guest, confirming the `pasta`/nftables reachability
-//! restriction this crate's `network_setup` module builds actually holds
-//! -- needs real KVM this dev container and this project's CI don't
-//! have; see `tests/manual/validate-egress.sh` for that runbook instead.
+//! Black-box tests of `habitat-egress`'s contract with the rest of the
+//! system (checked-in config, `habitat-policy`) -- run through real
+//! loopback sockets, not mocked TCP. The real exit gate -- a connection
+//! trace confirming the `pasta`/nftables reachability restriction holds
+//! from inside an actually-booted guest -- needs real KVM; see
+//! `tests/manual/validate-egress.sh` instead.
 
 use habitat_audit::MemoryAuditSink;
 use habitat_egress::dialer::testing::FakeDialer;
@@ -37,12 +24,9 @@ fn connect_and_send(addr: std::net::SocketAddr, bytes: &[u8]) -> TcpStream {
     guest
 }
 
-/// Exit gate: a project's checked-in config addition to the egress
-/// allowlist actually reaches the proxy's decision -- not just a value
-/// sitting unused in a parsed struct. Also confirms the "re-run after
-/// any allowlist ruleset change" requirement's core premise: the exact
-/// same hostname is denied before the addition and allowed after it,
-/// through the real config parser end to end.
+/// A project's checked-in config addition to the egress allowlist actually
+/// reaches the proxy's decision: the same hostname is denied before the
+/// addition and allowed after, through the real config parser end to end.
 #[test]
 fn a_project_config_addition_actually_reaches_the_proxy_decision() {
     let base_entries = egress_allowlist::effective_entries(&[]);
@@ -67,8 +51,7 @@ fn a_project_config_addition_actually_reaches_the_proxy_decision() {
         );
     }
 
-    // A project's checked-in config adds it -- parsed through the real
-    // hand-rolled config reader, not constructed as a struct literal.
+    // Parsed through the real config reader, not a struct literal.
     let parsed = config::parse("egress_allowlist_additions:\n  - internal.registry.example\n")
         .expect("valid config must parse");
     let effective_entries = egress_allowlist::effective_entries(&parsed.egress_allowlist_additions);
@@ -107,14 +90,8 @@ fn a_project_config_addition_actually_reaches_the_proxy_decision() {
     assert!(effective_entries.contains(&"pypi.org".to_string()));
 }
 
-/// Exit gate: `dns_listen_addr` (what the forwarder actually binds to)
-/// carries the proxy's real bound address, not a placeholder -- confirmed
-/// against a real `TcpListener`, not a hand-typed socket addr.
-/// `build_network_flags`'s own `--dns` value is deliberately *not* the
-/// proxy's address directly (confirmed on real hardware that doesn't
-/// work -- see `network_setup::HOST_LOOPBACK_ADDR`'s doc comment), so
-/// that half is covered by `crates/egress/src/network_setup.rs`'s own
-/// inline tests instead of duplicated here.
+/// `dns_listen_addr` carries the proxy's real bound address, confirmed
+/// against a real `TcpListener` rather than a hand-typed socket addr.
 #[test]
 fn network_flags_reflect_the_proxys_actual_bound_address() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -124,10 +101,8 @@ fn network_flags_reflect_the_proxys_actual_bound_address() {
     assert_eq!(forwarder_addr.ip(), proxy_addr.ip());
 }
 
-/// Exit gate: DNS pinning actually forwards a real query end to end --
-/// guest socket -> forwarder (bound at the address `network_setup` would
-/// hand the guest as its resolver) -> fixture upstream -> back to the
-/// guest, unmodified.
+/// DNS pinning forwards a real query end to end: guest socket -> forwarder
+/// -> fixture upstream -> back to the guest, unmodified.
 #[test]
 fn dns_forwarder_relays_a_real_query_round_trip() {
     let upstream = UdpSocket::bind("127.0.0.1:0").unwrap();

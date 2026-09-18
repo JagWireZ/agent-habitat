@@ -1,25 +1,11 @@
-//! Phase 4 exit-gate tests for `habitat-workspace::sync`
-//! (`tmp/wip/implementation-plan.md`).
-//!
-//! Per `file-structure.md` Section 2, these are black-box tests of this
-//! crate's contract with the rest of the system -- run through
-//! `sync::sync_host_to_sandbox`/`sync::sync_sandbox_to_host` exactly as a
-//! later phase's `habitat run` prompt loop would call them -- so they
-//! live here under `tests/unit/workspace/`, wired in via the `[[test]]`
-//! target in `crates/workspace/Cargo.toml`.
-//!
-//! `git` is ordinary, always-available tooling (like `crate::gitseed`'s
-//! own tests) -- exercised for real via `SystemCommandRunner` throughout.
-//! The one genuinely KVM/live-session-dependent half of this phase's exit
-//! gate -- "a live-session process inventory confirms no continuous/
-//! background sync daemon exists beyond the two discrete invocations" --
-//! needs an actually-running session, so it's `tests/manual/
-//! validate-sync.sh`'s job instead; everything here uses
-//! `FakeCommandRunner` to stand in for the guest side (`ssh`/`scp`,
-//! `docs/decisions/0008-guest-exec-channel.md` -- `podman exec`/`podman
-//! cp` through this phase's first implementation, confirmed on real
-//! hardware not to work against the `krun` runtime at all), which is
-//! exactly the seam `habitat-vm`'s own tests use for the same reason.
+//! Black-box exit-gate tests for `habitat-workspace::sync`, run through
+//! `sync::sync_host_to_sandbox`/`sync_sandbox_to_host` as `habitat run`'s
+//! prompt loop would call them. `git` runs for real via
+//! `SystemCommandRunner`; the guest side is faked via `FakeCommandRunner`
+//! (`ssh`, per `docs/decisions/0008-guest-exec-channel.md` -- `podman
+//! exec`/`podman cp` were confirmed not to work against `krun`). The
+//! "no background sync daemon" half of this exit gate needs a real
+//! running session; see `tests/manual/validate-sync.sh`.
 
 use habitat_audit::{EventKind, MemoryAuditSink};
 use habitat_policy::blocklist;
@@ -46,10 +32,9 @@ fn guest_endpoint() -> GuestEndpoint<'static> {
     }
 }
 
-/// Builds the exact `ssh ...` invocation string a `FakeCommandRunner`
-/// mock needs to key against, via the same construction
-/// `GuestExecRunner` itself uses (`habitat_workspace::guest_exec`) --
-/// never a hand-typed copy that could quietly drift from the real argv.
+/// Builds the `ssh ...` invocation string to key a `FakeCommandRunner`
+/// against, via the same construction the real runner uses -- never a
+/// hand-typed copy that could drift from the real argv.
 fn ssh_invocation(env: &[(&str, &str)], program: &str, args: &[&str]) -> String {
     let full = ssh_exec_args(&guest_endpoint(), env, program, args);
     format!("ssh {}", full.join(" "))
@@ -97,10 +82,8 @@ fn git_init_committed(dir: &std::path::Path) {
         .unwrap();
 }
 
-/// Exit gate: "nothing happens when nothing changed" -- host->sandbox
-/// side. No guest invocation is configured on the fake runner at all, so
-/// any attempt to reach the guest would fail the test via a broken
-/// `Result`, not silently succeed.
+/// Host->sandbox: no guest invocation is configured on the fake runner, so
+/// any attempt to reach the guest would fail the test.
 #[test]
 fn host_to_sandbox_no_op_when_nothing_changed() {
     let project = temp_dir("h2s-noop-project");
@@ -133,9 +116,8 @@ fn host_to_sandbox_no_op_when_nothing_changed() {
     fs::remove_dir_all(&mirror).unwrap();
 }
 
-/// Exit gate: "nothing happens when nothing changed" -- sandbox->host
-/// side. `git status --porcelain` reporting clean must stop everything
-/// right there -- no commit, no diff, no host mutation.
+/// Sandbox->host: `git status --porcelain` reporting clean must stop
+/// everything there -- no commit, no diff, no host mutation.
 #[test]
 fn sandbox_to_host_no_op_when_guest_reports_clean() {
     let project = temp_dir("s2h-noop-project");
@@ -170,9 +152,8 @@ fn sandbox_to_host_no_op_when_guest_reports_clean() {
     fs::remove_dir_all(&mirror).unwrap();
 }
 
-/// Exit gate: "injecting a corrupted/malformed patch ... is flagged, not
-/// applied" -- sandbox->host direction, simulated via a fake guest that
-/// reports a dirty tree and hands back garbage as its "diff".
+/// A corrupted/malformed patch must be flagged, not applied -- simulated
+/// via a fake guest that reports a dirty tree and hands back garbage.
 #[test]
 fn sandbox_to_host_flags_a_malformed_patch_instead_of_applying_it() {
     let project = temp_dir("s2h-malformed-project");
@@ -230,9 +211,7 @@ fn sandbox_to_host_flags_a_malformed_patch_instead_of_applying_it() {
         flagged_store: &store,
     };
 
-    // The structural check (`git apply --check`) must run for real
-    // against the real project directory -- `SystemCommandRunner` here,
-    // distinct from the faked guest-exec channel above.
+    // The structural check runs for real against the project directory.
     let host_runner = SystemCommandRunner;
     let outcome = sync::sync_sandbox_to_host(&request, &host_runner, &runner, &audit).unwrap();
     match &outcome {
@@ -260,8 +239,8 @@ fn sandbox_to_host_flags_a_malformed_patch_instead_of_applying_it() {
     fs::remove_dir_all(&flagged_dir).unwrap();
 }
 
-/// Exit gate: "a crafted sync patch attempting to smuggle a blocklisted
-/// file back in is caught by the re-check" -- sandbox->host direction.
+/// A crafted patch attempting to smuggle a blocklisted file back in must
+/// be caught by the re-check.
 #[test]
 fn sandbox_to_host_flags_a_patch_reintroducing_a_blocklisted_file() {
     let project = temp_dir("s2h-smuggle-project");
@@ -346,12 +325,9 @@ index 0000000..1111111\n\
     fs::remove_dir_all(&flagged_dir).unwrap();
 }
 
-/// Sync latency/throughput measured against a large-file-count fixture,
-/// with real recorded numbers -- per the exit gate, "any scale beyond
-/// what's measured is logged as a known limitation, not asserted as
-/// fine." This measures the host-side half of a host->sandbox round
-/// (staging refresh + git diff), the part that scales with the size of
-/// the real project on disk, using real `git` throughout.
+/// Sync latency measured against a large-file-count fixture with real
+/// recorded numbers -- any scale beyond what's measured here is a known
+/// limitation, not an assertion.
 #[test]
 fn sync_perf_is_measured_against_a_monorepo_scale_fixture_with_real_numbers() {
     let project = temp_dir("perf-monorepo-project");
@@ -369,8 +345,7 @@ fn sync_perf_is_measured_against_a_monorepo_scale_fixture_with_real_numbers() {
     let mirror = temp_dir("perf-monorepo-mirror");
     fs::remove_dir_all(&mirror).unwrap();
     fs::create_dir_all(&mirror).unwrap();
-    // Seed the mirror as an exact copy so the first sync round is a
-    // genuine no-op measurement (detection cost, not application cost).
+    // Exact copy so the first sync round measures detection, not application.
     fn copy_recursive(src: &std::path::Path, dest: &std::path::Path) {
         for entry in fs::read_dir(src).unwrap() {
             let entry = entry.unwrap();
@@ -412,9 +387,7 @@ fn sync_perf_is_measured_against_a_monorepo_scale_fixture_with_real_numbers() {
          tmp/wip/implementation-plan.md Phase 4 exit gate)",
         elapsed
     );
-    // Recorded, generous bound so this stays a real regression guard, not
-    // a flaky timing assertion -- the number above is what's actually
-    // "validated at this scale" for the run-book, not this assertion.
+    // Generous bound so this is a regression guard, not a flaky timing test.
     assert!(
         elapsed.as_secs() < 30,
         "host->sandbox no-op detection over {FILE_COUNT} files took {:?}, \
@@ -426,11 +399,8 @@ fn sync_perf_is_measured_against_a_monorepo_scale_fixture_with_real_numbers() {
     fs::remove_dir_all(&mirror).unwrap();
 }
 
-/// The large-binary-fixture half of the same perf requirement -- a
-/// monorepo of many small text files stresses the walk/diff cost, a
-/// handful of large binary files stresses the byte-copying cost
-/// differently, so both are recorded separately rather than assuming one
-/// stands in for the other.
+/// The large-binary counterpart to the fixture above -- byte-copying cost
+/// scales differently than walk/diff cost, so it's measured separately.
 #[test]
 fn sync_perf_is_measured_against_a_large_binary_fixture_with_real_numbers() {
     let project = temp_dir("perf-binary-project");
@@ -490,34 +460,23 @@ fn sync_perf_is_measured_against_a_large_binary_fixture_with_real_numbers() {
     fs::remove_dir_all(&mirror).unwrap();
 }
 
-/// **Regression test for the 2026-09-15 `GIT_CEILING_DIRECTORIES` fix**
-/// (`crate::patch::git_apply_ceiling`), found via
-/// `tests/manual/validate-sync.sh`'s real-hardware diagnostics: applying
-/// a sandbox->host patch that creates a *new* file must actually land
-/// that file in `project_root` on disk, even when `project_root` is
-/// nested inside some other, unrelated git repository -- not just report
-/// `Applied` while `git apply` silently skips it (`Skipped patch`, exit
-/// `0`) because it discovered that outer repo and `project_root` isn't
-/// its toplevel. Deliberately does *not* use `tests/unit/workspace`'s
-/// usual `temp_dir()` helper for `project_root`, since `std::env::temp_dir()`
-/// (`/tmp`) has no enclosing repo and would never have caught this --
-/// exactly why this bug shipped past every other test in this file.
+/// Regression test: applying a sandbox->host patch that creates a new file
+/// must actually land it in `project_root`, even when `project_root` sits
+/// inside another, unrelated git repository -- not just report `Applied`
+/// while `git apply` silently skips it because it found that outer repo's
+/// toplevel instead. Deliberately builds `project_root` inside a real
+/// nested repo rather than the usual bare `temp_dir()`, since `/tmp` has
+/// no enclosing repo and would never have caught this.
 #[test]
 fn sandbox_to_host_applies_a_new_file_even_when_project_root_is_nested_in_another_repo() {
-    // Simulate an unrelated enclosing repository -- e.g. the real
-    // `tests/manual/validate-sync.sh` scenario, where `project_root`
-    // lives under agent-habitat's own `tmp/`, itself a real git repo.
+    // Simulate an unrelated enclosing repository.
     let outer_repo = temp_dir("nested-outer-repo");
     git_init_committed(&outer_repo);
     let project = outer_repo.join("some").join("nested").join("project");
     fs::create_dir_all(&project).unwrap();
-    // project_root deliberately has no `.git` of its own -- it's never
-    // supposed to be a repo (Phase 2's plain, blocklist-filtered tree).
+    // project_root deliberately has no .git of its own.
     assert!(!project.join(".git").exists());
 
-    // mirror_dir must already be a committed repo here -- in production
-    // it would already have been seeded by an earlier host->sandbox
-    // round; this test only exercises the sandbox->host direction.
     let mirror = temp_dir("nested-mirror");
     git_init_committed(&mirror);
     let flagged_dir = temp_dir("nested-flagged");
@@ -580,9 +539,7 @@ index 0000000..1111111\n\
         flagged_store: &store,
     };
 
-    // The structural check and the real apply both run for real
-    // (`SystemCommandRunner`) against `project`, exactly as they would
-    // in production -- only the guest side is faked.
+    // Only the guest side is faked; the apply runs for real against `project`.
     let host_runner = SystemCommandRunner;
     let outcome = sync::sync_sandbox_to_host(&request, &host_runner, &runner, &audit).unwrap();
 
@@ -593,9 +550,8 @@ index 0000000..1111111\n\
         other => panic!("expected Applied, got {other:?}"),
     }
 
-    // The actual regression check: without the GIT_CEILING_DIRECTORIES
-    // fix, `outcome` would already claim `Applied` above while this file
-    // silently never existed.
+    // Without the fix, `outcome` would already claim Applied above while
+    // this file silently never existed.
     assert_eq!(
         fs::read_to_string(project.join("from-guest.txt")).unwrap(),
         "hello from the guest\n",

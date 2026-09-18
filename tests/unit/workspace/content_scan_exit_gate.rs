@@ -1,29 +1,13 @@
 //! Content-based secrets scanning (Betterleaks) exit-gate tests for
-//! `habitat-workspace`'s pipeline -- this crate's contract with the rest
-//! of the system, not pure internal logic, so it lives here per
-//! `file-structure.md` rather than inline in the crate (staging's own
-//! per-file scan-routing is unit-tested directly in
-//! `crates/workspace/src/staging.rs`'s inline tests; this file confirms
-//! the same behavior holds end to end through `pipeline::build`, plus the
-//! enabled/disabled-flag and ruleset-merge requirements that only make
-//! sense at this level).
+//! `habitat-workspace`'s pipeline, confirming staging's per-file
+//! scan-routing holds end to end through `pipeline::build`.
 //!
-//! `betterleaks` isn't ordinary tooling guaranteed present in this dev
-//! container or CI (unlike `git`/e2fsprogs, which Phase 2's tests already
-//! established run for real here) -- that's exactly why
-//! `crates/install/src/checks.rs::betterleaks` exists as its own
-//! preflight check. So this file takes two different, deliberate
-//! approaches rather than assuming a real `betterleaks` install:
-//! - Tests that only need to observe "scanning was skipped" or "scanning
-//!   failed closed" run against the *real*, genuinely-absent binary via
-//!   `SystemCommandRunner` -- an honest, unmocked demonstration of the
-//!   fail-closed behavior this feature's whole point is to guarantee.
-//! - The one test that needs an actual finding (or a controlled clean
-//!   result) installs a small stub `betterleaks` script onto `PATH` for
-//!   its own duration -- a real subprocess with real argv parsing, not a
-//!   canned in-memory match table, so the actual shelling-out contract
-//!   (`--config`, `--format json`, `--file`, exit codes) is genuinely
-//!   exercised end to end.
+//! `betterleaks` isn't guaranteed present in this dev container or CI, so
+//! this file takes two approaches: tests observing "skipped"/"failed
+//! closed" run against the real, genuinely-absent binary via
+//! `SystemCommandRunner`; the one test needing an actual finding installs
+//! a small stub `betterleaks` script onto `PATH` so the real shelling-out
+//! contract (`--file`, exit codes) is genuinely exercised.
 
 use habitat_policy::config::ProjectConfig;
 use habitat_policy::secrets_scan::{SecretsScanConfig, Toggle};
@@ -33,10 +17,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-// `install_stub_betterleaks`/`restore_path` mutate the process-global
-// `PATH` env var, and cargo runs a crate's tests in multiple threads of
-// the same process by default -- serialize the one test that needs this,
-// same reasoning as `habitat-workspace`'s own `GIT_IDENTITY_ENV_LOCK`.
+// Serializes the test that mutates the process-global PATH env var, since
+// cargo runs a crate's tests in multiple threads of the same process.
 static PATH_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -69,19 +51,13 @@ fn default_request<'a>(project: &'a Path, workdir: &Path, content: Toggle) -> Bu
     }
 }
 
-/// Exit gate: content scanning respects the disabled flag -- a file that
-/// would otherwise look suspicious (an AWS-shaped access key) is still
-/// staged when `secrets_scan.content: disabled`, and no ruleset snapshot
-/// is even written, since there's nothing to scan against.
+/// Content scanning respects the disabled flag -- a suspicious-looking
+/// file is still staged when `secrets_scan.content: disabled`, and no
+/// ruleset snapshot is written.
 #[test]
 fn disabled_flag_skips_content_scanning_entirely() {
-    // Shares `PATH_ENV_LOCK` with the stub-`betterleaks`-on-`PATH` test
-    // below even though this test doesn't touch `PATH` itself: cargo runs
-    // a crate's tests in multiple threads of the same process by
-    // default, and this test's assertions assume `betterleaks` is
-    // genuinely absent -- which wouldn't hold if it ran concurrently
-    // with the window where that other test has prepended a stub to
-    // `PATH`.
+    // Shares the lock with the stub-betterleaks test: this test's
+    // assertions assume betterleaks is genuinely absent from PATH.
     let _guard = PATH_ENV_LOCK.lock().unwrap();
     let project = temp_dir("disabled");
     fs::write(project.join("notes.txt"), "AKIAABCDEFGHIJKLMNOP").unwrap();
@@ -101,10 +77,8 @@ fn disabled_flag_skips_content_scanning_entirely() {
     fs::remove_dir_all(&workdir).unwrap();
 }
 
-/// Exit gate: fails closed on scanner error -- with content scanning
-/// enabled (the default) but `betterleaks` genuinely not installed on
-/// this machine, every file must be blocked from copy, never silently
-/// let through unscanned.
+/// Fails closed on scanner error -- with content scanning enabled but
+/// `betterleaks` not installed, every file must be blocked from copy.
 #[test]
 fn enabled_flag_fails_closed_when_betterleaks_is_not_installed() {
     let _guard = PATH_ENV_LOCK.lock().unwrap();
@@ -148,9 +122,7 @@ fn effective_ruleset_snapshot_merges_baseline_with_project_rules() {
     let workdir = temp_dir("merge-workdir");
 
     let request = default_request(&project, &workdir, Toggle::Enabled);
-    // betterleaks is still absent, so every file is blocked (covered by
-    // the test above) -- this test only cares about the snapshot file
-    // pipeline::build writes before staging runs.
+    // Only the ruleset snapshot matters here; betterleaks is still absent.
     pipeline::build(request, &SystemCommandRunner).unwrap();
 
     let effective = fs::read_to_string(workdir.join("effective-betterleaks.toml")).unwrap();
@@ -197,9 +169,8 @@ fn write_stub_betterleaks() -> PathBuf {
     dir
 }
 
-/// Exit gate: "content scan runs on the right files" -- with a real
-/// (stub) `betterleaks` on `PATH`, a file carrying the finding marker is
-/// blocked from copy while an unrelated file is staged normally.
+/// With a stub `betterleaks` on `PATH`, a file carrying the finding marker
+/// is blocked from copy while an unrelated file is staged normally.
 #[test]
 fn content_scan_blocks_only_the_file_with_a_real_finding() {
     let _guard = PATH_ENV_LOCK.lock().unwrap();

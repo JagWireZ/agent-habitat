@@ -1,14 +1,9 @@
-//! Seam between the checks in this crate and the real machine, so every
-//! check in `checks.rs` can be exercised in a unit test against a fake
-//! machine state (no KVM, a broken podman/krun install, a non-Linux OS)
-//! without needing that hardware/software actually present in CI.
+//! Seam between the checks in this crate and the real machine, so checks
+//! can be exercised in tests against a fake machine state without needing
+//! that hardware/software present in CI.
 //!
-//! Every method the checks themselves use (`os_family`, `path_exists`,
-//! `can_open_read_write`, `read_to_string`, `run_command`) is read-only --
-//! that's what lets `run_install_checks`/`run_preflight` promise they
-//! never mutate the host. `run_command_inherited` is the one exception:
-//! it exists solely for `installer.rs`'s explicit, opt-in auto-install
-//! step, which no check calls.
+//! All methods are read-only except `run_command_inherited`, which exists
+//! solely for `installer.rs`'s opt-in auto-install step.
 
 use std::io;
 use std::path::Path;
@@ -25,9 +20,7 @@ pub trait Environment {
     fn path_exists(&self, path: &Path) -> bool;
 
     /// Whether `path` can actually be opened for read+write access right
-    /// now -- a real permission/capability probe, not just "the path
-    /// exists". Used for `/dev/kvm`: the device node can exist while the
-    /// current user still lacks access to it.
+    /// now -- e.g. `/dev/kvm` can exist while the user still lacks access.
     fn can_open_read_write(&self, path: &Path) -> io::Result<()>;
 
     /// Read a small text file (e.g. `/proc/cpuinfo`) to a string.
@@ -39,15 +32,9 @@ pub trait Environment {
     /// `status.success() == false`, which callers must check.
     fn run_command(&self, program: &str, args: &[&str]) -> io::Result<Output>;
 
-    /// Run an external command with the child's stdin/stdout/stderr
-    /// inherited from this process, rather than captured -- used only by
-    /// `habitat install`'s explicit, opt-in auto-install step
-    /// (`installer.rs`), never by the read-only checks in `checks.rs`.
-    /// A package-manager install run as `sudo` needs the operator to see
-    /// (and, for the password prompt, respond to) its live output; a
-    /// captured/silent transcript would hide that. Returns `Ok(true)` on
-    /// a zero exit, `Ok(false)` on non-zero, `Err` only if the program
-    /// itself couldn't be started.
+    /// Run an external command with stdin/stdout/stderr inherited rather
+    /// than captured, so the operator sees (and can respond to) a `sudo`
+    /// password prompt. Used only by `installer.rs`'s auto-install step.
     fn run_command_inherited(&self, program: &str, args: &[&str]) -> io::Result<bool>;
 }
 
@@ -88,11 +75,9 @@ impl Environment for SystemEnvironment {
 }
 
 pub mod testing {
-    //! A fully in-memory `Environment` for tests. Not `#[cfg(test)]`-gated:
-    //! this needs to be usable both by this crate's own inline unit tests
-    //! (pure per-check logic) and by the black-box exit-gate tests under
-    //! `tests/unit/install/`, which exercise this crate as an external
-    //! dependency and so only see items it actually exports.
+    //! A fully in-memory `Environment` for tests. Not `#[cfg(test)]`-gated
+    //! so it's also usable by the black-box exit-gate tests under
+    //! `tests/unit/install/`, which see only this crate's public exports.
 
     use super::*;
     use std::collections::HashMap;
@@ -112,14 +97,9 @@ pub mod testing {
         /// Canned command results, keyed by `"program arg1 arg2"`.
         pub command_results: HashMap<String, FakeCommandResult>,
         /// Canned success/failure for `run_command_inherited`, keyed the
-        /// same way as `command_results`. Separate map because the two
-        /// methods serve different callers (probes vs. the auto-install
-        /// step) and a test should be able to configure one without
-        /// implying anything about the other.
+        /// same way as `command_results`.
         pub inherited_command_results: HashMap<String, bool>,
-        /// Every invocation passed to `run_command_inherited`, in order --
-        /// lets a test assert the auto-install step actually ran (or
-        /// didn't run) the commands it claims to.
+        /// Every invocation passed to `run_command_inherited`, in order.
         pub inherited_invocations: std::cell::RefCell<Vec<String>>,
     }
 
@@ -238,12 +218,8 @@ pub mod testing {
             let key = Self::invocation_key(program, args);
             match self.command_results.get(&key) {
                 Some(result) => Ok(Output {
-                    // See `habitat-workspace`'s `FakeCommandRunner` for
-                    // why this shifts into bits 8-15 rather than using
-                    // the raw value `1` directly: `.success()` behaves
-                    // identically either way, but only the shifted form
-                    // makes `.code()` decode as a normal exit with code 1
-                    // rather than `None` (signal-terminated).
+                    // Shifted into bits 8-15 so `.code()` decodes as exit
+                    // code 1 rather than `None` (signal-terminated).
                     status: ExitStatus::from_raw(if result.success { 0 } else { 1 << 8 }),
                     stdout: result.stdout.clone().into_bytes(),
                     stderr: result.stderr.clone().into_bytes(),

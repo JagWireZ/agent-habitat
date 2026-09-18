@@ -1,25 +1,12 @@
 //! Adversarial coverage for content-based secrets scanning (Betterleaks):
-//! can a project's own checked-in `betterleaks.toml` be used to weaken or
-//! fully disable detection? Lives here per `file-structure.md`/AGENTS.md
-//! Section 6 ("adversarial tests cover... together"), alongside
-//! `blocklist_disk_image.rs`.
-//!
-//! Two attempts, both required to fail per `habitat_policy::secrets_scan`'s
-//! contract ("additive to Habitat's baseline rules, never a full
-//! replacement... must not be able to fully disable detection"):
-//! 1. A catch-all `[allowlist]` regex, which would suppress every
-//!    finding (baseline included) if it were honored.
-//! 2. An empty project ruleset, on the theory that "no rules" might mean
-//!    "no baseline either" -- it must not; the baseline is unconditional.
-//!
-//! `betterleaks` isn't installed in this dev container (it isn't ordinary
-//! tooling, unlike `git`/e2fsprogs -- see
-//! `crates/install/src/checks.rs::betterleaks`), so attempt 2 is verified
-//! through the fail-closed path instead of a real finding: since the
-//! scanner is absent, every file is blocked regardless of ruleset content
-//! -- which is itself still a meaningful adversarial confirmation
-//! ("weakening the ruleset doesn't even get you a pass-through when the
-//! scanner can't run at all").
+//! can a project's own checked-in `betterleaks.toml` weaken or disable
+//! detection? Two attempts, both required to fail per
+//! `habitat_policy::secrets_scan`'s "additive, never a full replacement"
+//! contract: a catch-all `[allowlist]` regex, and an empty ruleset (which
+//! must not skip the unconditional baseline). `betterleaks` isn't
+//! installed in this dev container, so attempt 2 is verified via the
+//! fail-closed path: every file blocked regardless of ruleset content is
+//! itself a meaningful confirmation that weakening the ruleset buys nothing.
 
 use habitat_policy::config::ProjectConfig;
 use habitat_policy::secrets_scan::{SecretsScanConfig, Toggle};
@@ -42,8 +29,7 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 /// A project `betterleaks.toml` with a catch-all allowlist regex must be
-/// rejected before anything is staged -- the same "hard stop before
-/// staging exists" shape as the git-history-toggle exit gate.
+/// rejected before anything is staged.
 #[test]
 fn catch_all_allowlist_ruleset_is_rejected_before_anything_is_staged() {
     let project = temp_dir("catch-all");
@@ -85,12 +71,10 @@ fn catch_all_allowlist_ruleset_is_rejected_before_anything_is_staged() {
     fs::remove_dir_all(&workdir).unwrap();
 }
 
-/// An empty project `betterleaks.toml` is not itself an error (it adds
-/// nothing, which is fine) -- but it must never be read as "skip the
-/// baseline too". The written effective-ruleset snapshot still carries
-/// the baseline regardless, and (since `betterleaks` is genuinely absent
-/// here) the build still fails every file closed rather than treating an
-/// empty project ruleset as "nothing to enforce, let it all through".
+/// An empty project `betterleaks.toml` is not itself an error, but must
+/// never be read as "skip the baseline too" -- the effective-ruleset
+/// snapshot still carries the baseline, and the build still fails every
+/// file closed since the scanner is genuinely absent here.
 #[test]
 fn empty_project_ruleset_cannot_be_used_to_skip_the_baseline() {
     let project = temp_dir("empty-ruleset");
@@ -126,9 +110,7 @@ fn empty_project_ruleset_cannot_be_used_to_skip_the_baseline() {
         "with the scanner genuinely unavailable, the file must still be blocked, not silently \
          waved through because the project's own ruleset was empty"
     );
-    // Two files exist in the project (main.rs and its own betterleaks.toml,
-    // which is scanned like any other ordinary file) -- both must be
-    // blocked, since the scanner is genuinely unavailable.
+    // main.rs and betterleaks.toml itself -- both blocked, scanner unavailable.
     assert_eq!(outcome.staging_report.skipped_content_scan.len(), 2);
 
     fs::remove_dir_all(&project).unwrap();

@@ -7,9 +7,8 @@ use crate::environment::Environment;
 use std::fmt;
 use std::path::Path;
 
-/// Identifies which specific check failed -- this is what gets named in
-/// the operator-facing error message and the audit log's `check` field,
-/// never a generic "preflight failed".
+/// Identifies which specific check failed, for the operator-facing error
+/// message and the audit log's `check` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckId {
     HostOs,
@@ -43,8 +42,8 @@ impl fmt::Display for CheckId {
     }
 }
 
-/// A failed check: which one, and why (attacker/environment-influenced --
-/// treat `message` as untrusted text, never interpolate it into a shell).
+/// A failed check: which one, and why. `message` is environment-influenced
+/// text -- never interpolate it into a shell.
 #[derive(Debug, Clone)]
 pub struct CheckFailure {
     pub check: CheckId,
@@ -66,11 +65,8 @@ fn fail(check: CheckId, message: impl Into<String>) -> CheckResult {
     })
 }
 
-/// Explicit refusal on any non-Linux host. This runs first, before any
-/// other check, in both `habitat install` and `habitat run`'s preflight
-/// subroutine (AGENTS.md host-Linux-only decision,
-/// `docs/decisions/0001-host-os-layer.md`) -- "explicitly refuses,
-/// not best effort".
+/// Explicit refusal on any non-Linux host (`docs/decisions/0001-host-os-layer.md`).
+/// Runs first, before any other check.
 pub fn host_os<E: Environment>(env: &E) -> CheckResult {
     let os = env.os_family();
     if os == "linux" {
@@ -84,13 +80,9 @@ pub fn host_os<E: Environment>(env: &E) -> CheckResult {
 }
 
 /// Real KVM / hardware-virtualization capability probe: `/dev/kvm` must be
-/// openable for read+write (existence alone is not enough -- a device node
-/// can exist while permission is denied, e.g. the current user isn't in the
-/// `kvm` group yet -- the one-time, non-elevated setup step rootless Podman
-/// launch relies on, `docs/plan.md` Section 2.1), and the CPU must
-/// advertise a virtualization extension flag in `/proc/cpuinfo`. Any error
-/// reading either signal fails the check closed rather than assuming
-/// success.
+/// openable for read+write (existence alone isn't enough -- a device node
+/// can exist while the user isn't yet in the `kvm` group), and the CPU
+/// must advertise a virtualization extension flag in `/proc/cpuinfo`.
 pub fn kvm<E: Environment>(env: &E) -> CheckResult {
     let kvm_path = Path::new("/dev/kvm");
     if !env.path_exists(kvm_path) {
@@ -134,12 +126,8 @@ pub fn kvm<E: Environment>(env: &E) -> CheckResult {
 }
 
 /// Podman present and actually able to run rootless, i.e. without any
-/// daemon/socket prerequisite (`docs/plan.md` Section 2.1 -- rootless
-/// Podman is the whole point, so this check must never assume a system
-/// service is running). Shared by `habitat install` and `habitat run`'s
-/// preflight subroutine -- one implementation, not a re-derived duplicate
-/// per file-structure.md's "shared, not per-domain" rule (applied here to
-/// check logic, not just policy data).
+/// daemon/socket prerequisite. Shared by `habitat install` and
+/// `habitat run`'s preflight subroutine.
 pub fn podman<E: Environment>(env: &E) -> CheckResult {
     match env.run_command("podman", &["--version"]) {
         Ok(output) if output.status.success() => {}
@@ -174,19 +162,13 @@ pub fn podman<E: Environment>(env: &E) -> CheckResult {
 }
 
 /// The `krun` OCI runtime (shipped by the `crun-krun` package, backed by
-/// libkrun) availability: `krun` is the binary Podman actually exec's to
-/// launch the session's microVM, so its absence means a session can't
-/// start regardless of what podman's own config claims. There is no
-/// separate Firecracker-style second binary to check -- libkrun is linked
-/// directly into `krun` (`docs/plan.md` Section 2.1).
+/// libkrun) is available -- `krun` is the binary Podman actually exec's to
+/// launch the session's microVM.
 ///
 /// **The package name and the binary name are not the same** -- confirmed
-/// against real Fedora hardware (`rpm -ql crun-krun` lists `/usr/bin/krun`,
-/// not `/usr/bin/crun-krun`; see `tmp/wip/phase-1-tasks.md`'s real-hardware
-/// notes). An earlier version of this check ran `crun-krun --version`,
-/// which fails closed even on a correctly-installed host -- the package
-/// name belongs in `package_manager.rs`'s dnf/apt commands, never in the
-/// command this check actually runs.
+/// on real Fedora hardware (`rpm -ql crun-krun` lists `/usr/bin/krun`, not
+/// `/usr/bin/crun-krun`). Run `krun --version` here, never `crun-krun
+/// --version`.
 pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
     match env.run_command("krun", &["--version"]) {
         Ok(output) if output.status.success() => Ok(()),
@@ -205,52 +187,32 @@ pub fn krun_runtime<E: Environment>(env: &E) -> CheckResult {
 }
 
 /// The minimum `crun` version this project trusts for real sandboxed
-/// networking -- pinned to the exact build `habitat install` always
-/// installs on the Dnf family (`package_manager::CRUN_PINNED_VERSION`,
-/// `installer::attempt_one`), not merely the version that added the
-/// `krun.use_passt` OCI annotation (crun 1.27.1, confirmed via upstream's
-/// own 1.27.1 release notes). Passing the annotation's own minimum isn't
-/// enough on its own: confirmed on real Fedora 44 hardware (2026-09-16,
-/// `tmp/wip/vm-launch-validation`) that its repo `crun-krun` (1.28)
-/// boots a real `passt`-backed guest with the annotation honored, but
-/// every SSH connection into it reset mid-handshake -- a loopback packet
-/// capture showed the RST coming from `pasta`'s own splice, before the
-/// guest's sshd ever saw the connection. This check exists so a passing
-/// checklist entry always means "this exact trusted build," never "new
-/// enough to accept the annotation but not necessarily working
-/// correctly" -- see [`crun_version`]'s doc comment for the check this
-/// backs.
+/// networking. Pinned above crun 1.27.1 (which merely added the
+/// `krun.use_passt` annotation): real Fedora 44 hardware with crun-krun
+/// 1.28 accepts that annotation and boots a passt-backed guest, but every
+/// SSH connection into it resets mid-handshake (RST from `pasta`'s own
+/// splice, before the guest's sshd ever sees the connection). So a
+/// passing check must mean "this exact trusted build," not just "new
+/// enough to accept the annotation."
 pub const MIN_CRUN_VERSION_FOR_PASST: (u32, u32, u32) = (1, 29, 1);
 
 /// `krun`'s underlying `crun` version is at least
-/// [`MIN_CRUN_VERSION_FOR_PASST`] -- i.e. confirmed capable of real
-/// `passt`-backed networking instead of either silently falling back to
-/// libkrun's default TSI mode, or (Fedora 44's real-hardware finding)
-/// accepting `krun.use_passt` but still resetting every guest SSH
-/// connection.
+/// [`MIN_CRUN_VERSION_FOR_PASST`], i.e. confirmed capable of real
+/// `passt`-backed networking rather than silently falling back to
+/// libkrun's default TSI mode, or accepting `krun.use_passt` but still
+/// resetting every guest SSH connection.
 ///
-/// **Why this is a separate check from [`krun_runtime`], not folded into
-/// it**: confirmed on real AlmaLinux 10.2 hardware
-/// (`tmp/wip/vm-launch-validation`, `tmp/wip/egress-validation`) --
-/// `krun --version` succeeding says nothing about whether this specific
-/// build is new enough for real networking. AlmaLinux 10's own
-/// `crun-krun-1.27-2.el10_2` package (from AppStream, not EPEL) is
-/// behind this cutoff: `krun --version` passes, `--network pasta` is
-/// accepted without error, and the guest still silently boots under TSI
-/// (`tsi_hijack` on the kernel command line, `PF_TSI`/`PF_TSI6`/
-/// `PF_TSIU` registered, no virtio-net device at all) -- with no error
-/// message anywhere pointing at the actual cause. This check exists so
-/// `habitat install` catches that gap before a session launch ever gets
-/// that far.
+/// **Separate check from [`krun_runtime`]**: `krun --version` succeeding
+/// says nothing about whether the build is new enough for real
+/// networking. Confirmed on real AlmaLinux 10.2 hardware: its
+/// `crun-krun-1.27-2.el10_2` package is behind this cutoff, accepts
+/// `--network pasta` without error, and the guest silently boots under
+/// TSI instead (no virtio-net device at all) -- with no error message
+/// pointing at the cause.
 ///
-/// Parses the first line of `krun --version`'s output (`"crun version
-/// X.Y.Z"`) rather than trusting a package manager's own version query --
-/// `crun`/`krun` are the same binary under different names
-/// (`checks::krun_runtime`'s doc comment), and the binary's own
-/// self-report is the one source of truth that doesn't depend on which
-/// package manager, if any, actually installed it (a from-source build or
-/// a manually-dropped-in Koji RPM has no package-manager record to query
-/// at all).
+/// Parses `krun --version`'s own output rather than querying a package
+/// manager, since a from-source or manually-installed build has no
+/// package-manager record to query.
 pub fn crun_version<E: Environment>(env: &E) -> CheckResult {
     let output = match env.run_command("krun", &["--version"]) {
         Ok(output) if output.status.success() => output,
@@ -303,11 +265,9 @@ pub fn crun_version<E: Environment>(env: &E) -> CheckResult {
     }
 }
 
-/// Parses `"crun version X.Y.Z"` (crun's own `--version` banner, first
-/// line) into `(major, minor, patch)`. A missing patch component (e.g.
-/// `"crun version 1.27"`) is treated as `.0` rather than a parse failure
-/// -- crun's own version scheme drops a trailing `.0` on whole-minor
-/// releases.
+/// Parses `"crun version X.Y.Z"` into `(major, minor, patch)`. A missing
+/// patch component is treated as `.0` -- crun's own version scheme drops
+/// a trailing `.0` on whole-minor releases.
 fn parse_crun_version(text: &str) -> Option<(u32, u32, u32)> {
     let line = text.lines().next()?;
     let version_str = line.strip_prefix("crun version ")?;
@@ -318,23 +278,14 @@ fn parse_crun_version(text: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// `passt` -- the actual userspace program that gives the guest its real
-/// virtual network interface and does the packet translation
-/// (`docs/decisions/0004-networking-layer.md`) -- is installed and
-/// runnable.
+/// `passt` -- the userspace program that gives the guest its real virtual
+/// network interface (`docs/decisions/0004-networking-layer.md`) -- is
+/// installed and runnable.
 ///
-/// **Why this is a separate check from [`crun_version`], not folded into
-/// it**: [`crun_version`] only confirms `crun-krun` is new enough to
-/// *hand off* to `passt` via the `krun.use_passt` annotation -- it says
-/// nothing about whether `passt` (the `passt`/`pasta` package) is
-/// actually installed on this host at all. `podman`'s own `--network
-/// pasta` driver only recommends that package rather than hard-requiring
-/// it on every distro, so a host can pass every other check here while a
-/// session still fails to get a real network at launch time with no
-/// earlier warning. Checked via `passt --version` (the same binary this
-/// project's own `tests/manual/validate-egress.sh` probes) rather than
-/// `pasta --version` -- same executable, and `passt` is the name the
-/// distro package itself uses.
+/// **Separate check from [`crun_version`]**: that only confirms crun-krun
+/// is new enough to hand off to `passt`, not that the `passt`/`pasta`
+/// package is actually installed -- podman's `--network pasta` driver
+/// only recommends it, doesn't hard-require it on every distro.
 pub fn passt<E: Environment>(env: &E) -> CheckResult {
     match env.run_command("passt", &["--version"]) {
         Ok(output) if output.status.success() => Ok(()),
@@ -352,37 +303,22 @@ pub fn passt<E: Environment>(env: &E) -> CheckResult {
     }
 }
 
-/// `libkrunfw` (the shared library bundling the actual guest kernel
-/// `libkrun` boots) resolvable by the dynamic linker.
+/// `libkrunfw` (the shared library bundling the guest kernel `libkrun`
+/// boots) is resolvable by the dynamic linker.
 ///
-/// **Why this is a separate check from [`krun_runtime`], not folded into
-/// it**: confirmed on real AlmaLinux 10.2 hardware
-/// (`tmp/wip/vm-launch-validation`) -- `krun --version` succeeds even
-/// with `libkrunfw` completely absent, because that code path never
-/// touches libkrun's VM-creation logic, which is the only place
-/// `libkrunfw` actually gets dlopen'd. The first real symptom without
-/// this check is a session launch itself failing outright ("Couldn't
-/// find or load libkrunfw.so.5"), which is exactly the false-confidence
-/// gap this check exists to close: `krun_runtime` passing must not be
-/// read as "a session can actually launch."
+/// **Separate check from [`krun_runtime`]**: confirmed on real AlmaLinux
+/// 10.2 hardware -- `krun --version` succeeds even with `libkrunfw`
+/// completely absent, since that code path never dlopen's it. Without
+/// this check the first symptom is a session launch itself failing
+/// ("Couldn't find or load libkrunfw.so.5").
 ///
-/// **Why this can't be an RPM dependency this crate relies on**: also
-/// confirmed on that same hardware -- the EPEL build of `libkrun` for
-/// AlmaLinux 10 declares no RPM `Requires` on `libkrunfw` at all (it's
-/// loaded via `dlopen`, not linked at build time, so rpm's automatic
-/// dependency generator never sees it), and EPEL carries no `libkrunfw`
-/// package under any name to depend on regardless. A genuine Fedora host
-/// doesn't hit this: Fedora's own `crun-krun`/`libkrun` packages pull in
-/// a matching `libkrunfw` automatically. See
-/// `package_manager::LIBKRUNFW_FALLBACK_URL` for what `habitat install`
-/// does about the EPEL gap.
+/// **Not an RPM dependency**: the EPEL build of `libkrun` for AlmaLinux
+/// 10 declares no RPM `Requires` on `libkrunfw` (it's dlopen'd, not
+/// linked), and EPEL carries no `libkrunfw` package to depend on anyway.
+/// See `package_manager::LIBKRUNFW_FALLBACK_URL` for the install-time fix.
 ///
-/// `ldconfig -p` (the dynamic linker's own cache) is the most direct
-/// real-hardware-confirmed way to ask "will `krun` actually be able to
-/// find this at VM-boot time" -- `ldd krun` doesn't show it (it's not a
-/// direct ELF dependency of the `krun`/`libkrun` binaries, since it's
-/// dlopen'd), and guessing a fixed install path (`/usr/lib64/...`) would
-/// break on any host that keeps it somewhere else.
+/// Checked via `ldconfig -p` rather than `ldd krun` (dlopen'd, not a
+/// direct ELF dependency) or a fixed path guess.
 pub fn libkrunfw<E: Environment>(env: &E) -> CheckResult {
     match env.run_command("ldconfig", &["-p"]) {
         Ok(output) if output.status.success() => {
@@ -412,16 +348,11 @@ pub fn libkrunfw<E: Environment>(env: &E) -> CheckResult {
 }
 
 /// The `betterleaks` binary (content-based secrets scanning) on `PATH`.
-/// Only run when a project's checked-in config has `secrets_scan.content`
-/// enabled (the default) -- see `crate::preflight::run_preflight`, which
-/// gates the call to this check on that flag rather than always running
-/// it, since a project may have explicitly opted out of content scanning
-/// and shouldn't be blocked on a binary it doesn't need.
+/// Only run when the project's config has `secrets_scan.content` enabled
+/// (`crate::preflight::run_preflight` gates the call on that flag).
 ///
-/// Same shape as [`krun_runtime`]: absence is a hard preflight failure,
-/// never a silent skip -- content scanning that's supposed to be on must
-/// not quietly become a no-op because the scanner isn't installed
-/// (AGENTS.md Section 2 invariant 11, "fail closed and never silently").
+/// Absence is a hard preflight failure, never a silent skip -- scanning
+/// that's supposed to be on must not quietly become a no-op.
 pub fn betterleaks<E: Environment>(env: &E) -> CheckResult {
     match env.run_command("betterleaks", &["--version"]) {
         Ok(output) if output.status.success() => Ok(()),
@@ -541,8 +472,6 @@ mod tests {
 
     #[test]
     fn crun_version_fails_when_older_than_the_annotation_cutoff() {
-        // Mirrors the real AlmaLinux 10.2 finding: crun-krun-1.27-2.el10_2,
-        // which predates the krun.use_passt annotation entirely (1.27.1).
         let env = FakeEnvironment::linux().with_command_ok(
             "krun --version",
             "crun version 1.27\ncommit: a718a92cc9a94955a5a550b6fdec1378c247ec50\n",
@@ -554,11 +483,6 @@ mod tests {
 
     #[test]
     fn crun_version_fails_when_new_enough_for_the_annotation_but_older_than_the_pinned_build() {
-        // Real Fedora 44 hardware (2026-09-16): crun-krun 1.28 accepts
-        // the krun.use_passt annotation (past the 1.27.1 cutoff) but
-        // still resets every guest SSH connection -- this check must
-        // fail closed on it, not treat "accepts the annotation" as
-        // "works correctly".
         let env = FakeEnvironment::linux()
             .with_command_ok("krun --version", "crun version 1.28\ncommit: abc\n");
         let err = crun_version(&env).unwrap_err();
@@ -626,8 +550,6 @@ mod tests {
 
     #[test]
     fn libkrunfw_fails_when_ldconfig_does_not_list_it() {
-        // Mirrors the real AlmaLinux 10.2 finding: `ldconfig -p` runs
-        // fine but simply has no libkrunfw entry.
         let env = FakeEnvironment::linux().with_command_ok(
             "ldconfig -p",
             "\tlibkrun.so.1 (libc6,x86-64) => /lib64/libkrun.so.1\n",
@@ -666,10 +588,4 @@ mod tests {
             FakeEnvironment::linux().with_command_ok("betterleaks --version", "betterleaks 0.4.0");
         assert!(betterleaks(&env).is_ok());
     }
-
-    // The Phase 1 exit-gate scenarios (KVM-absent reported not-false-positive,
-    // broken-Kata-install fails closed, install-run-twice-no-change) are
-    // black-box tests of this crate's contract with the rest of the system,
-    // not pure internal logic -- per file-structure.md they live under
-    // `tests/unit/install/`, not inline here.
 }

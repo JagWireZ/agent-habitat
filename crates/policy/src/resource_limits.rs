@@ -1,15 +1,8 @@
-//! Resource-limit config: CPU/memory caps enforced at VM launch (Phase 3,
-//! `crates/vm`). There is deliberately no separate "disk limit" field
-//! here -- the disk cap is just the size of the session's disk image,
-//! already fixed at build time by `habitat-workspace`'s
-//! `pipeline::BuildRequest::image_size_mb` (Phase 2); duplicating that as
-//! a second config knob would give two places to keep in sync for one
-//! value.
-//!
-//! Same "hand-rolled slice now, Phase 7 owns the full schema" note as
-//! `crate::config`'s doc comment: Phase 7 assembles the operator-facing
-//! `--config` file and may add per-project overrides beyond these two
-//! fields; this crate only defines what Phase 3 actually reads today.
+//! Resource-limit config: CPU/memory caps enforced at VM launch
+//! (`crates/vm`). No separate "disk limit" field -- the disk cap is just
+//! the session disk image's fixed build-time size
+//! (`pipeline::BuildRequest::image_size_mb`), so a second knob for the same
+//! value would just be two places to keep in sync.
 
 use std::fmt;
 
@@ -22,10 +15,7 @@ pub struct ResourceLimitsConfig {
 
 impl Default for ResourceLimitsConfig {
     fn default() -> Self {
-        // Sensible defaults for a single-operator coding-agent session --
-        // enough headroom for a typical build/test workload without
-        // assuming a beefy host. Per-project overrides are a Phase 7
-        // concern; this is only the built-in fallback.
+        // Enough headroom for a typical build/test workload without assuming a beefy host.
         ResourceLimitsConfig {
             cpus: 2.0,
             memory_mb: 2048,
@@ -54,10 +44,8 @@ impl ResourceLimitsConfig {
         let cpus: f64 = value.trim().parse().map_err(|_| ResourceLimitsError {
             message: format!("cpus: expected a positive number, got {value:?}"),
         })?;
-        // Written as a negated `>` rather than `<= 0.0` so a NaN input
-        // (e.g. a literal "NaN" string, which `f64::parse` accepts) is
-        // also rejected -- `NaN <= 0.0` is false, which would wrongly
-        // let it through.
+        // Negated `>` (not `<= 0.0`) so a NaN input (accepted by f64::parse) is
+        // also rejected -- `NaN <= 0.0` is false and would let it through.
         #[allow(clippy::neg_cmp_op_on_partial_ord)]
         if !(cpus > 0.0) {
             return Err(ResourceLimitsError {

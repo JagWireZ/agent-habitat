@@ -1,20 +1,14 @@
 //! Assembles a staging directory into the session's disposable raw disk
-//! image (`docs/decisions/0005-storage-layer.md`): a plain file of a
-//! fixed size, formatted with an ext4 filesystem and populated directly
-//! from the staging directory via `mke2fs -d`. This needs no host-side
-//! loop-device step and no root -- `mke2fs` can build a populated
-//! filesystem image directly against a regular file, which is exactly
-//! what keeps this consistent with the rootless launch model the rest of
-//! the stack relies on (no privileged host action anywhere in the
-//! disk-build path). Phase 3 is what actually attaches the resulting
-//! file to a guest as a `virtio-blk` device; this module only produces
-//! the file.
+//! image (`docs/decisions/0005-storage-layer.md`): a fixed-size file
+//! formatted ext4 and populated directly via `mke2fs -d` -- no loop
+//! device, no root, consistent with the rootless launch model. This
+//! module only produces the file; attaching it as a `virtio-blk` device
+//! happens elsewhere.
 //!
-//! Also provides [`dump_image_contents`], built on `debugfs`'s `rdump`,
-//! which extracts a populated image's contents back out to a plain
-//! directory without mounting anything -- used by this phase's
+//! Also provides [`dump_image_contents`] (`debugfs -R rdump`), which
+//! extracts a populated image's contents without mounting -- used by the
 //! adversarial test to confirm a blocklisted file is absent from the
-//! actual image, not just from the staging directory that fed it.
+//! actual image, not just the staging directory that fed it.
 
 use crate::command_runner::CommandRunner;
 use std::io;
@@ -40,10 +34,8 @@ fn err(message: impl Into<String>) -> DiskImageError {
 }
 
 /// Builds `image_path` as a fresh, `size_mb`-megabyte raw disk image
-/// containing exactly the contents of `staging_dir`. `image_path` must
-/// not already exist -- this never overwrites an existing file, so a
-/// caller can't accidentally reuse (and thus leak into) a stale image
-/// from an earlier session.
+/// containing exactly the contents of `staging_dir`. Never overwrites an
+/// existing file, so a caller can't accidentally reuse a stale image.
 pub fn assemble_disk_image<R: CommandRunner>(
     staging_dir: &Path,
     image_path: &Path,
@@ -82,10 +74,8 @@ pub fn assemble_disk_image<R: CommandRunner>(
         })?;
 
     if !output.status.success() {
-        // Fail closed: remove the half-built image rather than leaving
-        // something on disk that looks like a real session disk but
-        // isn't -- a stray leftover here must never be picked up by a
-        // later step as if it were a good build.
+        // Fail closed: don't leave a half-built image that a later step
+        // could mistake for a good build.
         let _ = std::fs::remove_file(image_path);
         return Err(err(format!(
             "mke2fs exited non-zero: {}",
@@ -96,9 +86,8 @@ pub fn assemble_disk_image<R: CommandRunner>(
 }
 
 /// Extracts everything inside `image_path` into `out_dir` (which must not
-/// already exist) via `debugfs -R "rdump / <out_dir>"` -- read-only
-/// against the image, no mount, no loop device, no root required. Used
-/// only by this phase's adversarial verification, not by the normal
+/// already exist) via `debugfs -R "rdump / <out_dir>"` -- read-only, no
+/// mount, no root. Used only by adversarial verification, not the normal
 /// build path.
 pub fn dump_image_contents<R: CommandRunner>(
     image_path: &Path,
@@ -138,10 +127,8 @@ pub fn dump_image_contents<R: CommandRunner>(
     Ok(())
 }
 
-/// Real disk images are created via [`std::fs::File::set_len`] which
-/// produces a sparse file -- this is a convenience so tests/callers can
-/// assert an image was actually produced without hand-rolling the size
-/// check.
+/// Convenience for tests/callers to assert an image was produced with
+/// the expected size, without hand-rolling the check.
 pub fn image_exists_and_is_sized(image_path: &Path, expected_mb: u64) -> io::Result<bool> {
     let metadata = std::fs::metadata(image_path)?;
     Ok(metadata.len() == expected_mb * 1024 * 1024)
@@ -166,8 +153,6 @@ mod tests {
         dir
     }
 
-    // `mke2fs`/`debugfs` are ordinary e2fsprogs tooling, not
-    // KVM-dependent -- exercised for real here (AGENTS.md Section 3).
     #[test]
     fn assemble_and_dump_round_trip_for_real() {
         let staging = temp_dir("staging");

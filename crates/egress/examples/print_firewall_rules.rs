@@ -1,10 +1,6 @@
 //! Prints the nftables ruleset `network_setup::build_egress_firewall_rules`
-//! generates for a given pasta interface and proxy address, for
-//! `tests/manual/validate-egress.sh` Step 4 to pipe straight into
-//! `nft -f -`. Kept as a thin example (rather than duplicating the format
-//! string in the shell script, the way Step 4's instructions used to ask
-//! a human to do by hand) so the script always applies the exact ruleset
-//! this crate actually builds, not a hand-copied approximation of it.
+//! generates, for `tests/manual/validate-egress.sh` to pipe into `nft -f -`
+//! so the script always applies the exact ruleset this crate builds.
 //!
 //! Usage:
 //!   cargo run -p habitat-egress --example print_firewall_rules -- \

@@ -1,13 +1,10 @@
-//! The git-history toggle (Phase 2): synthetic repo by default, real
-//! `.git` shared read-only only when a project's checked-in config turns
-//! that on -- and turning it on requires a logged, reviewed approval
-//! entry to already be present, or resolution is a hard failure, never a
-//! silent pass-through (AGENTS.md Section 2 invariant 9, Section 8).
+//! The git-history toggle: synthetic repo by default, real `.git` shared
+//! read-only only when a project's config turns that on with a logged,
+//! reviewed approval already present -- otherwise resolution is a hard
+//! failure, never a silent pass-through.
 //!
-//! This module only resolves *whether* real history is permitted for a
-//! given, already-loaded config; `crates/workspace`'s disk-build pipeline
-//! is what actually acts on the result (seed a synthetic repo, or copy
-//! the real `.git` in read-only).
+//! This module only resolves *whether* real history is permitted; the
+//! disk-build pipeline (`crates/workspace`) acts on the result.
 
 use std::fmt;
 
@@ -30,12 +27,8 @@ pub struct GitHistoryConfig {
     pub approval: Option<GitHistoryApproval>,
 }
 
-/// The logged, reviewed entry AGENTS.md Section 8 requires before a
-/// git-history-toggle flip takes effect. All three fields are required
-/// and must be non-empty -- this is the config-level record; the
-/// quarterly governance review (`reviews/CHECKLIST.md`) separately
-/// confirms each flip like this one actually happened and links back to
-/// it, but does not substitute for it being present up front.
+/// The logged, reviewed entry required before a git-history-toggle flip
+/// takes effect. All three fields are required and must be non-empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GitHistoryApproval {
     pub reviewed_by: String,
@@ -51,12 +44,8 @@ impl GitHistoryApproval {
     }
 }
 
-/// Why real history was refused. There is deliberately no "warning" or
-/// "degraded mode" variant -- resolution either produces a mode or it
-/// fails closed to [`GitHistoryMode::Synthetic`] being the only option
-/// left unresolved, per AGENTS.md Section 2 invariant 10's "distinct
-/// state, never silently merged/dropped" standard applied here to
-/// ambiguous config, not just sync patches.
+/// Why real history was refused. No "warning" or "degraded mode" variant --
+/// resolution either produces a mode or fails closed to `Synthetic`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHistoryError {
     pub message: String,
@@ -72,17 +61,11 @@ impl std::error::Error for GitHistoryError {}
 
 /// Resolves a project's git-history config into a mode, or a hard error.
 ///
-/// - `enabled: false` (the default) always resolves to `Synthetic`,
-///   regardless of whatever an `approval` field might contain -- an
-///   approval left over from a previous, later-reverted flip must never
-///   cause real history to leak back in on its own.
-/// - `enabled: true` requires a complete `approval` (all three fields
-///   non-empty) to resolve to `RealHistoryReadOnly`. A missing or
-///   incomplete approval is a hard `Err`, never a fallback to
-///   `Synthetic` and never a warning-only pass-through -- flipping the
-///   toggle on is a deliberate request for more exposure, and an
-///   unapproved request must stop the build, not quietly under-deliver
-///   it.
+/// `enabled: false` always resolves to `Synthetic` regardless of any
+/// `approval` present -- a stale approval from a reverted flip must never
+/// silently re-enable real history. `enabled: true` requires a complete
+/// approval to resolve to `RealHistoryReadOnly`; a missing or incomplete
+/// one is a hard `Err`, never a fallback or warning-only pass-through.
 pub fn resolve(config: &GitHistoryConfig) -> Result<GitHistoryMode, GitHistoryError> {
     if !config.enabled {
         return Ok(GitHistoryMode::Synthetic);
@@ -96,7 +79,7 @@ pub fn resolve(config: &GitHistoryConfig) -> Result<GitHistoryMode, GitHistoryEr
         }),
         None => Err(GitHistoryError {
             message: "enabled, but no logged approval entry is present -- flipping this toggle \
-                      on requires a reviewed entry before it takes effect (AGENTS.md Section 8)"
+                      on requires a reviewed entry before it takes effect"
                 .to_string(),
         }),
     }

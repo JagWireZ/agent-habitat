@@ -1,36 +1,22 @@
 //! `habitat` -- the operator-facing CLI entrypoint.
 //!
-//! Phase 1 wires up two subcommands against the Phase 0 skeleton:
+//! Two subcommands:
 //! - `habitat install` -- runs `habitat-install::run_install_checks`. If
-//!   anything's missing, it offers to install it: on "yes", detects the
-//!   host's dnf/apt package-manager family
-//!   (`docs/decisions/0001-host-os-layer.md`'s 2026-09-14 amendment) and
-//!   runs the actual `sudo <pkg-mgr> install` command for each fixable
-//!   check, then re-verifies before reporting the final result.
-//! - `habitat run` -- runs `habitat-install::run_preflight` and then stops;
-//!   the rest of the session lifecycle (disk build, VM launch, prompt
-//!   loop, teardown) is assembled in Phase 7 from Phases 2-6.
+//!   anything's missing, offers to install it: detects the host's dnf/apt
+//!   package-manager family, runs `sudo <pkg-mgr> install` for each
+//!   fixable check, then re-verifies before reporting the final result.
+//! - `habitat run` -- runs `habitat-install::run_preflight` and stops; the
+//!   rest of the session lifecycle is assembled elsewhere.
 //!
-//! No arg-parsing dependency is taken here: with no dependency-fetch
-//! access in this environment (see Phase 1 implementation notes) and only
-//! two subcommands and one flag (`--verbose`/`-v`) to recognize, hand-rolled
-//! parsing is simpler and has fewer moving parts than pulling in a
-//! framework for it.
+//! No arg-parsing dependency: only two subcommands and one flag
+//! (`--verbose`/`-v`), so hand-rolled parsing is simpler.
 //!
-//! Default output is written for a general audience (think Docker
-//! Desktop's or Homebrew's `doctor` output): a plain-English pass/fail
-//! checklist first, then -- only if something's missing -- a separate
-//! "here's what to do" section listing one concrete fix per failed item,
-//! so the checklist itself stays scannable instead of interleaving status
-//! and remediation prose line by line. Each checklist line also carries
-//! its check's own short id (`CheckId::name()`, e.g. `crun-version`) next
-//! to the plain-English name -- the same id the audit log and
-//! `--verbose` detail use, so a line here can be matched straight to
-//! either without guessing.
-//! Everything beyond that id -- exact binaries, packages, error text --
-//! is reserved for `--verbose`/`-v` -- shown as a dimmed line under each
-//! fix -- and for the audit log, which always gets the full technical
-//! detail regardless of this flag.
+//! Default output is a plain-English pass/fail checklist, then (only if
+//! something's missing) a separate "here's what to do" section with one
+//! concrete fix per failed item. Each checklist line carries the check's
+//! short id (`CheckId::name()`) alongside the plain-English name, matching
+//! the audit log and `--verbose` detail. Exact binaries/packages/error
+//! text are reserved for `--verbose` and the audit log.
 
 mod output;
 
@@ -106,17 +92,10 @@ fn friendly_status(check: CheckId) -> &'static str {
     }
 }
 
-/// A failed check's fix, split into a one-line "what/why" and, separately,
-/// the exact commands to run -- so the two never run together mid-sentence
-/// (naming the actual thing to install, e.g. "podman", since "install the
-/// container runtime" is meaningless to someone who doesn't already know
-/// that's what it means). Deeper internals (exact error text, PATH
-/// resolution) still live in [`technical_detail`], shown only under
-/// `--verbose`.
-///
-/// Not every check has a runnable command -- a BIOS setting or "there is
-/// no fix" can't be copy-pasted into a terminal, so `commands` is empty
-/// rather than faking one.
+/// A failed check's fix: a one-line reason plus the exact commands to run.
+/// `commands` is empty when there's nothing copy-pasteable (a BIOS
+/// setting, or no fix at all). Deeper internals live in
+/// [`technical_detail`], shown only under `--verbose`.
 struct Fix {
     reason: &'static str,
     commands: &'static [&'static str],
@@ -162,10 +141,8 @@ fn fix_for(check: CheckId) -> Fix {
     }
 }
 
-/// The jargon-bearing detail for a failed check: the internal component
-/// names, the exact error, and what to actually install/configure in
-/// toolchain terms. Reserved for `--verbose` output and the audit log --
-/// never shown by default (per the "no jargon in default output" rule).
+/// Jargon-bearing detail for a failed check. Reserved for `--verbose`
+/// output and the audit log, never shown by default.
 fn technical_detail(check: CheckId) -> &'static str {
     match check {
         CheckId::HostOs => {
@@ -195,16 +172,9 @@ fn technical_detail(check: CheckId) -> &'static str {
     }
 }
 
-/// Prints one line per check in plain English -- just the status, nothing
-/// else -- so the whole list stays scannable at a glance. `habitat
-/// install` is still verify-only -- this only changes what's displayed,
-/// not what's on the host -- so the checklist is safe to print even when
-/// the run is ultimately going to fail.
-///
-/// Passes get a green check mark, failures a red X (colors auto-disabled
-/// when stdout isn't a terminal, or `NO_COLOR` is set -- see `output.rs`).
-/// What to do about a failure lives in [`print_required_steps`], printed
-/// as its own section after the full list rather than interleaved here.
+/// Prints one line per check in plain English. Passes get a green check
+/// mark, failures a red X. What to do about a failure lives in
+/// [`print_required_steps`], printed as its own section afterward.
 fn print_checklist(statuses: &[CheckStatus]) {
     let s = style();
     println!("{}", s.bold("Checking your system..."));
@@ -229,16 +199,9 @@ fn print_checklist(statuses: &[CheckStatus]) {
 }
 
 /// Printed after the checklist, only when at least one check failed: one
-/// numbered step per failed item, each in the same shape -- a bold
-/// "Step X of N -- <name>" heading, a one-line reason, a blank line, then
-/// the exact commands (if any) as a clearly offset, copy-pasteable block,
-/// never embedded mid-sentence. The steps' failed checks don't depend on
-/// each other today (each is a standalone binary/socket presence check),
-/// so the section says so up front rather than implying a required order.
-///
-/// With `verbose`, each step also gets a dimmed line with the raw
-/// technical error and the jargon-bearing fix -- the audit log always has
-/// this detail regardless of the flag.
+/// numbered step per failed item -- a heading, a one-line reason, then any
+/// commands as a copy-pasteable block. With `verbose`, each step also gets
+/// a dimmed line with the raw technical error and jargon-bearing fix.
 fn print_required_steps(statuses: &[CheckStatus], verbose: bool) {
     let s = style();
     let failed: Vec<_> = statuses
@@ -290,18 +253,8 @@ fn print_required_steps(statuses: &[CheckStatus], verbose: bool) {
     }
 }
 
-/// Checks with a real package-manager fix -- the only ones the
-/// auto-install step ever offers to run something for. `HostOs` (no fix
-/// on this host at all) and `Kvm` (a firmware setting, not a package) are
-/// never included. `CrunVersion`, `Libkrunfw`, and `Betterleaks` each have
-/// a package on the Dnf family only (`package_manager::package_for`
-/// returns `None` for any of them on Apt); the auto-install step already
-/// reports `NotAvailable` rather than guessing there, so it's safe to
-/// list them here alongside the other two. `CrunVersion` and `Libkrunfw`
-/// additionally have a same-family fallback (`installer::attempt_one`)
-/// for hosts where the plain package name doesn't resolve to a
-/// trusted-enough version at all -- see `package_manager::
-/// CRUN_FALLBACK_URL`/`CRUN_KRUN_FALLBACK_URL` and `LIBKRUNFW_FALLBACK_URL`.
+/// Checks with a real package-manager fix. `HostOs` (no fix at all) and
+/// `Kvm` (a firmware setting) are never included.
 fn is_installable(check: CheckId) -> bool {
     matches!(
         check,
@@ -315,8 +268,8 @@ fn is_installable(check: CheckId) -> bool {
 }
 
 /// Reads a yes/no answer from stdin, defaulting to "no" on anything else
-/// (including EOF/a piped-empty stdin) -- an ambiguous answer must never
-/// be treated as consent to run `sudo` commands.
+/// (including EOF) -- an ambiguous answer must never be treated as
+/// consent to run `sudo` commands.
 fn prompt_yes_no(question: &str) -> bool {
     use std::io::Write;
     print!("{question} [y/N] ");
@@ -353,13 +306,9 @@ fn print_install_attempts(attempts: &[InstallAttempt], s: output::Style) {
     println!();
 }
 
-/// What happens once the operator has agreed to auto-install: either a
-/// recognized package-manager family to actually run installs through, or
-/// an explicit "nothing to run" -- decided once, up front, so `cmd_install`
-/// is a straight match on this rather than interleaving detection with
-/// the printing/execution that follows. Kept as its own function (over
-/// `crates/install`'s own `Environment` seam) so this decision is
-/// unit-testable without going through stdin/stdout at all.
+/// What happens once the operator has agreed to auto-install: a
+/// recognized package-manager family to run installs through, or an
+/// explicit "nothing to run".
 enum AutoInstallPlan {
     Run(PackageFamily),
     NoFamilyDetected,
@@ -394,9 +343,7 @@ fn cmd_install(verbose: bool) -> ExitCode {
             AutoInstallPlan::Run(family) => {
                 let attempts = install_missing(&env, &audit, family, &fixable_failed);
                 print_install_attempts(&attempts, s);
-                // Re-run the checks from scratch rather than trusting the
-                // install commands' own exit codes -- the same fail-closed
-                // posture as everything else in this crate.
+                // Re-verify rather than trust the install commands' exit codes.
                 statuses = install_report(&env);
                 print_checklist(&statuses);
             }
@@ -419,10 +366,6 @@ fn cmd_install(verbose: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(_) => {
-            // The required-steps section below already says what to do
-            // about each failure -- don't repeat it as a second,
-            // error-shaped line; just close out and point at where the
-            // full technical detail lives.
             print_required_steps(&statuses, verbose);
             eprintln!(
                 "{}",
@@ -438,12 +381,8 @@ fn cmd_run(verbose: bool) -> ExitCode {
     let env = SystemEnvironment;
     let audit = audit_sink();
     print_intro("Getting your session ready");
-    // Phase 7 hasn't wired up `--config`/full CLI parsing yet, but the
-    // one config field this preflight step needs (`secrets_scan.content`)
-    // is cheap to read now: a missing `sandbox.yaml` in the current
-    // directory resolves to `ProjectConfig::default()` (both toggles
-    // enabled), same "absence is just defaults" contract as
-    // `habitat_policy::config::load` documents.
+    // A missing `sandbox.yaml` in the current directory resolves to
+    // `ProjectConfig::default()` (`habitat_policy::config::load`).
     let secrets_scan_content_enabled =
         habitat_policy::config::load(std::path::Path::new("sandbox.yaml"))
             .map(|c| c.secrets_scan.content.is_enabled())
@@ -453,9 +392,6 @@ fn cmd_run(verbose: bool) -> ExitCode {
     let s = style();
     match run_preflight(&env, &audit, secrets_scan_content_enabled) {
         Ok(()) => {
-            // Phase 1 stops here. Phases 2-6 (disk build, VM launch,
-            // two-point sync, egress, full audit) are assembled behind
-            // this point in Phase 7.
             eprintln!(
                 "{}",
                 s.green_bold(
@@ -465,8 +401,6 @@ fn cmd_run(verbose: bool) -> ExitCode {
             ExitCode::FAILURE
         }
         Err(_) => {
-            // Same reasoning as cmd_install: the required-steps section
-            // below already says what to do about each failure.
             print_required_steps(&statuses, verbose);
             eprintln!(
                 "{}",
@@ -478,9 +412,8 @@ fn cmd_run(verbose: bool) -> ExitCode {
     }
 }
 
-/// Points at the audit log for full technical detail, phrased for a
-/// reader who doesn't necessarily know what an audit log is. Nudges
-/// towards `--verbose` unless the caller already used it.
+/// Points at the audit log for full technical detail; nudges towards
+/// `--verbose` unless the caller already used it.
 fn print_detail_pointer(s: &output::Style, audit: &habitat_audit::FileAuditSink, verbose: bool) {
     eprintln!(
         "{}",
@@ -502,12 +435,8 @@ mod tests {
     use super::*;
     use habitat_install::testing::FakeEnvironment;
 
-    /// The fallback path (`§6` in `tmp/wip/phase-1-tasks.md`): a host whose
-    /// package-manager family can't be recognized (or whose
-    /// `/etc/os-release` is missing/unreadable) must resolve to
-    /// `NoFamilyDetected` -- never a guessed family, and never `Run`, which
-    /// is the only variant `cmd_install` will actually invoke
-    /// `install_missing` for.
+    /// An unrecognized package-manager family must resolve to
+    /// `NoFamilyDetected`, never a guessed family.
     #[test]
     fn unrecognized_distro_plans_no_auto_install() {
         let env =
@@ -527,9 +456,6 @@ mod tests {
         ));
     }
 
-    /// The recognized-family counterpart, so this test only fails for the
-    /// right reason (a real regression) rather than `AutoInstallPlan`
-    /// always resolving to `NoFamilyDetected` regardless of input.
     #[test]
     fn recognized_distro_plans_to_run_on_its_family() {
         let env = FakeEnvironment::linux().with_file("/etc/os-release", "ID=ubuntu\n");

@@ -1,23 +1,14 @@
 //! Builds the staging directory: a filtered copy of a project, with the
-//! secrets blocklist enforced *before* anything is written -- the
-//! enforcement point this phase exists to place correctly (AGENTS.md
-//! Section 2 invariant 2). There is no "copy everything, then delete the
-//! blocked files" step anywhere in this module: each file is decided
-//! on -- blocked or not -- before it is ever read or written, so a
-//! blocked file's bytes never touch the staging directory even
-//! transiently.
+//! secrets blocklist enforced *before* anything is written (AGENTS.md
+//! Section 2 invariant 2) -- each file is decided on before it is ever
+//! read or written, never copied then scrubbed.
 //!
-//! `.git` is deliberately never walked by this module -- git-history
-//! handling (synthetic seed vs. real read-only copy) is a distinct
-//! decision made by [`crate::gitseed`], not a file the ordinary blocklist
-//! walk should ever copy on its own.
+//! `.git` is never walked here -- git-history handling is a distinct
+//! decision made by [`crate::gitseed`].
 //!
-//! Symlinks are skipped outright, not followed. A symlink inside a
-//! project could point anywhere on the host filesystem (e.g. at a real
-//! `~/.ssh/id_rsa` via a relative `../../..` target) -- following it
-//! would let a filename-based blocklist be defeated by indirection, and
-//! copying it as a broken/dangling link into the sandbox has no benefit.
-//! This is a known, deliberate limitation, not an oversight.
+//! Symlinks are skipped outright, not followed -- following one could let
+//! a filename-based blocklist be defeated by indirection (e.g. a link to
+//! `~/.ssh/id_rsa`). Deliberate limitation, not an oversight.
 
 use crate::command_runner::CommandRunner;
 use crate::content_scan::{self, ScanOutcome};
@@ -25,18 +16,16 @@ use habitat_policy::blocklist;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// One file skipped by the content scan -- either a real finding, or a
-/// scanner error (both fail closed to "don't copy", per
-/// `crate::content_scan`'s contract; this struct exists so the report can
-/// still tell the two apart for audit/debugging).
+/// One file skipped by the content scan -- either a real finding or a
+/// scanner error (both fail closed to "don't copy"); kept separate so the
+/// report can tell the two apart for audit/debugging.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentScanSkip {
     pub path: String,
     pub reason: String,
 }
 
-/// The result of one staging build: what was copied, and -- for audit
-/// (Phase 6) and this phase's adversarial test -- exactly what was
+/// The result of one staging build: what was copied, and what was
 /// skipped and why.
 #[derive(Debug, Default, Clone)]
 pub struct StagingReport {
@@ -46,13 +35,11 @@ pub struct StagingReport {
     pub skipped_content_scan: Vec<ContentScanSkip>,
 }
 
-/// Wires a content scanner into [`build_staging_dir`]: the `betterleaks`
-/// binary is run through `runner`, against the already-resolved,
-/// already-merged effective ruleset at `ruleset_path`
-/// (`habitat_policy::secrets_scan`). Passing `None` to `build_staging_dir`
-/// means content scanning is off for this build (the project's
-/// `secrets_scan.content: disabled`) -- the filename blocklist still
-/// applies either way, independently (AGENTS.md Section 2 invariant 8).
+/// Wires a content scanner into [`build_staging_dir`]: runs `betterleaks`
+/// via `runner` against the resolved ruleset at `ruleset_path`
+/// (`habitat_policy::secrets_scan`). `None` disables content scanning for
+/// this build; the filename blocklist still applies independently
+/// (AGENTS.md Section 2 invariant 8).
 pub struct ContentScanConfig<'a> {
     pub runner: &'a dyn CommandRunner,
     pub ruleset_path: &'a Path,
@@ -60,12 +47,9 @@ pub struct ContentScanConfig<'a> {
 
 /// Copies `project_root` into `staging_dir` (which must not already
 /// exist), applying `patterns` to every regular file before it is copied,
-/// then -- if `content_scan` is `Some` -- scanning whatever survived that
-/// filename filter with `betterleaks` before it, too, is copied. Both
-/// checks run *before* any byte of a given file is written into staging;
-/// there is no "copy then scrub" step for either mechanism (AGENTS.md
-/// Section 2 invariant 2). `.git` at the project root is always skipped
-/// here regardless of the git-history toggle -- see [`crate::gitseed`].
+/// then -- if `content_scan` is `Some` -- scanning survivors with
+/// `betterleaks` before they too are copied. `.git` at the project root
+/// is always skipped here -- see [`crate::gitseed`].
 pub fn build_staging_dir(
     project_root: &Path,
     staging_dir: &Path,
@@ -110,9 +94,7 @@ fn walk(
         let relative = relative_slash_path(project_root, &path);
 
         if relative == ".git" {
-            // Git-history handling is a separate, explicit decision
-            // (`crate::gitseed`) -- never copied by the ordinary walk.
-            continue;
+            continue; // handled separately by crate::gitseed
         }
 
         if file_type.is_symlink() {
@@ -159,10 +141,8 @@ fn walk(
     Ok(())
 }
 
-/// `path`'s location relative to `root`, rendered with `/` separators
-/// regardless of host path conventions -- the blocklist's matching rule
-/// (`habitat_policy::blocklist`) is defined in terms of `/`-separated
-/// relative paths.
+/// `path`'s location relative to `root`, rendered with `/` separators --
+/// `habitat_policy::blocklist` matches on `/`-separated relative paths.
 fn relative_slash_path(root: &Path, path: &Path) -> String {
     let rel: PathBuf = path.strip_prefix(root).unwrap_or(path).to_path_buf();
     rel.components()
@@ -268,10 +248,6 @@ mod tests {
         fs::remove_dir_all(&staging).unwrap();
     }
 
-    /// The content scanner runs on files that already passed the filename
-    /// filter, on the same block-from-copy path -- a finding stops the
-    /// file being copied, exactly like a blocklist hit, and never
-    /// half-copies it first.
     #[test]
     fn content_scan_blocks_a_file_the_filename_filter_would_have_let_through() {
         use crate::command_runner::testing::FakeCommandRunner;
@@ -323,10 +299,8 @@ mod tests {
         fs::remove_dir_all(&staging).unwrap();
     }
 
-    /// `None` (content scanning disabled) must never invoke the scanner
-    /// at all -- confirmed here by using a runner that has no invocations
-    /// configured, so any call to it would panic/error the test via a
-    /// broken build rather than silently succeeding.
+    /// Uses a runner with no invocations configured, so any call to it
+    /// would error the test instead of silently succeeding.
     #[test]
     fn content_scan_disabled_means_no_scan_is_ever_run() {
         let project = temp_dir("project-content-scan-disabled");

@@ -1,81 +1,52 @@
 //! Builds and runs the `podman run` invocation that starts one session's
 //! microVM against a Phase 2 disk image, and the corresponding teardown
 //! invocation. Argv construction ([`build_run_args`]) is pure logic and
-//! fully unit-tested here; actually booting against real KVM and
-//! attempting an escape is Phase 3's `tests/manual` runbook's job -- this
-//! dev container and this project's CI (`ubuntu-latest`, no nested
-//! virtualization) have neither Podman+krun installed nor `/dev/kvm`
-//! (`tmp/wip/implementation-plan.md`'s Phase 3 exit gate).
+//! fully unit-tested here; actually booting against real KVM is
+//! `tests/manual`'s job, since neither this dev container nor CI has
+//! `/dev/kvm`.
 //!
-//! **Real-hardware caveat, same shape as Phase 1's krun-runtime
-//! package/binary-name lesson
-//! (`docs/decisions/0003-container-engine-runtime-layer.md`):** the exact
-//! OCI annotation crun-krun expects for attaching an extra `virtio-blk`
-//! device ([`WORKSPACE_DISK_ANNOTATION`]) is this launcher's current best
-//! understanding, not yet confirmed against real crun-krun on real
-//! hardware. Confirming (and, if it differs, correcting) that annotation
-//! key is explicitly part of Phase 3's real-hardware runbook
-//! (`tests/manual/validate-vm-launch.sh`), not something to assume
-//! correct by inspection (`AGENTS.md` Section 3).
+//! **Real-hardware caveat:** the OCI annotation crun-krun expects for
+//! attaching the extra `virtio-blk` device ([`WORKSPACE_DISK_ANNOTATION`])
+//! is this launcher's current best understanding, not yet confirmed
+//! against real crun-krun (`tests/manual/validate-vm-launch.sh` covers
+//! that).
 //!
-//! **Guest reachability under `pasta` is by published port, not by a
-//! distinct guest IP** (`docs/decisions/0008-guest-exec-channel.md`,
-//! second correction): a real run confirmed `podman exec` doesn't work
-//! against `krun` at all, and a *second* real run confirmed the initial
-//! SSH fix's own assumption was also wrong -- `podman inspect`'s
-//! `NetworkSettings` fields (`IPAddress`, `Gateway`, everything) all come
-//! back empty for a `pasta`-backed container, because `pasta` is a
-//! user-mode translator with no Podman-tracked container-side IP for
-//! `inspect` to report in the first place. Reachability instead goes
-//! through an explicit `--publish` port (bound to `127.0.0.1` only --
-//! this exec channel must never be reachable from outside the host
-//! machine), resolved after launch via [`guest_ssh_port`].
+//! **Guest reachability under `pasta` is by published port, not guest
+//! IP:** `podman inspect`'s `NetworkSettings` fields come back empty for
+//! a `pasta`-backed container (`pasta` is a user-mode translator with no
+//! Podman-tracked container-side IP), so reachability goes through an
+//! explicit `--publish` port bound to `127.0.0.1` only, resolved after
+//! launch via [`guest_ssh_port`].
 
 use crate::command_runner::CommandRunner;
 use crate::session::{LaunchRequest, LaunchedSession};
 use std::fmt;
 
 /// Path to the `krun` binary invoked as podman's `--runtime`. Not
-/// `crun-krun` -- see `crates/install/src/checks.rs::krun_runtime`'s doc
-/// comment for why the package and binary names differ; the same
-/// distinction applies here.
+/// `crun-krun` -- see `crates/install/src/checks.rs::krun_runtime` for
+/// why the package and binary names differ.
 pub const KRUN_RUNTIME: &str = "krun";
 
-/// The OCI annotation key this launcher uses to tell crun-krun which
-/// extra disk image to attach to the guest as a `virtio-blk` device,
-/// alongside the guest's own root filesystem (`0005-storage-layer.md`).
-/// See this module's doc comment for the real-hardware caveat on this
-/// specific key.
+/// OCI annotation key telling crun-krun which extra disk image to attach
+/// to the guest as a `virtio-blk` device. See this module's doc comment
+/// for the real-hardware caveat on this key.
 pub const WORKSPACE_DISK_ANNOTATION: &str = "io.habitat.vm.workspace-disk";
 
-/// The environment variable this launcher uses to hand the guest its
-/// per-session authorized SSH public key (`guest/entrypoint.sh` installs
-/// it into `~/.ssh/authorized_keys`). Not a secret -- see
-/// `docs/decisions/0008-guest-exec-channel.md` for why a plaintext env
-/// var is fine here even though `AGENTS.md` Section 2 invariant 5
-/// forbids one for credentials/API keys.
+/// Env var carrying the guest's per-session authorized SSH public key
+/// (`guest/entrypoint.sh` installs it into `~/.ssh/authorized_keys`).
+/// Not a secret, so a plaintext env var is fine here.
 pub const AUTHORIZED_KEY_ENV: &str = "HABITAT_AUTHORIZED_KEY";
 
-/// The guest-side port `sshd` listens on (`guest/entrypoint.sh`) -- not
-/// the standard port 22. Confirmed on real Fedora 44 hardware
-/// (2026-09-16, `tmp/wip/vm-launch-validation`): `krun.use_passt=1`'s
-/// internal `passt` forwarding (separate from Podman's own `pasta`
-/// network setup -- see `crates/egress/src/network_setup.rs`'s doc
-/// comment) cannot forward privileged ports (<1024) into the guest at
-/// all; the TCP handshake completes but the connection resets as soon as
-/// data flows (upstream: <https://github.com/containers/crun/issues/2251>).
-/// Port 22 hit this every time (`kex_exchange_identification: read:
-/// Connection reset by peer`, immediately after `Connection established`);
-/// 1024+ does not. This exec channel is loopback-only and never exposed
-/// externally (`GUEST_SSH_HOST`), so there's no reason it needs the
-/// privileged port at all.
+/// The guest-side port `sshd` listens on -- not 22. Confirmed on real
+/// hardware: `krun.use_passt=1` forwarding can't forward privileged
+/// ports (<1024) into the guest at all (TCP handshake completes but the
+/// connection resets on first data; upstream:
+/// <https://github.com/containers/crun/issues/2251>). This channel is
+/// loopback-only anyway, so there's no reason to fight for port 22.
 const GUEST_SSH_PORT: u16 = 2222;
 
-/// The host address the guest's SSH port is published to
-/// (`build_run_args`'s `--publish`). Always loopback -- this exec
-/// channel is a host<->guest control path, never something another
-/// machine on the network should be able to reach, so this is `127.0.0.1`
-/// unconditionally, never `0.0.0.0` or left to Podman's default.
+/// Host address the guest's SSH port is published to. Always loopback --
+/// this exec channel must never be reachable from another machine.
 pub const GUEST_SSH_HOST: &str = "127.0.0.1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,30 +69,21 @@ fn err(message: impl Into<String>) -> LaunchError {
 }
 
 /// Builds the argv for `podman run ...` from a [`LaunchRequest`] -- pure,
-/// no side effects, so command construction is fully testable without
-/// Podman/krun/KVM actually present.
+/// no side effects, fully testable without Podman/krun/KVM present.
 ///
-/// Deliberately absent from this argv, by construction: any `-v` or
-/// `--mount type=bind` flag. The workspace disk crosses in exactly once,
-/// via the `--annotation` below, resolved at launch -- never a live,
-/// continuously-mounted share (`AGENTS.md` Section 2, invariant 1;
-/// `0005-storage-layer.md`). Also absent: any host-privilege-widening
-/// flag (`--privileged`, `--cap-add`, `--pid=host`, `--network=host`,
-/// `--security-opt` loosening) -- the containment boundary is the VM
-/// itself, not a hardened container config layered on top of it
-/// (`0003-container-engine-runtime-layer.md`). `tests/adversarial/
-/// containment_escape.rs` pins both of these absences as a mocked-seam
-/// check; the real, booted escape-attempt is `tests/manual`'s job.
+/// Deliberately never includes: a `-v`/`--mount type=bind` flag (the
+/// workspace disk crosses in exactly once, via the `--annotation`
+/// below, never a live mounted share), or any host-privilege-widening
+/// flag (`--privileged`, `--cap-add`, `--pid=host`, `--network=host`) --
+/// the containment boundary is the VM itself. `tests/adversarial/
+/// containment_escape.rs` pins both absences.
 ///
-/// Networking (Phase 5): `habitat_egress::network_setup::
-/// build_network_flags` supplies the `--network`/`--dns` flags -- a real
-/// `passt`-backed interface pinned to the session's egress proxy, never
-/// libkrun's default TSI mode (invisible to host firewall rules) and
-/// never left unset (`docs/decisions/0004-networking-layer.md`). Actual
-/// reachability restriction (making the proxy the *only* address the
-/// guest can reach) is a separate nftables ruleset
-/// (`habitat_egress::network_setup::build_egress_firewall_rules`)
-/// applied alongside this launch, not a `podman run` flag itself.
+/// Networking: `habitat_egress::network_setup::build_network_flags`
+/// supplies `--network`/`--dns`, a real `passt`-backed interface pinned
+/// to the session's egress proxy (never libkrun's default TSI mode).
+/// The reachability-restricting nftables ruleset
+/// (`build_egress_firewall_rules`) is applied separately, not via a
+/// `podman run` flag.
 pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -145,16 +107,8 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
         ),
         "--env".to_string(),
         format!("{AUTHORIZED_KEY_ENV}={}", request.guest_ssh_public_key),
-        // Publish the guest's sshd port to an ephemeral host port,
-        // loopback-only -- the guest exec channel
-        // (docs/decisions/0008-guest-exec-channel.md). `pasta` gives no
-        // separate, `podman inspect`-visible guest IP to dial directly
-        // (confirmed on real hardware: NetworkSettings comes back empty
-        // for every field), so reachability is by published port, the
-        // same mechanism any other Podman networking mode uses for
-        // host<->container reachability. Leaving the host port
-        // unspecified (`::22`) means Podman assigns one, resolved after
-        // launch by `guest_ssh_port`.
+        // Host port left unspecified (`::2222`) -- Podman assigns one,
+        // resolved after launch by `guest_ssh_port`.
         "--publish".to_string(),
         format!("{GUEST_SSH_HOST}::{GUEST_SSH_PORT}/tcp"),
         request.guest_image.clone(),
@@ -162,12 +116,10 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
     args
 }
 
-/// Launches one session: runs `podman run` (detached) with the argv from
-/// [`build_run_args`], resolves the guest's published SSH port
-/// ([`guest_ssh_port`]), and returns a [`LaunchedSession`] handle. Fails
-/// closed on anything but a clean, successful launch -- a non-zero exit,
-/// an unstartable `podman` binary, or a failure resolving the published
-/// port is `Err`, never a "probably fine" partial success.
+/// Launches one session: runs `podman run` (detached), resolves the
+/// guest's published SSH port ([`guest_ssh_port`]), and returns a
+/// [`LaunchedSession`] handle. Fails closed on anything but a clean,
+/// successful launch.
 pub fn launch<R: CommandRunner>(
     request: &LaunchRequest,
     runner: &R,
@@ -198,14 +150,10 @@ pub fn launch<R: CommandRunner>(
 }
 
 /// Resolves the host port a launched session's guest SSH port was
-/// published to, via `podman port <name> <container-port>/tcp`. That
-/// command's normal output shape is one line, `<host>:<port>` (e.g.
-/// `127.0.0.1:34567`) -- this takes the substring after the last `:` and
-/// parses it as a port number. Fails closed (never falls back to a guess
-/// like the container port itself, or an unparsed string) if `podman
-/// port` fails, reports nothing, or its output doesn't parse as
-/// `host:port` -- an unreachable guest exec channel is a launch failure,
-/// not a "sync just won't work this time" degradation.
+/// published to, via `podman port <name> <container-port>/tcp`. Expected
+/// output is one line, `<host>:<port>` -- takes the substring after the
+/// last `:` and parses it as a port number. Fails closed if `podman
+/// port` fails or its output doesn't parse.
 pub fn guest_ssh_port<R: CommandRunner>(
     session_id: &crate::session::SessionId,
     runner: &R,
@@ -232,28 +180,16 @@ pub fn guest_ssh_port<R: CommandRunner>(
     })
 }
 
-/// Tears a session down: force-removes the podman container (even though
-/// `--rm` already asks podman to clean up on a normal stop, this covers a
-/// hung/uncleanly-stopped guest too), deletes the session's disk image,
-/// and deletes its ephemeral SSH keypair
-/// (`docs/decisions/0008-guest-exec-channel.md`). All three steps are
-/// idempotent -- tearing down a session that's already gone (container
-/// already removed, disk and key already deleted) succeeds rather than
-/// erroring, matching this project's standing idempotency bar
-/// (`AGENTS.md` Section 7 / Phase 1's install-run-twice-makes-no-changes
-/// exit gate, applied here to teardown instead of install).
-///
-/// Nothing is left behind that a later session could read or use: no
-/// residual writable artifact, and no residual credential, reachable
-/// once this returns `Ok` (`tmp/wip/implementation-plan.md`'s Phase 3
-/// exit gate).
+/// Tears a session down: force-removes the podman container (covers a
+/// hung/uncleanly-stopped guest, beyond what `--rm` handles on a normal
+/// stop), deletes the disk image, and deletes the ephemeral SSH keypair.
+/// All three steps are idempotent -- tearing down an already-gone
+/// session succeeds rather than erroring.
 pub fn teardown<R: CommandRunner>(
     session: &LaunchedSession,
     runner: &R,
 ) -> Result<(), LaunchError> {
-    // `--ignore` makes `podman rm` treat "no such container" as success
-    // rather than an error -- teardown of an already-gone session must
-    // not fail just because it's already gone.
+    // `--ignore` makes `podman rm` treat "no such container" as success.
     let name = session.session_id.to_string();
     let output = runner
         .run("podman", &["rm", "--force", "--ignore", &name])
@@ -356,13 +292,9 @@ mod tests {
         );
     }
 
-    /// Confirmed on real hardware (`tmp/wip/vm-launch-validation`,
-    /// `tmp/wip/egress-validation`): without this annotation, `crun-krun`
-    /// silently falls back to libkrun's default TSI networking
-    /// regardless of `--network pasta` -- the guest never gets a real
-    /// virtio-net device, and everything downstream that assumes one
-    /// (DHCP, DNS pinning, the egress firewall ruleset) has nothing to
-    /// act on. This must always travel alongside `--network`/`--dns`.
+    /// Without this annotation, `crun-krun` silently falls back to
+    /// libkrun's default TSI networking regardless of `--network pasta`,
+    /// so it must always travel alongside `--network`/`--dns`.
     #[test]
     fn build_run_args_includes_the_krun_use_passt_annotation() {
         let args = build_run_args(&sample_request());
@@ -380,11 +312,8 @@ mod tests {
     fn build_run_args_attaches_the_workspace_disk_via_annotation() {
         let args = build_run_args(&sample_request());
         let expected_value = format!("{WORKSPACE_DISK_ANNOTATION}=/tmp/habitat-test-session.img");
-        // `.position` alone would find the *first* `--annotation` flag --
-        // `build_network_flags` now emits one of its own
-        // (`krun.use_passt=1`) ahead of this one, so this specifically
-        // looks for the workspace-disk annotation's own value rather than
-        // assuming there's only one `--annotation` pair in the argv.
+        // There are two `--annotation` flags in the argv (build_network_flags
+        // emits its own), so match on the value, not the first flag found.
         let ann_idx = args
             .iter()
             .position(|a| a == &expected_value)
@@ -392,10 +321,6 @@ mod tests {
         assert_eq!(args[ann_idx - 1], "--annotation");
     }
 
-    /// No live/continuous file-share mount at any point (`AGENTS.md`
-    /// Section 2, invariant 1) -- pinned at the command-construction
-    /// level here; `tests/adversarial/containment_escape.rs` covers the
-    /// same absence plus the broader host-privilege-widening flags.
     #[test]
     fn build_run_args_never_includes_a_bind_mount_flag() {
         let args = build_run_args(&sample_request());
@@ -415,9 +340,6 @@ mod tests {
         );
     }
 
-    /// The guest exec channel is a host<->guest control path, never
-    /// something another machine on the network should reach -- so the
-    /// published port must always bind loopback only.
     #[test]
     fn build_run_args_publishes_the_ssh_port_to_loopback_only() {
         let args = build_run_args(&sample_request());
@@ -473,7 +395,7 @@ mod tests {
         let invocation = format!("podman {}", arg_refs.join(" "));
         let runner = FakeCommandRunner::default()
             .with_ok(&invocation, "abc123containerid\n")
-            .with_ok(&port_invocation("habitat-test-session"), ""); // empty output
+            .with_ok(&port_invocation("habitat-test-session"), "");
 
         let err = launch(&request, &runner).unwrap_err();
         assert!(err.message.contains("did not parse"));
@@ -482,8 +404,6 @@ mod tests {
     #[test]
     fn launch_fails_closed_when_podman_is_not_on_path() {
         let request = sample_request();
-        // Deliberately no invocation configured on the fake -- simulates
-        // `podman` not being found at all.
         let runner = FakeCommandRunner::default();
         let err = launch(&request, &runner).unwrap_err();
         assert!(err.message.contains("PATH"));
@@ -543,9 +463,6 @@ mod tests {
         );
         let runner = FakeCommandRunner::default()
             .with_ok("podman rm --force --ignore habitat-teardown-session", "");
-        // A second teardown of the same (already torn-down) session must
-        // still succeed, never error just because there's nothing left
-        // to remove.
         assert!(teardown(&session, &runner).is_ok());
         assert!(teardown(&session, &runner).is_ok());
     }

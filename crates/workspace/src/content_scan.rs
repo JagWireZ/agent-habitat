@@ -1,17 +1,12 @@
 //! Content-based secrets scanning (Betterleaks): shells out to the
 //! `betterleaks` binary against one file at a time, at the same
-//! enforcement point the filename blocklist already uses (before
-//! anything is copied into the staging directory, including the very
-//! first copy -- AGENTS.md Section 2 invariant 2). `crate::staging` calls
-//! [`scan_file`] for every file that survived the filename filter; a
-//! finding routes through the exact same "skip, don't copy" decision as
-//! a blocklist hit, and a scanner error routes through it too -- there is
-//! no in-between/"warn only" outcome (AGENTS.md Section 4's "no middle
-//! ground for blocked files" extended here to content scanning as well).
+//! enforcement point the filename blocklist already uses. `crate::staging`
+//! calls [`scan_file`] for every file that survived the filename filter;
+//! a finding or a scanner error both route through the same "skip, don't
+//! copy" decision -- no "warn only" outcome (AGENTS.md Section 4).
 //!
 //! **Betterleaks CLI contract assumed here** (no public spec bundled with
-//! this repo, so this is the narrow slice of behavior this module
-//! depends on and is written against):
+//! this repo):
 //! - `betterleaks scan --config <ruleset.toml> --format json --file <path>`
 //!   scans exactly one file.
 //! - Exit code `0`: no findings.
@@ -31,10 +26,8 @@ pub enum ScanOutcome {
     /// No findings; safe to copy.
     Clean,
     /// A finding, or a scanner error -- either way, this file must not be
-    /// copied. `reason` is a human-readable explanation (findings
-    /// summary, or the fail-closed error message) for the staging
-    /// report/audit trail; treat it as attacker-influenced text (it can
-    /// embed scanner stderr), never interpolated into a shell.
+    /// copied. `reason` can embed scanner stderr; treat as
+    /// attacker-influenced, never interpolate into a shell.
     Blocked(String),
 }
 
@@ -44,11 +37,9 @@ impl ScanOutcome {
     }
 }
 
-/// Scans `path`'s contents against the already-resolved, already-merged
-/// effective ruleset at `ruleset_path` (see
-/// `habitat_policy::secrets_scan::load_effective_ruleset`/`merge_rules`).
-/// Never mutates `path`; only ever reads it (via the `betterleaks`
-/// process, not this function directly).
+/// Scans `path`'s contents against the resolved effective ruleset at
+/// `ruleset_path`. Never mutates `path`, only reads it via the
+/// `betterleaks` process.
 pub fn scan_file(runner: &dyn CommandRunner, path: &Path, ruleset_path: &Path) -> ScanOutcome {
     let Some(path_str) = path.to_str() else {
         return ScanOutcome::Blocked(
@@ -121,12 +112,9 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Parses betterleaks' JSON findings array, extracting each finding's
-/// `"rule_id"` field. Deliberately a narrow, hand-rolled parser rather
-/// than a `serde_json` dependency (no dependency-fetch access in this
-/// workspace, matching `habitat-audit`'s own hand-rolled JSON escaping and
-/// `habitat-policy`'s hand-rolled YAML/TOML-subset parsers) -- it only
-/// needs to handle the one shape this module's contract promises: a flat
-/// JSON array of objects with string-valued fields.
+/// `"rule_id"` field. Hand-rolled rather than a `serde_json` dependency
+/// (no dependency-fetch access in this workspace) -- only needs to
+/// handle a flat JSON array of objects with string-valued fields.
 fn parse_findings(stdout: &[u8]) -> Result<Vec<String>, ParseError> {
     let text = std::str::from_utf8(stdout).map_err(|e| ParseError {
         message: format!("betterleaks output was not valid UTF-8: {e}"),

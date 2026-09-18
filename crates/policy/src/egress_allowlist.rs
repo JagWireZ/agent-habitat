@@ -1,20 +1,12 @@
-//! The default egress allowlist (Phase 5): sensible built-in defaults
-//! plus a per-project extension mechanism, and the matching rule the
-//! local proxy (`crates/egress`) checks every SNI hostname against.
+//! The default egress allowlist: built-in defaults plus a per-project
+//! extension mechanism, and the matching rule the local proxy
+//! (`crates/egress`) checks every SNI hostname against. Same shape as
+//! `crate::blocklist`: defaults baked in via `include_str!`, project
+//! additions are always additive, never a removal/override of a default.
 //!
-//! Same shape as `crate::blocklist` (Phase 2): built-in defaults are
-//! baked into the binary via `include_str!`, never re-read from disk at
-//! runtime, and a project's own additions from its checked-in config are
-//! always additive -- no mechanism here lets a project remove or weaken
-//! a default entry (`docs/plan.md` Section 2.5's "one hardened setup"
-//! rule, applied here ahead of Phase 7 formally wiring the rest of that
-//! config file).
-//!
-//! Matching is by destination hostname only, never by IP address
-//! (`docs/decisions/0004-networking-layer.md`): a connection that names
-//! no hostname at all (e.g. a direct-IP TLS ClientHello with no SNI
-//! extension, or a malformed one) has nothing here to match against and
-//! is denied by construction -- there is no IP-based fallback path.
+//! Matching is by destination hostname only, never IP address: a
+//! connection that names no hostname at all (missing or malformed SNI) has
+//! nothing to match against and is denied by construction.
 
 /// The built-in default patterns (see `policy/egress_allowlist.txt` and
 /// `policy/README.md`).
@@ -35,11 +27,8 @@ fn parse_pattern_lines(src: &str) -> Vec<String> {
         .collect()
 }
 
-/// The allowlist actually enforced for a given project: built-in
-/// defaults plus that project's own additions from its checked-in config
-/// (`crate::config::ProjectConfig::egress_allowlist_additions`).
-/// Additive only -- there is no mechanism here for a project to remove or
-/// weaken a default entry.
+/// The allowlist actually enforced for a project: built-in defaults plus
+/// that project's own additions. Additive only.
 pub fn effective_entries(project_additions: &[String]) -> Vec<String> {
     let mut entries = default_entries();
     entries.extend(
@@ -52,12 +41,8 @@ pub fn effective_entries(project_additions: &[String]) -> Vec<String> {
 
 /// Whether `hostname` (as named by a guest's TLS ClientHello SNI
 /// extension) is reachable under `entries`. Case-insensitive; a trailing
-/// `.` (a fully-qualified DNS name written with one) is stripped before
-/// comparison so `example.com.` and `example.com` match the same entry.
-///
-/// This is the single implementation the local proxy
-/// (`crates/egress::proxy`) calls on every connection -- never
-/// re-derived per call site.
+/// `.` is stripped before comparison so `example.com.` and `example.com`
+/// match the same entry.
 pub fn is_allowed(entries: &[String], hostname: &str) -> bool {
     let hostname = normalize(hostname);
     if hostname.is_empty() {
@@ -79,9 +64,8 @@ fn host_matches(hostname: &str, entry: &str) -> bool {
     match entry.strip_prefix("*.") {
         Some(suffix) => {
             hostname != suffix && hostname.ends_with(suffix) && {
-                // Confirm the match lands on a label boundary, not a bare
-                // string-suffix coincidence (`evilexample.com` must not match
-                // `*.example.com` just because it ends with "example.com").
+                // Must land on a label boundary: `evilexample.com` should not
+                // match `*.example.com` just by string-suffix coincidence.
                 let boundary = hostname.len() - suffix.len();
                 boundary > 0 && hostname.as_bytes()[boundary - 1] == b'.'
             }

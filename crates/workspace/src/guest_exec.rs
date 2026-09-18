@@ -1,30 +1,18 @@
 //! The seam between this crate's sync logic and an actual running guest
-//! session: every guest-side operation goes through the real `ssh`/`scp`
-//! binaries against the guest's published SSH port and this session's
-//! ephemeral private key (`habitat_vm::guest_ssh`), through whatever
-//! `CommandRunner` the caller supplies -- mirroring `habitat-vm`'s own
-//! `CommandRunner` seam for the launcher rather than introducing a
-//! second shelling-out mechanism.
+//! session: every guest-side operation goes through real `ssh`/`scp`
+//! against the guest's published SSH port and this session's ephemeral
+//! private key (`habitat_vm::guest_ssh`), via whatever `CommandRunner`
+//! the caller supplies.
 //!
-//! **This was `podman exec`/`podman cp` through Phase 4's first
-//! implementation.** A real run against a real, booted `krun` guest
-//! confirmed that does not work at all -- `podman exec` is unconditionally
-//! unsupported against the `krun` runtime (`the handler does not support
-//! exec`), a real, currently-unresolved upstream limitation, not
-//! something specific to this project's setup. A *second* real run then
-//! confirmed the initial SSH-by-guest-IP fix's own assumption was also
-//! wrong: `pasta` gives no separate, `podman inspect`-visible guest IP to
-//! dial -- reachability is by an explicitly published port on
-//! `127.0.0.1` instead (`habitat_vm::launcher::guest_ssh_port`). See
-//! `docs/decisions/0008-guest-exec-channel.md` for the full story.
-//! `crate::sync`'s call sites (`.exec()`, `.exec_with_env()`,
-//! `.copy_in()`) are unchanged by either correction -- only what happens
-//! inside this module changed.
+//! This was `podman exec`/`podman cp` originally, but `podman exec` is
+//! unconditionally unsupported against the `krun` runtime, and `pasta`
+//! gives no separate guest IP to dial -- reachability is by a published
+//! port on `127.0.0.1` instead. See
+//! `docs/decisions/0008-guest-exec-channel.md`.
 //!
-//! Actually exercising this against a real, booted guest needs real KVM
-//! (`habitat-vm`'s own exit gate) -- so, same as before, the pure
-//! argv-construction logic here is fully unit-tested against a
-//! `FakeCommandRunner`; the real, booted round-trip is
+//! Exercising this against a real booted guest needs real KVM, so the
+//! argv-construction logic here is unit-tested against a
+//! `FakeCommandRunner`; the real round-trip is
 //! `tests/manual/validate-sync.sh`'s job.
 
 use crate::command_runner::CommandRunner;
@@ -37,12 +25,10 @@ use std::process::Output;
 /// never `root`.
 pub const GUEST_SSH_USER: &str = "habitat";
 
-/// Everything needed to reach one session's guest over SSH: the host
-/// address/port its `sshd` was published to (`habitat_vm::launcher`'s
-/// `GUEST_SSH_HOST`/`guest_ssh_port` -- always loopback, see that
-/// module's real-hardware caveat on why there's no separate guest IP to
-/// address directly under `pasta`) and the per-session ephemeral private
-/// key (`habitat_vm::guest_ssh::generate`) authorized for it.
+/// Everything needed to reach one session's guest over SSH: the loopback
+/// address/port its `sshd` was published to
+/// (`habitat_vm::launcher::guest_ssh_port`) and the per-session ephemeral
+/// private key (`habitat_vm::guest_ssh::generate`) authorized for it.
 #[derive(Debug, Clone, Copy)]
 pub struct GuestEndpoint<'a> {
     pub host: &'a str,
@@ -52,35 +38,27 @@ pub struct GuestEndpoint<'a> {
 
 /// Runs commands *inside* one running guest session via `ssh`, and
 /// copies a file in via `scp`, through whatever `CommandRunner` the
-/// caller supplies for the actual invocation -- this struct never shells
-/// out on its own, it only builds the right argv and delegates.
+/// caller supplies -- this struct never shells out on its own, it only
+/// builds the argv and delegates.
 pub struct GuestExecRunner<'a, R: CommandRunner> {
     inner: &'a R,
     endpoint: GuestEndpoint<'a>,
 }
 
-/// Common `-i`/`-o` options shared by both `ssh` and `scp` invocations --
-/// exposed (not private) so external test targets (`tests/unit/workspace/`,
-/// `tests/adversarial/`) can build the exact expected invocation string
-/// for a `FakeCommandRunner` mock without hand-duplicating this flag
-/// list, the same reason `shell_quote` is public.
+/// Common `-i`/`-o` options shared by `ssh` and `scp` -- public so
+/// external test targets can build the exact expected invocation for a
+/// `FakeCommandRunner` mock.
 ///
-/// - `IdentitiesOnly=yes` -- use exactly the session key given, never any
-///   other identity the calling user's own `ssh-agent` or `~/.ssh/config`
-///   might otherwise offer.
-/// - `StrictHostKeyChecking=accept-new` with `UserKnownHostsFile=/dev/null`
-///   -- this session's guest is a brand-new host every time (a fresh
-///   microVM, not a long-lived server), so there is no persistent host
-///   identity worth pinning across sessions; accept-on-first-use within
-///   this one session's lifetime is the right trust model, not a
-///   downgrade from it.
-/// - `BatchMode=yes` -- never fall back to an interactive prompt (a
-///   password, a passphrase, a host-key confirmation); fail closed
-///   instead, since there is no operator present to answer one.
+/// - `IdentitiesOnly=yes`: use exactly the session key given, never
+///   anything else the caller's `ssh-agent`/`~/.ssh/config` might offer.
+/// - `StrictHostKeyChecking=accept-new` + `UserKnownHostsFile=/dev/null`:
+///   each guest is a fresh microVM with no persistent host identity, so
+///   accept-on-first-use per session is the right trust model.
+/// - `BatchMode=yes`: fail closed instead of an interactive prompt, since
+///   no operator is present to answer one.
 ///
-/// Does **not** include the port flag -- `ssh` and `scp` spell it
-/// differently (`-p` vs `-P`), so [`ssh_option_args`] and
-/// [`scp_option_args`] each add their own.
+/// Does not include the port flag -- `ssh`/`scp` spell it differently
+/// (`-p` vs `-P`).
 fn common_option_args(endpoint: &GuestEndpoint<'_>) -> Vec<String> {
     vec![
         "-i".to_string(),
@@ -113,17 +91,12 @@ pub fn scp_option_args(endpoint: &GuestEndpoint<'_>) -> Vec<String> {
     args
 }
 
-/// Shell-quotes a single token for safe inclusion in the remote command
-/// string OpenSSH hands to the guest's login shell. Unlike `podman
-/// exec`'s pure-argv model, OpenSSH concatenates every argument after the
-/// destination into one string and sends it as-is for the remote shell
-/// to interpret -- so a value containing shell metacharacters would
-/// otherwise be reinterpreted rather than passed through literally.
-/// Wrapping in single quotes and escaping any embedded single quote (the
-/// standard `'\''` technique) makes every token inert regardless of its
-/// content, keeping this channel to the same "never let a string reach a
-/// shell unescaped" posture the rest of this project holds
-/// (`habitat-audit`'s JSON escaping, the blocklist matcher).
+/// Shell-quotes a single token for the remote command string OpenSSH
+/// hands to the guest's login shell. Unlike `podman exec`'s pure-argv
+/// model, OpenSSH concatenates arguments into one string for the remote
+/// shell to interpret, so metacharacters must be neutralized: wraps in
+/// single quotes, escaping embedded quotes with the standard `'\''`
+/// technique.
 pub fn shell_quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('\'');
@@ -141,9 +114,8 @@ pub fn shell_quote(value: &str) -> String {
 pub fn build_remote_command(env: &[(&str, &str)], program: &str, args: &[&str]) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(env.len() + 1 + args.len());
     for (k, v) in env {
-        // `k` is always one of this crate's own fixed identifiers
-        // (`GIT_AUTHOR_NAME` and friends) -- never attacker-influenced --
-        // so only the value needs quoting.
+        // `k` is always one of this crate's fixed identifiers, never
+        // attacker-influenced, so only the value needs quoting.
         parts.push(format!("{k}={}", shell_quote(v)));
     }
     parts.push(shell_quote(program));
@@ -152,9 +124,7 @@ pub fn build_remote_command(env: &[(&str, &str)], program: &str, args: &[&str]) 
 }
 
 /// Builds the full `ssh` argv for one `exec_with_env` call -- exposed so
-/// external test targets can build the exact expected invocation for a
-/// `FakeCommandRunner` mock in one call, rather than re-deriving
-/// [`ssh_option_args`]/[`build_remote_command`]'s combination themselves.
+/// external test targets can build the expected invocation in one call.
 pub fn ssh_exec_args(
     endpoint: &GuestEndpoint<'_>,
     env: &[(&str, &str)],
@@ -173,10 +143,9 @@ impl<'a, R: CommandRunner> GuestExecRunner<'a, R> {
     }
 
     /// `ssh [options] habitat@<addr> '<shell-quoted env prefix + program + args>'`.
-    /// The env prefix is how a guest-side git commit gets the fixed
-    /// synthetic author/committer identity (`crate::gitseed`'s constants)
-    /// without this crate ever needing to set an environment variable on
-    /// the *host* process for a guest-side command.
+    /// The env prefix is how a guest-side git commit gets the synthetic
+    /// author/committer identity without setting an env var on the host
+    /// process.
     pub fn exec_with_env(
         &self,
         env: &[(&str, &str)],

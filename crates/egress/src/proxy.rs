@@ -1,19 +1,14 @@
 //! The local proxy: the single point every guest connection must pass
 //! through, enforcing the default-deny, SNI-based allowlist
-//! (`docs/decisions/0004-networking-layer.md`). Positioning the guest so
-//! this proxy is the *only* reachable address is `crate::network_setup`
-//! and `habitat-vm`'s job, coordinated at launch time -- this module only
-//! covers what happens to a connection that does arrive here.
+//! (`docs/decisions/0004-networking-layer.md`). Making this proxy the
+//! *only* reachable address is `crate::network_setup`'s job.
 //!
-//! One connection, one decision, made once at connection setup and never
-//! revisited: read the guest's TLS ClientHello, extract its SNI hostname
-//! ([`crate::sni`]), check it against the effective allowlist
-//! ([`habitat_policy::egress_allowlist`]), and either relay the raw bytes
-//! to the real destination on port 443 (no TLS termination -- the guest's
-//! own certificate verification runs unmodified end to end) or close the
-//! connection immediately. There is no partial-forward, no "look inside
-//! and decide later" path: nothing is written to the destination until
-//! the decision is `Allowed`.
+//! One connection, one decision made once: read the ClientHello, extract
+//! its SNI hostname ([`crate::sni`]), check it against the allowlist
+//! ([`habitat_policy::egress_allowlist`]), and either relay raw bytes to
+//! the real destination on port 443 (no TLS termination) or close
+//! immediately. Nothing is written to the destination until the decision
+//! is `Allowed`.
 
 use crate::dialer::Dialer;
 use crate::sni;
@@ -24,23 +19,17 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
 
-/// Every allowed connection is forwarded here -- the local proxy is
-/// SNI-based, not a general-purpose port forwarder, and every entry in
-/// the default and per-project allowlist is an HTTPS API or package
-/// registry (`policy/egress_allowlist.txt`).
+/// Every allowed connection is forwarded here; every allowlist entry is an
+/// HTTPS API or package registry (`policy/egress_allowlist.txt`).
 pub const UPSTREAM_TLS_PORT: u16 = 443;
 
-/// Caps how many bytes of a guest's opening bytes this proxy will buffer
-/// while waiting for a complete TLS record to arrive -- matches the TLS
-/// specification's own maximum record body size (2^14) plus the 5-byte
-/// record header, so no well-formed ClientHello is ever cut off, while a
-/// connection that never produces one (or floods bytes instead) is
-/// bounded rather than let grow the buffer without limit.
+/// Buffer cap while waiting for a complete TLS record: TLS's max record
+/// body (2^14) plus the 5-byte header, so no well-formed ClientHello is
+/// cut off while a flooding connection is still bounded.
 const MAX_HELLO_BYTES: usize = 5 + 16384;
 
-/// One connection's outcome -- returned so tests (and, later, a fuller
-/// Phase 6 aggregation) can observe what happened without re-deriving it
-/// from log side effects.
+/// One connection's outcome, so tests can observe it without re-deriving
+/// it from log side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionOutcome {
     /// Relayed to `host` until either side closed the connection.
@@ -51,12 +40,8 @@ pub enum ConnectionOutcome {
     Denied { host: Option<String> },
 }
 
-/// Reads bytes from `client` until a complete TLS record is buffered (or
-/// the guest closes the connection, or the record grows past
-/// [`MAX_HELLO_BYTES`]), then makes and acts on the allow/deny decision.
-/// Fails closed at every step: a read error, an incomplete/malformed
-/// record, or a denied hostname all end in the connection being closed
-/// with nothing forwarded -- never a partial relay.
+/// Reads until a complete TLS record is buffered, then makes and acts on
+/// the allow/deny decision. Fails closed at every step.
 pub fn handle_connection<D: Dialer, A: AuditSink>(
     mut client: TcpStream,
     allowlist: &[String],
@@ -87,19 +72,13 @@ pub fn handle_connection<D: Dialer, A: AuditSink>(
 
     emit(audit, EventKind::EgressAllowed, Some(&host));
     let mut upstream = dialer.connect(&host, UPSTREAM_TLS_PORT)?;
-    // Forward the ClientHello bytes already consumed from `client` before
-    // relaying everything else -- the destination must see the exact
-    // same bytes a direct connection would have sent it.
     upstream.write_all(&hello)?;
     relay(client, upstream)?;
     Ok(ConnectionOutcome::Allowed { host })
 }
 
-/// Accumulates bytes from `client` until [`sni::record_is_complete`]
-/// says a full TLS record has arrived. Returns `Ok(None)` (not an error)
-/// on a clean EOF before that -- a guest that opens a connection and
-/// closes it without ever sending a full ClientHello has nothing to
-/// evaluate, which is the same as denying it, not a proxy failure.
+/// Accumulates bytes until [`sni::record_is_complete`] says a full record
+/// has arrived. `Ok(None)` (not an error) on a clean EOF before that.
 fn read_client_hello(client: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -119,9 +98,7 @@ fn read_client_hello(client: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
 }
 
 /// Bidirectionally copies bytes between `client` and `upstream` until
-/// either side closes -- a plain byte relay, never inspecting or
-/// modifying anything past this point (the TLS session itself stays
-/// end-to-end between the guest and the real destination).
+/// either side closes.
 fn relay(client: TcpStream, upstream: TcpStream) -> io::Result<()> {
     let mut client_read = client.try_clone()?;
     let mut client_write = client;
@@ -149,11 +126,8 @@ fn emit<A: AuditSink>(audit: &A, kind: EventKind, host: Option<&str>) {
     let _ = audit.record(&AuditEvent::now(kind, host, message));
 }
 
-/// Runs the proxy's accept loop against `listen_addr` until the listener
-/// itself errors out (e.g. the socket is closed from elsewhere). Each
-/// connection is handled on its own thread so one slow or stalled guest
-/// connection can never block another's decision -- there is no shared
-/// per-connection state beyond the (read-only, cloned) allowlist.
+/// Runs the proxy's accept loop until the listener errors out. Each
+/// connection is handled on its own thread.
 pub fn run<D, A>(
     listen_addr: std::net::SocketAddr,
     allowlist: Vec<String>,
@@ -185,10 +159,8 @@ mod tests {
     use habitat_audit::MemoryAuditSink;
     use std::net::{Shutdown, TcpListener};
 
-    /// Spins up a fixture "real destination": accepts one connection,
-    /// records everything it received, writes back a fixed response,
-    /// then closes. Returns its address so a `FakeDialer` can route an
-    /// allowed hostname to it.
+    /// Fixture "real destination": accepts one connection, records what it
+    /// received, writes back a fixed response, then closes.
     fn spawn_fixture_upstream_with_response(
         response: &'static [u8],
     ) -> (std::net::SocketAddr, thread::JoinHandle<Vec<u8>>) {
@@ -299,13 +271,9 @@ mod tests {
         assert_eq!(events[0].check.as_deref(), Some("attacker.example"));
     }
 
-    /// A crafted allowlist-lookalike hostname (a real SNI, just not an
-    /// entry on the list -- e.g. attempting to smuggle past `*.example.
-    /// com` with `example.com.attacker.example`) must be denied exactly
-    /// like any other non-matching hostname; the allowlist matcher
-    /// (`habitat_policy::egress_allowlist`) is what's actually
-    /// responsible for the comparison, this pins that the proxy acts on
-    /// its answer rather than doing any looser matching of its own.
+    /// A crafted allowlist-lookalike hostname (e.g. smuggling past
+    /// `*.example.com` with `example.com.attacker.example`) must be denied
+    /// like any other non-match.
     #[test]
     fn an_allowlist_lookalike_hostname_is_denied() {
         let dialer = FakeDialer::default();
@@ -331,11 +299,8 @@ mod tests {
         assert!(dialer.attempts.borrow().is_empty());
     }
 
-    /// A direct-IP connection (or any connection that never produces a
-    /// real ClientHello) carries no SNI hostname to match at all -- the
-    /// proxy has no IP-based fallback, so this must be denied exactly
-    /// like a hostname-mismatch denial, not treated as a different, more
-    /// permissive case.
+    /// A direct-IP connection carries no SNI hostname; the proxy has no
+    /// IP-based fallback, so this must be denied like any other.
     #[test]
     fn a_connection_with_no_readable_sni_is_denied() {
         let dialer = FakeDialer::default();
@@ -369,7 +334,6 @@ mod tests {
         let proxy_addr = proxy_listener.local_addr().unwrap();
 
         thread::spawn(move || {
-            // Only 3 bytes, then hang up -- never a complete record.
             connect_guest_and_send(proxy_addr, &[0x16, 0x03, 0x01]);
         });
 

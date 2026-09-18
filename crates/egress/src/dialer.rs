@@ -1,10 +1,6 @@
-//! Seam between the proxy's connection-handling logic and the outbound
-//! TCP connection it opens to an allowed destination -- mirrors
-//! `habitat-vm`'s `CommandRunner` and `habitat-install`'s `Environment`
-//! seams so allow/deny/relay logic is fully unit-testable over real
-//! loopback sockets without needing a real destination host on the
-//! network (or, for the denial path, any outbound network access at
-//! all).
+//! Seam between the proxy's connection-handling logic and the outbound TCP
+//! connection it opens, so allow/deny/relay logic is unit-testable over
+//! real loopback sockets without a real destination host on the network.
 
 use std::io;
 use std::net::TcpStream;

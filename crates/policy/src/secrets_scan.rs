@@ -10,34 +10,22 @@
 //!   content_rules_path: "./custom-betterleaks.toml"   # optional
 //! ```
 //!
-//! Both default to `enabled` -- disabling either is an explicit, visible
-//! opt-out a team chooses in its checked-in config, never the
-//! out-of-the-box state (`docs/plan.md` Section 2.5's "one hardened
-//! setup" rule).
-//!
-//! This module owns two things: the toggle/config types themselves, and
-//! resolving+merging the *content* ruleset actually handed to the
-//! `betterleaks` binary (`crates/workspace` is what actually shells out to
-//! it -- this module never runs a process). A project's own
-//! `betterleaks.toml` is additive to Habitat's bundled baseline rules,
-//! never a full replacement -- see [`merge_rules`] for why an empty
-//! project ruleset or an overly broad allowlist rule can't be used to
-//! fully disable detection.
+//! Both default to `enabled`. This module owns the toggle/config types and
+//! resolving+merging the *content* ruleset handed to the `betterleaks`
+//! binary (`crates/workspace` shells out to it; this module never runs a
+//! process). A project's own `betterleaks.toml` is additive to the bundled
+//! baseline, never a full replacement -- see [`merge_rules`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// The bundled baseline content-scan ruleset, baked into the binary at
-/// compile time (see `policy/betterleaks-baseline.toml`) -- not re-read
-/// from disk at runtime, mirroring [`crate::blocklist`]'s
-/// `DEFAULT_BLOCKLIST_SRC`: a compromised or edited on-disk copy after
-/// install can't change what ships.
+/// Baked into the binary at compile time, not re-read from disk at runtime
+/// -- an edited on-disk copy after install can't change what ships.
 const BASELINE_RULES_SRC: &str = include_str!("../../../policy/betterleaks-baseline.toml");
 
-/// An `enabled`/`disabled` toggle. Deliberately not a plain `bool` in the
-/// config schema -- `enabled`/`disabled` reads unambiguously in a checked-
-/// in YAML file, where `true`/`false` alone doesn't say what's being
-/// toggled.
+/// An `enabled`/`disabled` toggle. Not a plain `bool` -- reads unambiguously
+/// in a checked-in YAML file, where `true`/`false` alone doesn't say what's
+/// being toggled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Toggle {
     Enabled,
@@ -58,8 +46,6 @@ impl Toggle {
     }
 }
 
-/// Both mechanisms default to enabled -- this is what makes disabling
-/// either one an explicit, visible opt-out rather than the shipped state.
 impl Default for Toggle {
     fn default() -> Self {
         Toggle::Enabled
@@ -69,15 +55,13 @@ impl Default for Toggle {
 /// The `secrets_scan:` slice of a project's checked-in config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretsScanConfig {
-    /// The existing filename blocklist mechanism ([`crate::blocklist`]),
-    /// now named explicitly rather than being always-on with no toggle.
+    /// The filename blocklist mechanism ([`crate::blocklist`]).
     pub filenames: Toggle,
-    /// The new Betterleaks-based content scan.
+    /// The Betterleaks-based content scan.
     pub content: Toggle,
     /// Optional override pointing at a custom Betterleaks ruleset. If
-    /// unset, resolution falls back to a `betterleaks.toml` in the
-    /// mounted project root, then to the bundled baseline alone -- see
-    /// [`resolve_project_rules_path`].
+    /// unset, falls back to a `betterleaks.toml` in the project root, then
+    /// the bundled baseline alone -- see [`resolve_project_rules_path`].
     pub content_rules_path: Option<String>,
 }
 
@@ -111,21 +95,16 @@ fn err(message: impl Into<String>) -> ContentRulesError {
 }
 
 /// The bundled baseline ruleset text -- always the starting point of
-/// [`merge_rules`], regardless of what a project supplies.
+/// [`merge_rules`].
 pub fn baseline_rules() -> &'static str {
     BASELINE_RULES_SRC
 }
 
 /// Resolves which on-disk path (if any) holds the project's own additive
-/// ruleset, per the documented order:
-///
-/// 1. `configured` (the config file's `content_rules_path`, if set) --
-///    resolved relative to `project_root` when it isn't already absolute.
-/// 2. A `betterleaks.toml` found at `project_root`, if one exists.
-/// 3. Neither -- `None`, meaning the bundled baseline alone applies.
-///
-/// This only resolves a *path*; it never reads file contents (see
-/// [`load_effective_ruleset`] for that).
+/// ruleset: `configured` (resolved relative to `project_root` if not
+/// absolute) if set, else a `betterleaks.toml` at `project_root` if one
+/// exists, else `None` (bundled baseline alone applies). Only resolves a
+/// *path*; never reads contents (see [`load_effective_ruleset`]).
 pub fn resolve_project_rules_path(
     project_root: &Path,
     configured: Option<&str>,
@@ -147,11 +126,9 @@ pub fn resolve_project_rules_path(
 }
 
 /// Resolves and reads the project's own ruleset (if any), then merges it
-/// with the bundled baseline via [`merge_rules`]. This is the one function
-/// that touches the filesystem in this module -- callers that already
-/// have file contents in hand (e.g. a snapshot taken once at session
-/// start, see the module-level note in `crates/workspace`) should call
-/// [`merge_rules`] directly instead of re-reading here.
+/// with the bundled baseline via [`merge_rules`]. The one function here
+/// that touches the filesystem -- callers with file contents already in
+/// hand should call [`merge_rules`] directly instead of re-reading.
 pub fn load_effective_ruleset(
     project_root: &Path,
     configured_path: Option<&str>,
@@ -169,16 +146,11 @@ pub fn load_effective_ruleset(
 }
 
 /// Merges `baseline` (always included, always first) with an optional
-/// project-supplied ruleset (`project`), producing the effective ruleset
-/// text handed to the `betterleaks` binary.
-///
-/// The baseline is unconditionally present in the result regardless of
-/// what `project` contains -- an empty or missing project ruleset can
-/// therefore never weaken detection below the baseline, by construction.
-/// The one thing a project ruleset genuinely could do to weaken detection
-/// -- add an allowlist rule broad enough to suppress findings wholesale
-/// -- is explicitly rejected by [`rejects_if_disables_baseline`] before
-/// being appended.
+/// project-supplied ruleset, producing the effective ruleset text handed to
+/// `betterleaks`. The baseline is unconditionally present, so an empty or
+/// missing project ruleset can never weaken detection below it; a project
+/// ruleset broad enough to suppress findings wholesale (a catch-all
+/// allowlist rule) is rejected by [`reject_if_disables_baseline`] instead.
 pub fn merge_rules(baseline: &str, project: Option<&str>) -> Result<String, ContentRulesError> {
     if let Some(project) = project {
         reject_if_disables_baseline(project)?;
@@ -197,20 +169,12 @@ pub fn merge_rules(baseline: &str, project: Option<&str>) -> Result<String, Cont
     Ok(effective)
 }
 
-/// A project ruleset with no `[allowlist]`/`[[allowlist]]` section at all
-/// is trivially fine -- it can only ever add rules, not suppress them. An
-/// empty ruleset (no content at all) is likewise fine for the same
-/// reason: [`merge_rules`] never omits the baseline.
-///
-/// What is rejected: an allowlist entry whose `regexes`/`regex`/`paths`
-/// value is a catch-all pattern (`.*`, `.+`, `^.*$`, `^.+$`) that would
-/// suppress every finding, from the baseline included, rather than
-/// excluding a specific known-safe case. This is a deliberately narrow,
-/// hand-rolled heuristic (no TOML-parsing dependency is available in this
-/// workspace, matching `blocklist.rs`'s and `config.rs`'s own hand-rolled
-/// parsers) -- it is not a full TOML validator, just a guard against the
-/// specific "disable detection via the allowlist" attack this module's
-/// contract explicitly rules out.
+/// Rejects an allowlist entry whose `regexes`/`regex`/`paths` value is a
+/// catch-all pattern (`.*`, `.+`, `^.*$`, `^.+$`) that would suppress every
+/// finding rather than excluding a specific known-safe case. A deliberately
+/// narrow, hand-rolled heuristic (no TOML-parsing dependency available
+/// here), not a full TOML validator -- just a guard against disabling
+/// detection via the allowlist.
 fn reject_if_disables_baseline(project_src: &str) -> Result<(), ContentRulesError> {
     const CATCH_ALL_PATTERNS: [&str; 4] = [".*", ".+", "^.*$", "^.+$"];
     let mut in_allowlist = false;
@@ -334,8 +298,6 @@ mod tests {
 
     #[test]
     fn merge_rules_rejects_an_empty_project_ruleset_gracefully_not_by_dropping_baseline() {
-        // An empty project ruleset isn't an error -- it's a no-op addition
-        // -- but the baseline must still be present either way.
         let merged = merge_rules("baseline-rule-marker", Some("")).unwrap();
         assert!(merged.contains("baseline-rule-marker"));
     }
@@ -377,8 +339,6 @@ mod tests {
 
         let effective = load_effective_ruleset(&dir, None).unwrap();
         assert!(effective.contains("project-custom-rule"));
-        // Baseline content always present too -- spot-check a pattern that
-        // ships in `policy/betterleaks-baseline.toml`.
         assert!(effective.contains("id = \"generic-api-key\""));
 
         std::fs::remove_dir_all(&dir).unwrap();

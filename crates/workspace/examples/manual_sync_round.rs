@@ -1,15 +1,10 @@
 //! Manual driver for `tests/manual/validate-sync.sh` Steps 4-5.
 //!
-//! Phase 4 has no CLI wiring yet (`habitat run`'s prompt loop is Phase
-//! 7's job), so there is nothing to invoke
-//! `habitat_workspace::sync::sync_host_to_sandbox`/`sync_sandbox_to_host`
-//! against a real, booted guest except a small standalone driver. This
-//! exists only for that manual runbook -- the sync logic itself is
-//! already covered for real by `tests/unit/workspace/sync_exit_gate.rs`
-//! and `tests/adversarial/sync_patch_validation.rs` against
-//! `FakeCommandRunner`; this example's only job is to make one real,
-//! discrete `sync_*` call against a real guest so the runbook's
-//! process-inventory check has something real to observe around.
+//! No CLI wiring exists yet for `sync_host_to_sandbox`/`sync_sandbox_to_host`
+//! against a real booted guest, so this small standalone driver exists
+//! only for that manual runbook -- the sync logic itself is already
+//! covered for real by `tests/unit/workspace/sync_exit_gate.rs` and
+//! `tests/adversarial/sync_patch_validation.rs` against `FakeCommandRunner`.
 //!
 //! Usage:
 //!   cargo run -p habitat-workspace --example manual_sync_round -- \
@@ -84,8 +79,8 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            // A real host-side edit every run, so this is never a no-op
-            // even when re-run against an already-synced state dir.
+            // Real edit every run, so this is never a no-op even when
+            // re-run against an already-synced state dir.
             let stamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

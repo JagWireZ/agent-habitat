@@ -1,17 +1,7 @@
-//! Phase 3 exit-gate tests for `habitat-vm` (`tmp/wip/implementation-plan.md`).
-//!
-//! These are black-box tests of the crate's public contract with the
-//! rest of the system -- run through `launcher::launch`/`launcher::teardown`
-//! exactly as a later phase's `habitat run` would call them -- not pure
-//! internal logic, so per `file-structure.md` Section 2 they live here
-//! under `tests/unit/vm/` rather than as inline `#[cfg(test)]` modules in
-//! `crates/vm/src/`. Wired into `cargo test` via the `[[test]]` target in
-//! `crates/vm/Cargo.toml`.
-//!
-//! The other half of Phase 3's exit gate -- a concrete escape attempt
-//! from inside an actually-booted guest fails -- needs real KVM this dev
-//! container and this project's CI don't have; see
-//! `tests/manual/validate-vm-launch.sh` for that runbook instead.
+//! Black-box exit-gate tests for `habitat-vm`, run through
+//! `launcher::launch`/`launcher::teardown` as `habitat run` would call
+//! them. A concrete escape attempt from inside an actually-booted guest
+//! needs real KVM; see `tests/manual/validate-vm-launch.sh` instead.
 
 use habitat_policy::resource_limits::ResourceLimitsConfig;
 use habitat_vm::command_runner::testing::FakeCommandRunner;
@@ -31,11 +21,8 @@ fn request_with_limits(cpus: f64, memory_mb: u64) -> LaunchRequest {
     }
 }
 
-/// Exit gate: resource limits read from the shared config (Phase 7 will
-/// wire the actual `--config` read; this confirms the value actually
-/// reaches the launch command once it's in hand, not just that the type
-/// exists) show up on the real `podman run` invocation, not just in an
-/// in-memory struct nothing acts on.
+/// Resource limits from config show up on the real `podman run`
+/// invocation, not just in an in-memory struct nothing acts on.
 #[test]
 fn resource_limits_from_config_reach_the_launch_command() {
     let request = request_with_limits(3.0, 6144);
@@ -58,11 +45,9 @@ fn resource_limits_from_config_reach_the_launch_command() {
     assert_eq!(args[mem_idx + 1], "6144m");
 }
 
-/// Exit gate: "teardown actually destroys the virtual disk and VM state
-/// with no residual writable artifact reachable from a later session."
-/// Runs against a real temp file (disk deletion is an ordinary
-/// filesystem operation, not KVM-dependent) and a mocked `podman rm`
-/// (container removal is).
+/// Teardown must destroy the virtual disk and VM state with no residual
+/// artifact reachable from a later session. Disk deletion runs for real;
+/// `podman rm` is mocked (container removal is KVM-dependent).
 #[test]
 fn teardown_leaves_no_residual_disk_image_or_container() {
     let dir = std::env::temp_dir().join(format!(
@@ -106,11 +91,7 @@ fn teardown_leaves_no_residual_disk_image_or_container() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// Exit gate companion: tearing down an already-torn-down session (the
-/// container already gone, the disk already deleted) must succeed rather
-/// than fail -- same idempotency bar as Phase 1's
-/// install-run-twice-makes-no-changes exit gate, applied here to
-/// teardown.
+/// Tearing down an already-torn-down session must succeed, not fail.
 #[test]
 fn teardown_run_twice_makes_no_further_changes() {
     let session = LaunchedSession {

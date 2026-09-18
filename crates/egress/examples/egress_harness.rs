@@ -1,20 +1,13 @@
-//! Throwaway harness that actually runs `habitat-egress`'s proxy and DNS
-//! forwarder against real sockets, for `tests/manual/validate-egress.sh`
-//! Step 2. Phase 7 wires this into `habitat run`'s own lifecycle; until
-//! then this is the "exact invocation" that script's Step 2 comment asks
-//! for, kept in-tree (rather than a one-off shell/cargo incantation) so
-//! it stays in sync with `crate::proxy`/`crate::dns`'s real signatures.
+//! Harness that runs `habitat-egress`'s proxy and DNS forwarder against
+//! real sockets, for `tests/manual/validate-egress.sh`.
 //!
 //! Usage:
 //!   cargo run -p habitat-egress --example egress_harness -- \
 //!       --proxy-addr 127.0.0.1:8443 --dns-addr 127.0.0.1:5300 \
 //!       --audit-log /path/to/audit.jsonl [--project-config /path/to/config.yaml]
 //!
-//! Prints a line starting with `READY` once both the proxy and DNS
-//! forwarder sockets are bound, then blocks forever -- callers wait for
-//! that line rather than guessing at a fixed startup delay, and stop the
-//! process (SIGTERM/SIGKILL) themselves when done; there is no in-band
-//! shutdown request.
+//! Prints a line starting with `READY` once both sockets are bound, then
+//! blocks forever; stop with SIGTERM/SIGKILL.
 
 use habitat_audit::FileAuditSink;
 use habitat_egress::dialer::SystemDialer;
@@ -98,9 +91,8 @@ fn main() {
             .unwrap_or_else(|| "built-in defaults only".to_string())
     );
 
-    // Bind both sockets up front so a failure here (port already in use)
-    // is reported before printing READY, never silently swallowed inside
-    // the loop.
+    // Bind both sockets up front so a port-in-use failure is reported
+    // before printing READY.
     let proxy_listener =
         TcpListener::bind(args.proxy_addr).unwrap_or_else(|e| die(&format!("proxy bind: {e}")));
     let dns_socket = std::net::UdpSocket::bind(args.dns_addr)
@@ -128,13 +120,8 @@ fn main() {
         network_setup::FIREWALL_TABLE
     );
 
-    // proxy::run takes ownership of the accept loop for the rest of the
-    // process's life -- re-bind via the same address rather than reusing
-    // `proxy_listener` directly, since `proxy::run`'s signature owns the
-    // bind step itself (this crate has no split "bind, then run" seam).
-    // The listener above already proved the port is free; drop it right
-    // before `run()` re-binds so there's no window where two listeners
-    // fight over the port under normal (non-adversarial) use.
+    // proxy::run owns its own bind step, so drop this listener right
+    // before it re-binds the same address.
     drop(proxy_listener);
     if let Err(e) = proxy::run(args.proxy_addr, allowlist, dialer, audit) {
         die(&format!("proxy accept loop exited: {e}"));

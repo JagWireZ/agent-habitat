@@ -1,26 +1,15 @@
-//! Seam between this crate's launcher and the external command it shells
-//! out to (`podman`), mirroring `habitat-install`'s `Environment` seam and
-//! `habitat-workspace`'s `CommandRunner` seam so command-construction and
-//! error-handling logic can be unit-tested without a real Podman/krun
-//! install (let alone real KVM) on the machine running the tests.
-//!
-//! Unlike `habitat-workspace`'s `git`/`mke2fs`/`debugfs` calls, actually
-//! *launching* a session through Podman + `krun` needs real hardware
-//! (KVM) this dev container and this project's CI don't have -- so this
-//! seam exists precisely so the pure parts (which argv gets built, how a
-//! non-zero exit or missing binary is reported, teardown's idempotency)
-//! stay testable, while the actually-booted-and-escaped-from case is
-//! `tests/manual`'s job (`tests/manual/README.md`).
+//! Seam between this crate's launcher and the external `podman` command,
+//! mirroring `habitat-install`'s `Environment` and `habitat-workspace`'s
+//! `CommandRunner` seams so argv construction and error handling stay
+//! unit-testable without real Podman/krun/KVM. The actually-booted case
+//! is `tests/manual`'s job (`tests/manual/README.md`).
 
 use std::io;
 use std::process::Output;
 
-/// Runs an external command to completion and returns its output.
-/// Returns `Err` if the program could not even be started (e.g. not
-/// found on `PATH`); a nonzero exit is still `Ok(Output)` with
-/// `status.success() == false`, which callers must check -- same
-/// contract as `habitat_install::Environment::run_command` and
-/// `habitat_workspace::command_runner::CommandRunner::run`.
+/// Runs an external command to completion. `Err` means the program
+/// couldn't even be started; a nonzero exit is still `Ok(Output)` with
+/// `status.success() == false`, which callers must check.
 pub trait CommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output>;
 }
@@ -35,12 +24,10 @@ impl CommandRunner for SystemCommandRunner {
 }
 
 pub mod testing {
-    //! An in-memory `CommandRunner` for tests that need to exercise a
-    //! `podman` invocation succeeding, failing, or being absent, without
-    //! actually running Podman/krun (or needing KVM) on the machine
-    //! running the tests. Not `#[cfg(test)]`-gated so `tests/unit/vm/`
-    //! and `tests/adversarial/` (external dependents of this crate) can
-    //! use it too.
+    //! In-memory `CommandRunner` for exercising a `podman` invocation
+    //! succeeding, failing, or being absent, without real Podman/KVM.
+    //! Not `#[cfg(test)]`-gated so external dependents (`tests/unit/vm/`,
+    //! `tests/adversarial/`) can use it too.
 
     use super::*;
     use std::collections::HashMap;
@@ -57,9 +44,7 @@ pub mod testing {
     #[derive(Default, Clone)]
     pub struct FakeCommandRunner {
         outcomes: HashMap<String, FakeOutcome>,
-        /// Every invocation passed to `run`, in order -- lets a test
-        /// assert exactly what was (or wasn't) actually invoked, e.g.
-        /// that teardown never re-invokes launch's own command.
+        /// Invocations passed to `run`, in order, for tests to assert against.
         pub invocations: std::cell::RefCell<Vec<String>>,
     }
 
@@ -104,9 +89,7 @@ pub mod testing {
             self.invocations.borrow_mut().push(key.clone());
             match self.outcomes.get(&key) {
                 Some(outcome) => Ok(Output {
-                    // See `habitat-workspace`'s `FakeCommandRunner` for
-                    // why this shifts into bits 8-15 rather than using
-                    // the raw value `1` directly.
+                    // ExitStatus::from_raw expects the exit code in bits 8-15.
                     status: ExitStatus::from_raw(if outcome.success { 0 } else { 1 << 8 }),
                     stdout: outcome.stdout.clone().into_bytes(),
                     stderr: outcome.stderr.clone().into_bytes(),

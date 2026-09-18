@@ -1,15 +1,12 @@
 //! Colorized, human-friendly rendering of the checklist `habitat install`
 //! and `habitat run` print.
 //!
-//! Hand-rolled ANSI rather than a coloring crate: `main.rs`'s module doc
-//! already notes Phase 1 avoids taking dependencies where hand-rolling is
-//! simpler, and that holds here too -- two colors and a bold weight don't
-//! justify a new dependency.
+//! Hand-rolled ANSI rather than a coloring crate: two colors and a bold
+//! weight don't justify the dependency.
 //!
-//! Color is suppressed automatically when stdout isn't a terminal (e.g.
-//! piped into a log file or CI) or when `NO_COLOR` is set
-//! (https://no-color.org), and forced on when `CLICOLOR_FORCE` is set to
-//! anything but `"0"` -- the same two env vars most CLI tools honor.
+//! Color is suppressed when stdout isn't a terminal or `NO_COLOR` is set
+//! (https://no-color.org), forced on when `CLICOLOR_FORCE` is set to
+//! anything but `"0"` -- the same env vars most CLI tools honor.
 
 use std::io::IsTerminal;
 use std::sync::OnceLock;

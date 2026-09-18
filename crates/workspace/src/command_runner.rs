@@ -1,45 +1,32 @@
 //! Seam between this crate's disk-build pipeline and the external
 //! commands it shells out to (`git`, `mke2fs`, `debugfs`), mirroring
-//! `habitat-install`'s `Environment` seam so pure error-handling paths
-//! (a command missing, a command failing) can be unit-tested without
-//! actually breaking those tools on the machine running the tests.
+//! `habitat-install`'s `Environment` seam so error-handling paths can be
+//! unit-tested without actually breaking those tools on the test machine.
 //!
-//! Unlike `habitat-install`'s KVM/Podman/krun checks, the tools this
-//! crate shells out to (`git`, e2fsprogs' `mke2fs`/`debugfs`) are
-//! ordinary, widely-available Linux tooling with no real-hardware
-//! dependency -- so the exit-gate and adversarial tests for this phase
-//! run them for real (`SystemCommandRunner`) rather than deferring to a
-//! `tests/manual/` runbook the way Phase 3/5's KVM-dependent tests must.
-//! `FakeCommandRunner` exists only for the narrower unit tests that need
-//! to exercise a command failing.
+//! Unlike `habitat-install`'s KVM/Podman/krun checks, `git`/e2fsprogs have
+//! no real-hardware dependency, so exit-gate and adversarial tests run
+//! them for real via `SystemCommandRunner`; `FakeCommandRunner` is only
+//! for unit tests that need to exercise a command failing.
 
 use std::io;
 use std::process::Output;
 
-/// Runs an external command to completion and returns its output.
-/// Returns `Err` if the program could not even be started (e.g. not
-/// found on `PATH`); a nonzero exit is still `Ok(Output)` with
-/// `status.success() == false`, which callers must check -- same
+/// Runs an external command to completion. Returns `Err` only if the
+/// program could not be started; a nonzero exit is still `Ok(Output)`
+/// with `status.success() == false`, which callers must check -- same
 /// contract as `habitat_install::Environment::run_command`.
 pub trait CommandRunner {
-    /// Runs `program` with `args`, inheriting this process's own
-    /// environment unchanged. Equivalent to `run_with_env(&[], program,
-    /// args)` -- kept as a separate method (rather than making every
-    /// call site pass `&[]`) purely for callers that have no env
-    /// concerns at all.
+    /// Equivalent to `run_with_env(&[], program, args)`, for callers with
+    /// no env concerns.
     fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
         self.run_with_env(&[], program, args)
     }
 
-    /// Runs `program` with `args`, plus `env` set on top of this
-    /// process's own environment. Deliberately **not** defaulted to
-    /// silently ignore `env` and fall back to plain `run` -- a caller
-    /// that requests `GIT_CEILING_DIRECTORIES` (see
-    /// `crate::patch::git_apply_ceiling`) to stop `git apply` from
-    /// walking into an unrelated enclosing repository needs to know, at
-    /// compile time, whether its runner actually honors that or would
-    /// silently reproduce the exact bug the env var exists to prevent.
-    /// Every real implementation must decide this explicitly.
+    /// Runs `program` with `args`, plus `env` on top of this process's
+    /// own environment. Not defaulted to plain `run`, so every real
+    /// implementation must decide explicitly whether it honors `env`
+    /// (e.g. `GIT_CEILING_DIRECTORIES`, see `crate::patch::git_apply_ceiling`)
+    /// rather than silently ignoring it.
     fn run_with_env(&self, env: &[(&str, &str)], program: &str, args: &[&str])
         -> io::Result<Output>;
 }
@@ -63,10 +50,8 @@ impl CommandRunner for SystemCommandRunner {
 
 pub mod testing {
     //! An in-memory `CommandRunner` for tests that need to exercise a
-    //! command failing or being absent, without actually breaking `git`
-    //! or e2fsprogs on the machine running the tests. Not
-    //! `#[cfg(test)]`-gated so `tests/unit/workspace/` (an external
-    //! dependent of this crate) can use it too.
+    //! command failing or being absent. Not `#[cfg(test)]`-gated so
+    //! `tests/unit/workspace/` can use it too.
 
     use super::*;
     use std::collections::HashMap;
@@ -83,10 +68,8 @@ pub mod testing {
     #[derive(Default, Clone)]
     pub struct FakeCommandRunner {
         outcomes: HashMap<String, FakeOutcome>,
-        /// Every invocation passed to `run`, in order -- lets a test
-        /// assert exactly what was (or wasn't) actually invoked, e.g.
-        /// that a true no-op sync round never goes beyond one status
-        /// check. Mirrors `habitat-vm`'s `FakeCommandRunner`.
+        /// Every invocation passed to `run`, in order -- lets a test assert
+        /// exactly what was invoked. Mirrors `habitat-vm`'s `FakeCommandRunner`.
         pub invocations: std::cell::RefCell<Vec<String>>,
     }
 
@@ -115,11 +98,9 @@ pub mod testing {
             self
         }
 
-        /// A non-zero exit (status code 1) with `stdout` set rather than
-        /// `stderr` -- for exercising a scanner that reports findings (or
-        /// garbled/ambiguous output) on its findings-present exit code,
-        /// as opposed to [`Self::with_failure`]'s "the tool itself broke"
-        /// shape.
+        /// A non-zero exit with `stdout` set rather than `stderr` -- for a
+        /// scanner reporting findings, as opposed to [`Self::with_failure`]'s
+        /// "the tool itself broke" shape.
         pub fn with_findings(mut self, invocation: &str, stdout: &str) -> Self {
             self.outcomes.insert(
                 invocation.to_string(),
@@ -144,11 +125,7 @@ pub mod testing {
 
     impl CommandRunner for FakeCommandRunner {
         /// Ignores `env` entirely -- no fake-runner test needs to assert
-        /// on it today, only on which program+args ran (`invocations`
-        /// already captures that). If a future test needs to assert a
-        /// call carried a specific `GIT_CEILING_DIRECTORIES` (or any
-        /// other env var), extend `key()`/`invocations` to include it
-        /// rather than reaching around this method.
+        /// on it today, only on which program+args ran.
         fn run_with_env(
             &self,
             _env: &[(&str, &str)],
@@ -159,15 +136,8 @@ pub mod testing {
             self.invocations.borrow_mut().push(key.clone());
             match self.outcomes.get(&key) {
                 Some(outcome) => Ok(Output {
-                    // Real exit codes live in bits 8-15 of the raw wait
-                    // status (`WEXITSTATUS`) -- `from_raw(1)` alone would
-                    // decode as a *signal*-terminated process (`.code()`
-                    // returns `None`), not a normal exit with code 1.
-                    // Shifting gives callers that inspect `.code()`
-                    // (`crate::content_scan`, distinguishing "clean" from
-                    // "findings present" from "scanner error" by exit
-                    // code) a faithful fake, while `.success()` (`== 0`)
-                    // behaves exactly as before either way.
+                    // Shift into bits 8-15 (WEXITSTATUS) so `.code()` sees a
+                    // real exit code 1, not a signal termination (`None`).
                     status: ExitStatus::from_raw(if outcome.success { 0 } else { 1 << 8 }),
                     stdout: outcome.stdout.clone().into_bytes(),
                     stderr: outcome.stderr.clone().into_bytes(),

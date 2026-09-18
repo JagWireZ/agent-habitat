@@ -1,14 +1,7 @@
-//! Phase 2 exit-gate tests for `habitat-workspace` -- this crate's
-//! contract with the rest of the system, not pure internal logic, so it
-//! lives here per `file-structure.md` rather than inline in the crate.
-//!
-//! The blocklisted-files-never-on-disk-image adversarial requirement
-//! lives in `tests/adversarial/blocklist_disk_image.rs` alongside Phase
-//! 3/5's containment/egress adversarial tests, per file-structure.md's
-//! "adversarial tests... live together" convention -- this file covers
-//! the git-history-toggle exit-gate requirement plus a couple of
-//! pipeline-level, whole-system checks that don't fit the "adversarial"
-//! framing on their own.
+//! Exit-gate tests for `habitat-workspace`'s pipeline-level contract:
+//! the git-history-toggle requirement plus a few whole-system checks. The
+//! blocklisted-files adversarial requirement lives separately in
+//! `tests/adversarial/blocklist_disk_image.rs`.
 
 use habitat_policy::config::ProjectConfig;
 use habitat_policy::git_history::{GitHistoryApproval, GitHistoryConfig};
@@ -18,13 +11,9 @@ use habitat_workspace::pipeline::{self, BuildError, BuildRequest};
 use std::fs;
 use std::path::PathBuf;
 
-/// `betterleaks` isn't ordinary tooling guaranteed present in this dev
-/// container or CI (unlike `git`/e2fsprogs, per Phase 2's own precedent;
-/// see `crates/install/src/checks.rs::betterleaks` for why this needs its
-/// own preflight check). These git-history-toggle tests aren't about
-/// content scanning at all, so they disable it explicitly rather than
-/// depending on a binary that may not be installed. Content-scanning's
-/// own exit gate lives in `content_scan_exit_gate.rs` alongside this file.
+/// These git-history-toggle tests aren't about content scanning, so they
+/// disable it explicitly rather than depending on a binary that may not
+/// be installed (`betterleaks` isn't guaranteed present in CI).
 fn content_scan_disabled() -> SecretsScanConfig {
     SecretsScanConfig {
         content: Toggle::Disabled,
@@ -45,12 +34,8 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-/// Exit gate: "git-history toggle defaults off, and flipping it without
-/// a logged approval entry is blocked/flagged as a hard failure, not a
-/// warning" -- verified through the actual pipeline entry point
-/// (`pipeline::build`), not just the lower-level `git_history::resolve`
-/// unit tests, so this is a true end-to-end confirmation of the
-/// requirement.
+/// Flipping git-history on without a logged approval entry must hard-fail
+/// the build, verified through the actual pipeline entry point.
 #[test]
 fn flipping_git_history_on_without_approval_hard_fails_the_whole_build_before_staging() {
     let project = temp_dir("project-unapproved");
@@ -80,8 +65,7 @@ fn flipping_git_history_on_without_approval_hard_fails_the_whole_build_before_st
         matches!(result, Err(BuildError::GitHistory(_))),
         "expected a hard GitHistory error, got {result:?}"
     );
-    // Nothing downstream of the failed toggle resolution may exist --
-    // confirms this is a hard stop, not a degraded/partial build.
+    // A hard stop -- nothing downstream of the failure may exist.
     assert!(!workdir.join("staging").exists());
     assert!(!workdir.join("session.img").exists());
 
@@ -120,9 +104,8 @@ fn default_off_git_history_builds_a_synthetic_repo() {
     fs::remove_dir_all(&workdir).unwrap();
 }
 
-/// The properly-approved counterpart: a complete approval entry lets the
-/// toggle actually take effect, sharing the real `.git` (read-only, per
-/// `gitseed::copy_real_history_read_only`).
+/// A complete approval entry lets the toggle take effect, sharing the
+/// real `.git` read-only.
 #[test]
 fn approved_git_history_toggle_shares_real_history() {
     let project = temp_dir("project-approved");

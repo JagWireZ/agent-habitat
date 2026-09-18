@@ -1,21 +1,8 @@
-//! Phase 3's adversarial coverage of the launch command itself -- the
-//! part of "a concrete escape attempt fails" that can actually be checked
-//! without real KVM: that the `podman run` argv this crate builds never
-//! requests a host-reachable path in the first place. A booted guest that
-//! never gets a bind mount, a host device, or a widened capability set
-//! has nothing to escape *through* on that particular route, regardless
-//! of what happens inside the guest -- which is exactly the part of this
-//! phase's containment story that mocked-seam tests over pure argv
-//! construction can meaningfully pin down.
-//!
-//! This deliberately does **not** claim to be the exit gate's real
-//! escape-attempt test -- reaching host files, host processes, or the
-//! host network namespace from *inside* an actually-booted guest needs
-//! real KVM, which neither this dev container nor this project's CI has.
-//! That real attempt is `tests/manual/validate-vm-launch.sh`'s job (see
-//! `tests/manual/README.md` and `file-structure.md`, which puts Phase 3's
-//! containment tests and Phase 5's egress-bypass tests together here and
-//! in `tests/manual/`).
+//! Adversarial coverage of `build_run_args`: confirms the launch argv never
+//! grants a route back to the host (bind mounts, widened privileges,
+//! disabled egress control). Real escape/KVM testing is
+//! `tests/manual/validate-vm-launch.sh`'s job -- this only checks the argv
+//! construction, not an actually-booted guest.
 
 use habitat_egress::network_setup;
 use habitat_policy::resource_limits::ResourceLimitsConfig;
@@ -35,11 +22,9 @@ fn sample_request() -> LaunchRequest {
     }
 }
 
-/// No live/continuous file-share mount at any point (`AGENTS.md` Section
-/// 2, invariant 1) -- a `-v`/`--volume`/`--mount type=bind` flag would be
-/// exactly that kind of route back to the real host filesystem, and the
-/// workspace disk crosses in exactly once via the block-device
-/// annotation, never a bind mount.
+/// No bind-mount route back to the host filesystem may ever appear in the
+/// launch argv (`AGENTS.md` Section 2, invariant 1) -- the workspace disk
+/// crosses in only via the block-device annotation.
 #[test]
 fn launch_command_never_bind_mounts_the_host_filesystem() {
     let args = build_run_args(&sample_request());
@@ -55,12 +40,10 @@ fn launch_command_never_bind_mounts_the_host_filesystem() {
     );
 }
 
-/// The security boundary is the VM/kernel isolation itself
-/// (`0003-container-engine-runtime-layer.md`), never a widened
-/// container-level privilege on top of it -- so none of the flags that
-/// would hand a guest a route to the host (privileged mode, added
-/// capabilities, the host PID/network/IPC namespaces, or a loosened
-/// security policy) may ever appear in the launch argv.
+/// Containment is the VM/kernel boundary (`0003-container-engine-runtime-layer.md`),
+/// never a widened container privilege -- no flag may hand the guest a
+/// route to the host (privileged mode, added caps, host namespaces, or
+/// unconfined seccomp).
 #[test]
 fn launch_command_never_widens_host_privilege() {
     let args = build_run_args(&sample_request());
@@ -86,13 +69,10 @@ fn launch_command_never_widens_host_privilege() {
     }
 }
 
-/// The guest's network is always explicitly `pasta` (Phase 5's real
-/// `passt`-backed egress path, `docs/decisions/0004-networking-layer.md`)
-/// -- never left unset, which on some Podman defaults would mean an
-/// unfiltered bridge network reaching the host's own network namespace,
-/// and never libkrun's default TSI mode, which isn't visible to
-/// host-side firewall rules at all. Fail closed on missing egress
-/// control, never open by default.
+/// The guest network must always be explicit `pasta` (`0004-networking-layer.md`)
+/// -- never left unset (some Podman defaults reach the host's own netns
+/// unfiltered) and never libkrun's default TSI mode, which host-side
+/// firewall rules can't see at all.
 #[test]
 fn launch_command_always_uses_the_passt_backed_network_not_unset_or_tsi() {
     let args = build_run_args(&sample_request());
@@ -108,10 +88,8 @@ fn launch_command_always_uses_the_passt_backed_network_not_unset_or_tsi() {
             network_setup::HOST_LOOPBACK_ADDR
         )
     );
-    // Also confirms the `krun.use_passt` annotation is present -- real
-    // hardware confirmed `--network pasta` alone is not sufficient for
-    // `crun-krun`; without this annotation it silently falls back to
-    // libkrun's default TSI mode regardless of the `--network` value.
+    // Real hardware: `--network pasta` alone isn't sufficient for
+    // crun-krun -- without this annotation it silently falls back to TSI.
     let expected_annotation = format!("{}=1", network_setup::KRUN_USE_PASST_ANNOTATION);
     assert!(
         args.iter().any(|a| a == &expected_annotation),
@@ -119,19 +97,10 @@ fn launch_command_always_uses_the_passt_backed_network_not_unset_or_tsi() {
     );
 }
 
-/// DNS pinning (`0004`'s open item): the guest's resolver must be
-/// pointed at an address that actually reaches the egress proxy's host,
-/// never left on whatever `pasta` would otherwise hand it -- a leftover
-/// default resolver would be a way to quietly leak past the
-/// reachability restriction.
-///
-/// This is [`network_setup::HOST_LOOPBACK_ADDR`], not the proxy's own IP
-/// directly -- confirmed on real hardware that pointing `--dns` straight
-/// at the proxy's bind address (typically `127.0.0.1`) never works,
-/// since that address means the guest's *own* loopback from inside its
-/// own network namespace, never the host's. `pasta`'s own
-/// `--map-host-loopback` translation (paired with this in `--network`)
-/// is what actually gets guest traffic to the host's loopback.
+/// DNS must point at [`network_setup::HOST_LOOPBACK_ADDR`], not the proxy's
+/// own bind address directly -- `127.0.0.1` from inside the guest means its
+/// *own* netns, not the host's; `pasta`'s `--map-host-loopback` is what
+/// actually bridges guest DNS traffic to the host.
 #[test]
 fn launch_command_pins_guest_dns_to_the_egress_proxy() {
     let request = sample_request();
@@ -143,11 +112,8 @@ fn launch_command_pins_guest_dns_to_the_egress_proxy() {
     assert_eq!(args[dns_idx + 1], network_setup::HOST_LOOPBACK_ADDR);
 }
 
-/// Every session gets its own disposable disk image, attached only via
-/// the annotation this launcher controls -- confirms the guest image
-/// reference (the shared, roadmap-stage-wide base image,
-/// `0002-guest-os-layer.md`) and the per-session workspace disk
-/// (`0005-storage-layer.md`) are never conflated into the same argument.
+/// The shared guest image reference and the per-session workspace disk
+/// must never be conflated into the same argument.
 #[test]
 fn workspace_disk_and_guest_image_are_passed_as_distinct_arguments() {
     let request = sample_request();
@@ -164,13 +130,9 @@ fn workspace_disk_and_guest_image_are_passed_as_distinct_arguments() {
     );
 }
 
-/// `docs/decisions/0008-guest-exec-channel.md`: only the *public* half of
-/// the session's SSH keypair may ever reach the guest via
-/// `AUTHORIZED_KEY_ENV` -- a defense-in-depth guard against a future bug
-/// that accidentally hands the guest the private key instead. An ed25519
-/// private key's OpenSSH text encoding is always PEM-shaped
-/// (`-----BEGIN OPENSSH PRIVATE KEY-----`); a public key never contains
-/// that marker.
+/// Only the public half of the SSH keypair may reach the guest via
+/// `AUTHORIZED_KEY_ENV` -- checked by scanning for the PEM marker that
+/// only a private key's OpenSSH encoding would contain.
 #[test]
 fn launch_command_never_leaks_a_private_key_shaped_value_into_the_env() {
     let mut request = sample_request();
@@ -183,11 +145,8 @@ fn launch_command_never_leaks_a_private_key_shaped_value_into_the_env() {
     );
 }
 
-/// `docs/decisions/0008-guest-exec-channel.md`: the guest's SSH port is
-/// published for host<->guest exec, never for reachability from anywhere
-/// else -- the bind address must always be loopback, never `0.0.0.0` or
-/// left unspecified (which some Podman defaults would expose to every
-/// interface on the host, including the LAN).
+/// The guest's SSH port must be published to loopback only, never left
+/// unspecified (some Podman defaults expose it on every host interface).
 #[test]
 fn launch_command_publishes_the_ssh_port_to_loopback_only_never_all_interfaces() {
     let args = build_run_args(&sample_request());

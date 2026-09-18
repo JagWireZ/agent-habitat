@@ -9,19 +9,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Uniquely identifies one session. Used directly as the podman container
 /// name, so it must satisfy podman's name syntax
-/// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`) -- and, from Phase 6 on, as the tag
-/// audit-log events for this session attach to.
+/// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
 
 impl SessionId {
-    /// Generates a fresh id: a fixed prefix (recognizable at a glance in
-    /// `podman ps` output, next to whatever else a host happens to be
-    /// running) plus a timestamp and a disambiguating suffix. No external
-    /// RNG dependency is taken for that suffix -- `std::process::id()`
-    /// XORed with the low bits of a nanosecond timestamp is enough to
-    /// keep two ids generated in the same process, or in two processes
-    /// started in the same nanosecond, from colliding in practice.
+    /// Generates a fresh id: a fixed prefix plus a timestamp and a
+    /// disambiguating suffix. No external RNG needed -- `process::id()`
+    /// XORed with low bits of a nanosecond timestamp is enough to avoid
+    /// collisions in practice.
     pub fn generate() -> Self {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -31,10 +27,8 @@ impl SessionId {
         SessionId(format!("habitat-{ts:x}-{suffix:x}"))
     }
 
-    /// Builds a `SessionId` from an already-known name (e.g. read back
-    /// from `podman ps` during a later phase's session-recovery logic) --
-    /// rejects anything that isn't a valid podman container name rather
-    /// than silently accepting it.
+    /// Builds a `SessionId` from an already-known name, rejecting
+    /// anything that isn't a valid podman container name.
     pub fn from_name(name: impl Into<String>) -> Result<Self, String> {
         let name = name.into();
         let starts_ok = name
@@ -67,64 +61,44 @@ impl fmt::Display for SessionId {
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
     pub session_id: SessionId,
-    /// The Phase 2 disk image to attach as the guest's extra
-    /// `virtio-blk` workspace device (`0005-storage-layer.md`) -- never
-    /// the guest's root filesystem itself.
+    /// Disk image to attach as the guest's extra `virtio-blk` workspace
+    /// device -- never the guest's root filesystem itself.
     pub workspace_disk_path: PathBuf,
-    /// The guest OS container image reference (`0002-guest-os-layer.md`)
-    /// -- a fixed Alpine image, independent of the host roadmap stage
-    /// (never AlmaLinux/Fedora/Ubuntu, and never chosen independently
-    /// per project or per session).
+    /// Guest OS container image reference -- a fixed Alpine image, never
+    /// chosen independently per project or session.
     pub guest_image: String,
     pub resource_limits: ResourceLimitsConfig,
-    /// The local egress proxy's bound address for this session
-    /// (`habitat_egress::proxy`) -- the guest's network is configured
-    /// (Phase 5, `habitat_egress::network_setup`) so this is the *only*
-    /// address it can reach at all. Required, not optional: there is no
-    /// launch path with no egress proxy configured (`AGENTS.md` Section
-    /// 2, invariant 7 -- fail closed on missing egress control, never
-    /// open by default).
+    /// The local egress proxy's bound address for this session -- the
+    /// guest's network is configured so this is the *only* address it
+    /// can reach. Required: there is no launch path with no egress proxy.
     pub egress_proxy_addr: SocketAddr,
-    /// This session's ephemeral SSH public key content
-    /// (`habitat_vm::guest_ssh::SessionKeypair::public_key`), baked into
-    /// the guest via an environment variable at launch
-    /// (`docs/decisions/0008-guest-exec-channel.md`) since `podman exec`
-    /// does not work against the `krun` runtime at all. Not a secret --
-    /// the corresponding private key stays host-side and is never part
-    /// of this request.
+    /// This session's ephemeral SSH public key
+    /// (`guest_ssh::SessionKeypair::public_key`), baked into the guest
+    /// via env var at launch since `podman exec` doesn't work against
+    /// `krun`. Not a secret; the private key stays host-side.
     pub guest_ssh_public_key: String,
     /// Where the private half of `guest_ssh_public_key`'s keypair lives
-    /// on the host (`habitat_vm::guest_ssh::generate`) -- carried through
-    /// so `launch` can copy it onto the returned `LaunchedSession` for
-    /// `teardown` to clean up. This request never needs to *read* the
-    /// private key itself, only remember where it is.
+    /// on the host, carried through so `launch` can copy it onto the
+    /// returned `LaunchedSession` for `teardown` to clean up.
     pub guest_ssh_private_key_path: PathBuf,
 }
 
 /// What a successful launch hands back -- enough to tear the session
-/// down later, nothing more. No live handle/mount is kept open beyond
-/// this (`AGENTS.md` Section 2, invariant 1).
+/// down later, nothing more.
 #[derive(Debug, Clone)]
 pub struct LaunchedSession {
     pub session_id: SessionId,
     pub workspace_disk_path: PathBuf,
-    /// Host address the guest's `sshd` port was published to
-    /// (`docs/decisions/0008-guest-exec-channel.md`) -- always
-    /// `launcher::GUEST_SSH_HOST` (loopback), never a value that could
-    /// make this exec channel reachable from outside the host machine.
+    /// Host address the guest's `sshd` port was published to -- always
+    /// `launcher::GUEST_SSH_HOST` (loopback).
     pub guest_ssh_host: String,
-    /// Host port the guest's `sshd` was published to. Resolved by
-    /// `launcher::guest_ssh_port` after a successful launch --
-    /// confirmed on real hardware that `pasta` gives no separate,
-    /// `podman inspect`-visible guest IP to address directly (an earlier
-    /// version of this field was a guest IP address for exactly that
-    /// reason, before real-hardware testing showed `NetworkSettings`
-    /// comes back empty for a `pasta`-backed container).
+    /// Host port the guest's `sshd` was published to, resolved by
+    /// `launcher::guest_ssh_port` after a successful launch (`pasta`
+    /// gives no separate, `podman inspect`-visible guest IP to use
+    /// instead).
     pub guest_ssh_port: u16,
-    /// Where this session's ephemeral private SSH key lives on the host
-    /// (`habitat_vm::guest_ssh`) -- carried here so `teardown` can delete
-    /// it alongside the disk image, never leaving a session's credential
-    /// behind after the session it authorized is gone.
+    /// Where this session's ephemeral private SSH key lives on the host,
+    /// so `teardown` can delete it alongside the disk image.
     pub guest_ssh_private_key_path: PathBuf,
 }
 

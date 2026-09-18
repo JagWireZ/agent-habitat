@@ -1,20 +1,15 @@
 //! Shared unified-diff/patch utilities used by both sync directions
 //! (`crate::sync`): parsing which files a patch touches, and running the
 //! structural "would this apply cleanly" check via `git apply --check`.
-//! Deliberately independent of which direction a patch is travelling --
-//! both directions run through exactly the same logic here
-//! (`docs/plan.md` Section 2.2: "the same trusted patch mechanism ...
-//! validated on arrival").
 
 use crate::command_runner::CommandRunner;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The file this crate's content-scan snapshot governs
-/// (`habitat_policy::secrets_scan`, `docs/decisions/0007-content-secrets-
-/// scan-snapshot.md`). A sync patch touching a file with this basename is
-/// routed through the flagged-for-review path regardless of its own
-/// structural validity -- see `crate::sync::FlagReason::ContentRulesetMidSessionEdit`.
+/// (`docs/decisions/0007-content-secrets-scan-snapshot.md`). A sync patch
+/// touching a file with this basename is always routed for review -- see
+/// `crate::sync::FlagReason::ContentRulesetMidSessionEdit`.
 pub const CONTENT_RULESET_FILENAME: &str = "betterleaks.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,14 +31,11 @@ fn err(message: impl Into<String>) -> PatchError {
     }
 }
 
-/// Parses the set of relative file paths a unified diff touches, read
-/// from `diff --git a/<path> b/<path>` header lines -- exactly what
-/// `git diff` and `git format-patch` always emit, regardless of what kind
-/// of change (modify, add, delete, rename) each hunk represents. Order
-/// preserved, de-duplicated. Deliberately hand-rolled rather than a
-/// diff-parsing dependency, same reasoning as `habitat_policy::blocklist`'s
-/// glob matcher: this is security-enforcement logic, kept small and fully
-/// inspectable rather than delegated to a dependency's generality.
+/// Parses the set of relative file paths a unified diff touches, from
+/// `diff --git a/<path> b/<path>` header lines. Order preserved,
+/// de-duplicated. Hand-rolled rather than a diff-parsing dependency,
+/// same reasoning as `habitat_policy::blocklist`'s glob matcher: this is
+/// security-enforcement logic, kept small and inspectable.
 pub fn extract_touched_paths(patch: &str) -> Vec<String> {
     let mut paths = Vec::new();
     for line in patch.lines() {
@@ -60,11 +52,8 @@ pub fn extract_touched_paths(patch: &str) -> Vec<String> {
 }
 
 /// Whether any of `paths` is the content-scan ruleset file, matched by
-/// basename (not full path) -- per
-/// `docs/decisions/0007-content-secrets-scan-snapshot.md`, "the file's
-/// mere presence in the patch is what matters here, regardless of what
-/// changed", and regardless of which directory it lives in within the
-/// project.
+/// basename regardless of directory -- see
+/// `docs/decisions/0007-content-secrets-scan-snapshot.md`.
 pub fn touches_content_ruleset_file(paths: &[String]) -> bool {
     paths.iter().any(|p| {
         Path::new(p).file_name().and_then(|n| n.to_str()) == Some(CONTENT_RULESET_FILENAME)
@@ -72,47 +61,27 @@ pub fn touches_content_ruleset_file(paths: &[String]) -> bool {
 }
 
 /// The env var git honors to stop walking upward while searching for an
-/// enclosing repository -- see [`git_apply_ceiling`]'s doc comment for
-/// why every `git apply`/`git apply --check` call in this crate that
-/// targets a plain (non-repo) directory must set it.
+/// enclosing repository -- see [`git_apply_ceiling`] for why every
+/// `git apply`/`git apply --check` call against a plain (non-repo)
+/// directory must set it.
 pub const GIT_CEILING_DIRECTORIES_VAR: &str = "GIT_CEILING_DIRECTORIES";
 
-/// **Real-hardware-confirmed bug this works around:** `git apply`
-/// silently no-ops a *new file* hunk -- printing `Skipped patch
-/// '<file>'` to stderr but still exiting `0` -- whenever the `-C
-/// <target>` directory is a *subdirectory* of some other git repository
-/// discovered by walking upward from it, rather than that repository's
-/// own toplevel. This has nothing to do with `.gitignore` content
-/// (reproduced with zero ignore rules present); it depends purely on
-/// `target` being a subdirectory of a discovered repo vs. being a repo's
-/// own root vs. having no enclosing repo at all -- only the latter two
-/// apply cleanly.
+/// Works around a confirmed `git apply` bug: it silently no-ops a *new
+/// file* hunk (`Skipped patch '<file>'`, exit 0) whenever `-C <target>`
+/// is a subdirectory of some other git repo discovered by walking
+/// upward, rather than that repo's own toplevel. `project_root` is never
+/// a repo of its own, so it's exposed to this whenever it happens to sit
+/// inside an unrelated enclosing repo (confirmed via
+/// `tests/manual/validate-sync.sh`). `mirror_dir` is unaffected -- it has
+/// its own `.git`.
 ///
-/// `crate::sync`'s `project_root` is deliberately never a git repository
-/// of its own (Phase 2's plain, blocklist-filtered project tree), so
-/// every `git apply -C project_root` call is exposed to this the moment
-/// `project_root` happens to sit inside *any* unrelated enclosing repo.
-/// `tests/manual/validate-sync.sh` hit this directly (`project_root`
-/// lives nested under this very repo's own `tmp/`, discovered as the
-/// enclosing repo); a real user's project layout is not guaranteed to
-/// avoid it either. `mirror_dir` is unaffected -- it has its own `.git`,
-/// so git resolves it as its own toplevel, not a subdirectory of
-/// anything else.
+/// Fix: point `GIT_CEILING_DIRECTORIES` at `target`'s own parent before
+/// invoking `git apply`, so git's upward search stops at the boundary.
+/// No-op for a directory that's already a repo toplevel.
 ///
-/// The fix: point `GIT_CEILING_DIRECTORIES` at `target`'s own parent
-/// before invoking `git apply`. `target` itself is always checked first
-/// regardless of the ceiling, so this is a no-op for a directory that
-/// already *is* a repo's own toplevel (`mirror_dir`), and the actual fix
-/// for one that isn't (`project_root`) -- git's upward search now stops
-/// at the boundary instead of continuing on to discover an unrelated
-/// repo.
-///
-/// Returns the ceiling path as a UTF-8 string ready to hand to
-/// [`CommandRunner::run_with_env`] under [`GIT_CEILING_DIRECTORIES_VAR`].
-/// Errors rather than silently proceeding unprotected if `target` has no
-/// parent directory, or if the parent isn't valid UTF-8 -- an
-/// unprotected `git apply` call would silently reproduce the exact bug
-/// this exists to prevent, which is worse than failing loudly here.
+/// Errors (rather than proceeding unprotected) if `target` has no parent
+/// or the parent isn't valid UTF-8, since an unprotected call would
+/// silently reproduce the bug.
 pub fn git_apply_ceiling(target: &Path) -> Result<String, PatchError> {
     let parent = target.parent().ok_or_else(|| {
         err(format!(
@@ -129,18 +98,9 @@ pub fn git_apply_ceiling(target: &Path) -> Result<String, PatchError> {
 }
 
 /// Whether `git apply --check` accepts `patch` against the tree at
-/// `target_dir` -- the real, authoritative structural-validity check,
-/// run against whatever tree is the actual arrival point for this
-/// direction (the guest's tree for host->sandbox, `project_root` for
-/// sandbox->host; see `crate::sync`).
-///
-/// `Ok(true)`: structurally valid. `Ok(false)`: `git` ran and rejected the
-/// patch as a real, well-formed refusal (corrupted patch, patch that
-/// doesn't apply to the current tree state, etc.) -- this is a
-/// classification, not an error, and callers route it to the
-/// flagged-for-review state. `Err`: `git` itself could not be run at all
-/// (missing binary, I/O failure writing the temp patch file) -- an
-/// infrastructure failure, distinct from a bad patch.
+/// `target_dir`. `Ok(false)` is a real, well-formed rejection (routed by
+/// callers to the flagged-for-review state); `Err` means `git` itself
+/// could not be run -- an infrastructure failure, distinct from a bad patch.
 pub fn structurally_valid<R: CommandRunner>(
     runner: &R,
     target_dir: &Path,
@@ -169,9 +129,8 @@ pub fn structurally_valid<R: CommandRunner>(
 }
 
 /// Writes `patch` to a fresh temp file and returns its path -- shared by
-/// [`structurally_valid`] and `crate::sync`'s actual-apply steps, since
-/// both need the patch text as a real file on disk (either for `git
-/// apply` directly, or to `podman cp` into a running guest).
+/// [`structurally_valid`] and `crate::sync`'s apply steps, both of which
+/// need the patch as a real file on disk.
 pub fn write_temp_patch_file(patch: &str) -> Result<PathBuf, PatchError> {
     let path = std::env::temp_dir().join(format!(
         "habitat-sync-{}-{}.patch",
@@ -246,8 +205,6 @@ new file mode 100644\n\
         dir
     }
 
-    // `git apply --check` is ordinary tooling, not KVM-dependent --
-    // exercised for real here, same posture as `crate::gitseed`'s tests.
     #[test]
     fn structurally_valid_accepts_a_real_clean_patch() {
         let dir = temp_dir("clean");

@@ -1,26 +1,16 @@
 //! Extracts the SNI (Server Name Indication) hostname from a raw TLS
 //! ClientHello, without terminating or otherwise interpreting the TLS
-//! session -- exactly the "destination inspection at connection setup,
-//! not full TLS interception" the proxy is required to do
-//! (`docs/decisions/0004-networking-layer.md`).
+//! session (`docs/decisions/0004-networking-layer.md`).
 //!
-//! Deliberately hand-rolled rather than pulling in a TLS crate: the only
-//! thing this proxy needs from the ClientHello is the plaintext SNI
-//! extension, which is sent unencrypted by design (that's precisely what
-//! makes SNI-based filtering possible without terminating TLS) -- a full
-//! TLS stack would be solving a much bigger problem than this one field.
+//! Hand-rolled rather than pulling in a TLS crate: SNI is sent unencrypted
+//! by design, so that's the only field this proxy needs.
 //!
-//! Parsing follows RFC 8446 (and RFC 5246 for the ClientHello framing,
-//! unchanged across TLS 1.2/1.3 for this purpose) far enough to reach the
-//! `server_name` extension (type `0x0000`) and its first `host_name`
-//! entry. Anything short, truncated, or structurally unexpected returns
-//! `None` -- callers treat `None` the same as "no allowlist entry
-//! matched": deny the connection, never guess or fall back to some other
-//! signal (`AGENTS.md` Section 2, invariant 7's fail-closed framing
-//! applied here to parsing, not just policy lookup).
+//! Parses far enough per RFC 8446 (RFC 5246 for ClientHello framing) to
+//! reach the `server_name` extension and its first `host_name` entry.
+//! Anything short, truncated, or malformed returns `None`, which callers
+//! treat the same as "no allowlist entry matched": deny the connection.
 
-/// A byte-cursor helper so the parsing functions below stay linear and
-/// bounds-checked without repeating `..` slicing arithmetic everywhere.
+/// Bounds-checked byte cursor for the parsing functions below.
 struct Cursor<'a> {
     data: &'a [u8],
     pos: usize,
@@ -68,13 +58,9 @@ const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
 const EXTENSION_TYPE_SERVER_NAME: u16 = 0x0000;
 const SERVER_NAME_TYPE_HOST_NAME: u8 = 0x00;
 
-/// Whether `buf` already holds a complete TLS record (its 5-byte header
-/// plus the number of body bytes the header declares) -- used by the
-/// proxy's read loop to know when to stop accumulating bytes before
-/// attempting to parse, rather than parsing against a partially-read
-/// buffer and misreading a truncated record as "no SNI present".
-/// Returns `false` (never a panic or a guess) on anything shorter than
-/// the header itself.
+/// Whether `buf` holds a complete TLS record (5-byte header plus the
+/// declared body length) -- lets the proxy's read loop avoid parsing a
+/// partially-read buffer and misreading it as "no SNI present".
 pub fn record_is_complete(buf: &[u8]) -> bool {
     if buf.len() < RECORD_HEADER_LEN {
         return false;
@@ -83,12 +69,9 @@ pub fn record_is_complete(buf: &[u8]) -> bool {
     buf.len() >= RECORD_HEADER_LEN + body_len
 }
 
-/// Extracts the SNI `host_name` from a single, complete TLS record
-/// holding a ClientHello. `None` on anything not exactly that: wrong
-/// content/handshake type, a truncated field, an absent `server_name`
-/// extension, or an extension present but empty/malformed. Never panics
-/// on attacker-controlled input -- every field read is bounds-checked
-/// through `Cursor`.
+/// Extracts the SNI `host_name` from a single, complete TLS record holding
+/// a ClientHello. `None` on anything malformed or missing; never panics on
+/// attacker-controlled input.
 pub fn extract_sni(buf: &[u8]) -> Option<String> {
     let mut record = Cursor::new(buf);
     let content_type = record.u8()?;
@@ -118,8 +101,6 @@ pub fn extract_sni(buf: &[u8]) -> Option<String> {
     c.skip(compression_methods_len)?;
 
     if c.remaining() == 0 {
-        // No extensions block at all -- valid ClientHello shape, just no
-        // SNI to find.
         return None;
     }
     let extensions_len = c.u16()? as usize;
@@ -144,9 +125,6 @@ fn find_server_name_extension(extensions: &[u8]) -> Option<String> {
 fn parse_server_name_list(data: &[u8]) -> Option<String> {
     let mut c = Cursor::new(data);
     let _list_len = c.u16()?;
-    // A ClientHello may in principle list more than one entry; TLS in
-    // practice sends exactly one `host_name`, and that's the only entry
-    // type this proxy acts on.
     while c.remaining() >= 3 {
         let name_type = c.u8()?;
         let name_len = c.u16()? as usize;
@@ -159,15 +137,9 @@ fn parse_server_name_list(data: &[u8]) -> Option<String> {
 }
 
 pub mod testing {
-    //! Builds a well-formed TLS 1.2/1.3-shaped ClientHello record
-    //! carrying a given SNI hostname, byte-for-byte per RFC 8446, so
-    //! tests exercise the real parser against real wire framing rather
-    //! than a hand-simplified stand-in. Not `#[cfg(test)]`-gated -- like
-    //! `habitat_vm::command_runner::testing`, this needs to be visible to
-    //! external `[[test]]` targets (`tests/unit/egress/`,
-    //! `tests/adversarial/egress_bypass.rs`), which compile against this
-    //! crate as an ordinary dependency rather than in-crate `#[cfg(test)]`
-    //! mode.
+    //! Builds a well-formed ClientHello record for a given SNI hostname.
+    //! Not `#[cfg(test)]`-gated so it's visible to external `[[test]]`
+    //! targets (`tests/unit/egress/`, `tests/adversarial/egress_bypass.rs`).
 
     pub fn build_client_hello(sni_host: &str) -> Vec<u8> {
         let mut hello_body = Vec::new();
@@ -240,8 +212,6 @@ mod tests {
     fn returns_none_for_a_truncated_record_rather_than_panicking() {
         let hello = build_client_hello("example.com");
         for cut in [0, 1, 5, 10, hello.len() / 2] {
-            // Must not panic on any prefix -- bounds-checked all the way
-            // through, fails closed to `None` instead.
             assert_eq!(extract_sni(&hello[..cut]), None);
         }
     }
@@ -256,8 +226,6 @@ mod tests {
 
     #[test]
     fn returns_none_when_the_server_name_extension_is_absent() {
-        // A structurally valid ClientHello with an empty extensions
-        // block -- there's no SNI here to find, not a malformed one.
         let mut hello_body = Vec::new();
         hello_body.extend_from_slice(&[0x03, 0x03]);
         hello_body.extend_from_slice(&[0u8; 32]);

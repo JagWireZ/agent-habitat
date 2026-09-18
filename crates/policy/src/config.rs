@@ -1,35 +1,15 @@
-//! The checked-in, per-project config file -- Phase 2 slice.
+//! The checked-in, per-project config file: blocklist additions,
+//! git-history toggle, secrets-scan toggles, resource limits, and egress
+//! allowlist additions.
 //!
-//! `docs/plan.md` Section 2.5 describes one operator-facing config file
-//! (resource limits, egress allowlist additions, git-history toggle,
-//! audit on/off, blocklist additions), assembled behind `habitat run
-//! --config` in Phase 7. Phase 2 only needs two of those fields --
-//! blocklist additions and the git-history toggle -- so this module
-//! reads just those, in a plain, hand-rolled `key: value` format that is
-//! valid YAML (a strict subset of it: no flow style, no multi-line
-//! scalars, no anchors). Phase 7 is expected to *extend* this schema
-//! (add `resource_limits`, `egress_allowlist_additions`, `audit`) rather
-//! than replace the file shape, and may swap this hand-rolled reader for
-//! a real YAML parser once the full schema needs one -- files written
-//! against this Phase 2 reader stay valid input either way, since the
-//! subset accepted here is unambiguous YAML.
+//! Read in a plain, hand-rolled `key: value` format that is valid YAML (a
+//! strict subset: no flow style, no multi-line scalars, no anchors) --
+//! files written against this reader stay valid input if it's ever swapped
+//! for a real YAML parser, since the accepted subset is unambiguous YAML.
 //!
-//! Loading is intentionally permissive about the file's *absence* (no
-//! config file at all is just "use every default") and strict about its
-//! *shape* once present: an unrecognized top-level key is a hard load
-//! error rather than a silently-ignored typo, since a operator who thinks
-//! `git_hstory:` (typo) turned a toggle on deserves a load failure, not
-//! quiet non-effect.
-//!
-//! Phase 3 adds one more top-level mapping, `resource_limits` (`cpus`,
-//! `memory_mb`) -- `crates/vm`'s launcher reads it the same way Phase 2's
-//! two fields are read here; a project only overrides what it wants to
-//! change, and either key absent keeps `ResourceLimitsConfig::default()`.
-//!
-//! Phase 5 adds `egress_allowlist_additions`, read the same way as
-//! `blocklist_additions`: a plain list, additive only -- a project can
-//! extend the default egress allowlist (`crate::egress_allowlist`), never
-//! remove or override a default entry.
+//! A missing config file is just "use every default". A present file with
+//! an unrecognized top-level key is a hard load error, not a silently
+//! ignored typo (e.g. `git_hstory:` should fail loudly, not no-op).
 
 use crate::git_history::{GitHistoryApproval, GitHistoryConfig};
 use crate::resource_limits::ResourceLimitsConfig;
@@ -37,12 +17,10 @@ use crate::secrets_scan::{SecretsScanConfig, Toggle};
 use std::fmt;
 use std::path::Path;
 
-/// The Phase 2 slice of the checked-in project config. Phase 7 adds
-/// fields here; it does not replace this one.
+/// The checked-in project config.
 ///
-/// `resource_limits` doesn't derive `Eq` (it holds an `f64`), so this
-/// struct drops the `Eq` bound Phase 2 originally had -- `PartialEq` is
-/// still enough for every test/caller that compares configs.
+/// No `Eq` derive: `resource_limits` holds an `f64`, and `PartialEq` is
+/// enough for every test/caller that compares configs.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProjectConfig {
     pub blocklist_additions: Vec<String>,
@@ -261,10 +239,8 @@ fn parse_git_history(
 }
 
 /// Parses the `secrets_scan:` mapping's nested `filenames` / `content` /
-/// `content_rules_path` keys. Both toggles default to
-/// [`Toggle::Enabled`] (via [`SecretsScanConfig::default`]) if their key
-/// is absent -- only an explicit `disabled` in the checked-in config
-/// turns either one off.
+/// `content_rules_path` keys. Both toggles default to enabled if absent;
+/// only an explicit `disabled` turns either one off.
 fn parse_secrets_scan(
     lines: &[&str],
     start: usize,
@@ -300,9 +276,7 @@ fn parse_secrets_scan(
 }
 
 /// Parses the `resource_limits:` mapping's nested `cpus` / `memory_mb`
-/// keys. Either key absent leaves that field at
-/// `ResourceLimitsConfig::default()`'s value -- a project only overrides
-/// what it wants to change, same shape as `secrets_scan`'s toggles.
+/// keys. Either key absent leaves that field at its default.
 fn parse_resource_limits(
     lines: &[&str],
     start: usize,

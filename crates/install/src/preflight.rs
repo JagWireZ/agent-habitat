@@ -2,23 +2,11 @@
 //! operator-facing entry points:
 //!
 //! - [`run_install_checks`] -- what `habitat install` runs: host-OS gate,
-//!   Podman, the `krun` runtime, whether that `crun`/`krun` build is new
-//!   enough to hand off to real `passt` networking (`checks::
-//!   crun_version`), whether `passt` itself is actually installed
-//!   (`checks::passt` -- a distinct requirement from the version check
-//!   above, see that function's doc comment), and `libkrunfw` (the shared
-//!   library `krun` needs to actually boot a microVM, checked separately
-//!   from the `krun` binary itself -- see `checks::libkrunfw`'s doc
-//!   comment for why). Verify-only, no mutation.
+//!   Podman, `krun`, `crun`-version, `passt`, `libkrunfw`. Verify-only.
 //! - [`run_preflight`] -- what `habitat run` runs at the start of every
-//!   session: host-OS gate, KVM/hardware-virtualization, then the same
-//!   Podman, `krun`-runtime, `crun`-version, `passt`, and `libkrunfw`
-//!   checks `habitat install` uses (one implementation, reused -- not
-//!   re-derived).
+//!   session: the same checks plus KVM/hardware-virtualization.
 //!
-//! Both stop at the first failing check (fail-closed and deterministic:
-//! an operator fixes one problem at a time rather than triaging a wall of
-//! failures that may be masking each other) and log exactly one
+//! Both stop at the first failing check and log exactly one
 //! `preflight-failure` / `install-failure` audit event naming that check
 //! before returning.
 
@@ -50,19 +38,13 @@ fn log_and_wrap(
         Some(failure.check.name()),
         failure.message.clone(),
     );
-    // The audit sink itself can fail (e.g. disk full, unwritable path).
-    // That must never suppress or soften the check failure it was trying
-    // to log -- the check result already fails closed regardless of
-    // whether the log write succeeded.
+    // A failed audit write must not suppress the check failure itself.
     let _ = audit.record(&event);
     PreflightError(failure)
 }
 
-/// One check's outcome for status-report display (`habitat install`'s and
-/// `habitat run`'s checklist), as opposed to `run_install_checks`'s /
-/// `run_preflight`'s gating return value. Carries the same [`CheckResult`]
-/// so a caller can render exactly the same failure message the gate would
-/// report -- no separate wording to keep in sync.
+/// One check's outcome for status-report display, as opposed to
+/// `run_install_checks`'s/`run_preflight`'s gating return value.
 #[derive(Debug, Clone)]
 pub struct CheckStatus {
     pub check: checks::CheckId,
@@ -76,30 +58,19 @@ impl CheckStatus {
 }
 
 /// Runs every check `habitat install` cares about and reports a status for
-/// each, rather than stopping at the first failure -- so an operator can
-/// see every prerequisite's state in one pass ("this is present, this
-/// isn't") instead of fixing them one at a time through repeated runs.
-///
-/// This is a read-only, unaudited companion to [`run_install_checks`]: it
-/// logs nothing (the single-audited-failure-per-run invariant stays
-/// [`run_install_checks`]'s job) and never mutates anything, same as the
-/// checks themselves.
+/// each, rather than stopping at the first failure, so an operator can see
+/// every prerequisite's state in one pass. Read-only and unaudited --
+/// [`run_install_checks`] owns the single-audited-failure-per-run gate.
 ///
 /// The host-OS gate is the one exception to "run everything": if it
-/// fails, every other check's assumptions (about *this* host being Linux)
-/// are meaningless, so they're left unreported rather than actually run.
+/// fails, every other check's assumptions are meaningless, so they're
+/// left unreported.
 ///
-/// `betterleaks` is included unconditionally here, unlike
-/// [`preflight_report`]'s `secrets_scan_content_enabled`-gated inclusion:
-/// `habitat install` runs with no project in scope (there's no
-/// `sandbox.yaml` to read a `secrets_scan.content` toggle from), and the
-/// project-level default for that toggle is enabled. Surfacing it here
-/// lets an operator install it up front, alongside Podman/krun-runtime,
-/// instead of only discovering it's missing the first time `habitat run`
-/// hits a project that wants it. It stays out of [`run_install_checks`]'s
-/// pass/fail gate, though: a project that has genuinely opted out via
-/// `secrets_scan.content: disabled` shouldn't make `habitat install`
-/// report an unfinished setup over a binary that project doesn't need.
+/// `betterleaks` is included unconditionally here (unlike
+/// [`preflight_report`]'s gated inclusion) since `habitat install` has no
+/// project in scope to read a `secrets_scan.content` toggle from, and the
+/// default is enabled. It stays out of [`run_install_checks`]'s pass/fail
+/// gate though, since a project can still opt out.
 pub fn install_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
     let host_os = checks::host_os(env);
     let host_os_failed = host_os.is_err();
@@ -138,13 +109,8 @@ pub fn install_report<E: Environment>(env: &E) -> Vec<CheckStatus> {
 }
 
 /// The same idea as [`install_report`], but over the checks `habitat run`'s
-/// preflight uses (adds the `kvm` check `habitat install` doesn't run).
-///
-/// `secrets_scan_content_enabled` mirrors `run_preflight`'s parameter of
-/// the same name: the `betterleaks` check only appears in the report when
-/// the project's checked-in config has `secrets_scan.content` enabled
-/// (the default) -- a project that has explicitly opted out shouldn't see
-/// a checklist item for a binary it doesn't need.
+/// preflight uses (adds the `kvm` check). `betterleaks` only appears when
+/// `secrets_scan_content_enabled` is true.
 pub fn preflight_report<E: Environment>(
     env: &E,
     secrets_scan_content_enabled: bool,
@@ -191,14 +157,8 @@ pub fn preflight_report<E: Environment>(
     statuses
 }
 
-/// `habitat install`'s verification sequence. Order matters: the host-OS
-/// gate is cheapest and most fundamental, so it runs first and pre-empts
-/// checks that would be meaningless on a refused host.
-/// `libkrunfw`, `crun-version`, and `passt` are included here as hard,
-/// unconditional requirements (unlike `betterleaks` below) -- they're
-/// real host-level prerequisites for any session to launch with real
-/// networking at all, never something a project can opt out of, so they
-/// belong in the same pass/fail gate as Podman/`krun-runtime`.
+/// `habitat install`'s verification sequence. The host-OS gate runs first
+/// and pre-empts checks that would be meaningless on a refused host.
 pub fn run_install_checks<E: Environment>(
     env: &E,
     audit: &dyn AuditSink,
@@ -213,19 +173,11 @@ pub fn run_install_checks<E: Environment>(
 }
 
 /// `habitat run`'s preflight subroutine, executed at the start of every
-/// session before any disk-build/VM-launch logic (Phases 2/3 hook in
-/// after this returns `Ok`, never around it).
+/// session before any disk-build/VM-launch logic.
 ///
 /// `secrets_scan_content_enabled` reflects the project's checked-in
-/// config (`habitat_policy::config::ProjectConfig::secrets_scan.content`,
-/// default enabled). When true, the `betterleaks` binary is checked for
-/// on `PATH` in this same pass, right alongside the KVM/Podman/krun-
-/// runtime checks -- a project that wants content-based secrets scanning
-/// must not be able to silently end up without it because the binary
-/// isn't installed; that's a hard preflight failure, same fail-closed
-/// posture as every other check here (AGENTS.md Section 2 invariant 11).
-/// When false (the project explicitly opted out), the check is skipped
-/// entirely rather than run-and-ignored.
+/// config (default enabled). When true, `betterleaks` is checked for on
+/// `PATH` in this same pass; when false, the check is skipped entirely.
 pub fn run_preflight<E: Environment>(
     env: &E,
     audit: &dyn AuditSink,
@@ -282,10 +234,6 @@ mod tests {
 
     #[test]
     fn install_checks_fail_closed_when_crun_version_is_too_old_even_with_krun_present() {
-        // The exact real-hardware finding this check exists for: `krun
-        // --version` succeeding says nothing about whether it's new
-        // enough for real passt networking (AlmaLinux 10's own
-        // crun-krun-1.27-2.el10_2 predates the 1.27.1 cutoff).
         let env = FakeEnvironment::linux()
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
@@ -297,9 +245,6 @@ mod tests {
 
     #[test]
     fn install_checks_fail_closed_when_passt_is_missing_even_with_krun_present() {
-        // `crun_version` passing says nothing about whether `passt`
-        // itself is installed -- it only checks crun-krun's ability to
-        // hand off to passt, not passt's own presence.
         let env = FakeEnvironment::linux()
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
@@ -312,22 +257,15 @@ mod tests {
 
     #[test]
     fn install_checks_fail_closed_when_libkrunfw_is_missing_even_with_krun_present() {
-        // The exact real-hardware finding this check exists for: `krun
-        // --version` alone must not be read as "a session can launch."
         let env = FakeEnvironment::linux()
             .with_command_ok("podman --version", "podman version 5.0.0")
             .with_command_ok("podman info", "host: ...")
             .with_command_ok("krun --version", "crun version 1.29.1\ncommit: abc\n")
             .with_command_ok("passt --version", "passt 0.0~git\n");
-        // Deliberately no `ldconfig -p` command configured on the fake.
         let audit = MemoryAuditSink::default();
         let err = run_install_checks(&env, &audit).unwrap_err();
         assert_eq!(err.0.check.name(), "libkrunfw");
     }
-
-    // The no-KVM exit-gate scenario through this full entry point lives
-    // under `tests/unit/install/` (file-structure.md: contract-with-the-
-    // rest-of-the-system tests, not pure internal logic, belong there).
 
     #[test]
     fn preflight_passes_end_to_end_when_everything_is_present() {
@@ -416,9 +354,6 @@ mod tests {
 
     #[test]
     fn install_report_lists_every_check_even_after_a_failure() {
-        // podman missing, but that must not hide the krun-runtime/
-        // crun-version/passt/libkrunfw/betterleaks results -- unlike the
-        // gate, the report doesn't stop at the first failure.
         let env = FakeEnvironment::linux();
         let report = install_report(&env);
         assert_eq!(

@@ -1,23 +1,9 @@
 //! `habitat-audit` -- the unified audit log for everything crossing the
-//! host/sandbox boundary.
+//! host/sandbox boundary. Boundary-only; in-sandbox activity is out of scope.
 //!
-//! Phase 1 scope: a minimal sink, established here so `habitat-install` has
-//! somewhere fail-closed to log preflight/install failures to. Full content
-//! (session start/stop, VM launch/teardown, proxy allow/deny, sync events)
-//! is added in Phase 6 -- this module is written so those additions are new
-//! `EventKind` variants and call sites, not a format change.
-//!
-//! Explicit scope note (carried into operator-facing output too, per
-//! AGENTS.md Section 4's deferred-items table): this is boundary-only
-//! audit, not in-sandbox activity logging.
-//!
-//! Log content is treated as untrusted, attacker-influenced input from day
-//! one (AGENTS.md Section 2, invariant 12): every string written into an
-//! event is JSON-string-escaped before it touches disk, and nothing here
-//! ever passes a logged value through a shell. No dependency on
-//! `serde_json` is taken (Phase 1 has no dependency-fetch access in this
-//! environment) -- the escaping is done by hand and unit-tested against
-//! shell-metacharacter payloads specifically.
+//! Log content is attacker-influenced (e.g. command stderr), so every string
+//! is JSON-escaped by hand before it touches disk -- no `serde_json` dep,
+//! and nothing here is ever passed through a shell.
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -25,10 +11,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// The kind of event being recorded. Each variant renders to a distinct,
-/// stable tag string (see `EventKind::tag`) so that preflight failures,
-/// install failures, and (from Phase 6 on) ordinary lifecycle events are
-/// all separately identifiable in the log -- never collapsed into one
+/// The kind of event being recorded. Each variant has a distinct, stable
+/// tag string (`EventKind::tag`) so event types are never collapsed into one
 /// generic "event" bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
@@ -36,56 +20,33 @@ pub enum EventKind {
     PreflightFailure,
     /// `habitat install` refused to proceed.
     InstallFailure,
-    /// `habitat install`'s optional auto-install step ran (or tried to
-    /// run) a privileged package-manager command. Logged for every
-    /// attempt, not just failures -- running `sudo` on the operator's
-    /// behalf is security-relevant regardless of outcome.
+    /// `habitat install`'s optional auto-install step ran (or tried to run)
+    /// a privileged package-manager command. Logged for every attempt, not
+    /// just failures -- running `sudo` on the operator's behalf is
+    /// security-relevant regardless of outcome.
     InstallAction,
-    /// A sandbox->host sync patch touched a project's `betterleaks.toml`
-    /// mid-session. Boundary-relevant even though it's an ordinary-
-    /// looking file edit: this file governs content-based secrets
-    /// scanning, and the running session's effective ruleset is a
-    /// snapshot taken once at session start (`habitat_policy::secrets_scan`),
-    /// never re-read on a later sync -- so an edit here must be visibly
-    /// distinct from any other file's edit, not silently merged into a
-    /// weaker snapshot.
-    ///
-    /// Emitted by `habitat_workspace::sync` (Phase 4) whenever a sync
-    /// patch, in either direction, touches a project's `betterleaks.toml`
-    /// -- see `docs/decisions/0007-content-secrets-scan-snapshot.md`.
-    /// Always emitted *in addition to*, never instead of, whichever of
-    /// `SyncApplied`/`SyncFlagged` below the same sync round also
-    /// produces (a `betterleaks.toml`-touching patch always resolves to
-    /// `SyncFlagged`, per that ADR, but the two events answer different
-    /// questions: "was this patch applied" vs. "did this patch touch the
-    /// file governing content scanning").
+    /// A sync patch touched a project's `betterleaks.toml` mid-session.
+    /// That file governs secrets scanning, and the session's ruleset is a
+    /// snapshot taken once at start (never re-read on later sync), so an
+    /// edit here must be distinguishable from any other file's edit rather
+    /// than silently merged into a stale snapshot. Always emitted alongside
+    /// (never instead of) `SyncApplied`/`SyncFlagged` for the same patch --
+    /// see `docs/decisions/0007-content-secrets-scan-snapshot.md`.
     ContentRulesetMidSessionEdit,
-    /// A host<->sandbox sync patch (Phase 4, `habitat_workspace::sync`)
-    /// validated cleanly and was applied. The minimal "ordinary sync
-    /// event" record Phase 4 needs now; Phase 6 is expected to extend
-    /// this event's fields (direction, byte size, timing) rather than
-    /// introduce a second event kind for the same thing.
+    /// A host<->sandbox sync patch validated cleanly and was applied.
     SyncApplied,
-    /// A host<->sandbox sync patch failed validation (malformed/
-    /// corrupted, or re-introduced a blocklisted path) and was flagged
-    /// for review instead of being applied -- never silently merged,
-    /// never silently dropped (`AGENTS.md` Section 2, invariant 10).
+    /// A host<->sandbox sync patch failed validation (malformed/corrupted,
+    /// or re-introduced a blocklisted path) and was flagged for review
+    /// instead of applied -- never silently merged or dropped.
     SyncFlagged,
-    /// The local egress proxy (Phase 5, `habitat_egress::proxy`) let a
-    /// guest connection through -- its SNI hostname matched the
-    /// effective allowlist. Emitted for every allowed connection, not
-    /// just denials, so a complete connection trace is possible from the
-    /// log alone (`docs/decisions/0004-networking-layer.md`'s
-    /// verify-before-trusting requirement; full aggregation into the
-    /// unified log format is Phase 6's job, same "add the event kind now,
-    /// aggregate later" precedent Phase 4 set for `SyncApplied`/
-    /// `SyncFlagged`).
+    /// The local egress proxy let a guest connection through -- its SNI
+    /// hostname matched the effective allowlist. Emitted for allowed
+    /// connections too (not just denials) so a full connection trace is
+    /// possible from the log alone.
     EgressAllowed,
-    /// The local egress proxy refused a guest connection -- no SNI
-    /// hostname could be read from its TLS ClientHello (missing or
-    /// malformed), or the hostname it named is not on the effective
-    /// allowlist. Fails closed either way: the connection is never
-    /// forwarded, and this event is emitted before the connection is
+    /// The local egress proxy refused a guest connection -- no SNI hostname
+    /// could be read from its TLS ClientHello, or the hostname isn't on the
+    /// allowlist. Fails closed either way; emitted before the connection is
     /// dropped, never after a best-effort forward.
     EgressDenied,
 }
@@ -111,17 +72,15 @@ impl fmt::Display for EventKind {
     }
 }
 
-/// One boundary-audit event. `check` and `message` are attacker-influenced
-/// in the sense that their content ultimately derives from probe output
-/// (e.g. a command's stderr) -- never assume they are shell-safe.
+/// One boundary-audit event. `check` and `message` derive from probe output
+/// (e.g. command stderr) and must never be assumed shell-safe.
 #[derive(Debug, Clone)]
 pub struct AuditEvent {
     pub ts_unix_ms: u128,
     pub kind: EventKind,
-    /// Name of the specific check that produced this event, if any
-    /// (e.g. "kvm", "podman"). Distinct from `kind`'s tag --
-    /// `kind` says *what class* of event this is, `check` says *which
-    /// check* within that class.
+    /// Name of the specific check that produced this event, if any (e.g.
+    /// "kvm", "podman") -- `kind` is the event class, `check` is which
+    /// check within that class.
     pub check: Option<String>,
     pub message: String,
 }
@@ -140,9 +99,7 @@ impl AuditEvent {
         }
     }
 
-    /// Render as one JSON-object line (JSON Lines format). Every string
-    /// field is escaped by `json_escape` -- this is the only place a
-    /// logged value is turned into text, and it never shells out.
+    /// Render as one JSON-object line (JSON Lines format).
     pub fn to_json_line(&self) -> String {
         let check_field = match &self.check {
             Some(c) => format!("\"{}\"", json_escape(c)),
@@ -158,12 +115,9 @@ impl AuditEvent {
     }
 }
 
-/// Escape a string for embedding as a JSON string value. Deliberately
-/// hand-rolled (no serde_json dependency available) and exercised in
-/// tests with shell-metacharacter payloads (`` $(...) ``, backticks, `;`,
-/// quotes, newlines) to confirm they come out as inert escaped text, never
-/// anything that could be re-interpreted by a shell or break the JSON
-/// structure.
+/// Escape a string for embedding as a JSON string value. Hand-rolled (no
+/// serde_json dependency available); tested against shell-metacharacter
+/// payloads to confirm they come out as inert escaped text.
 pub fn json_escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
@@ -180,10 +134,8 @@ pub fn json_escape(input: &str) -> String {
     out
 }
 
-/// Where an `AuditEvent` is recorded. Abstracted so preflight/install
-/// logic can be unit-tested against an in-memory sink without touching the
-/// filesystem, and so Phase 6 can add richer sinks without changing call
-/// sites.
+/// Where an `AuditEvent` is recorded. Abstracted so callers can be
+/// unit-tested against an in-memory sink without touching the filesystem.
 pub trait AuditSink {
     fn record(&self, event: &AuditEvent) -> io::Result<()>;
 }
@@ -218,9 +170,8 @@ impl AuditSink for FileAuditSink {
     }
 }
 
-/// In-memory sink, exposed (not test-only) so other crates -- notably
-/// `habitat-install`'s own unit tests -- can assert on exactly what was
-/// logged without touching the filesystem.
+/// In-memory sink, exposed (not test-only) so other crates' unit tests can
+/// assert on exactly what was logged.
 #[derive(Default)]
 pub struct MemoryAuditSink {
     pub events: std::sync::Mutex<Vec<AuditEvent>>,
@@ -286,20 +237,12 @@ mod tests {
             );
             let line = event.to_json_line();
 
-            // The payload must appear only in escaped form: raw backticks,
-            // raw double-quotes, and raw control characters must not
-            // survive into the serialized line unescaped.
             assert!(
                 !line.contains('\n') && !line.contains('\r') && !line.contains('\t'),
                 "control characters leaked unescaped into: {line}"
             );
-            // The overall line must still be one well-formed JSON object:
-            // exactly the four keys we write, nothing injected.
             assert!(line.starts_with('{') && line.ends_with('}'));
             assert!(line.contains("\"kind\":\"preflight-failure\""));
-
-            // Confirm the escaped payload round-trips back to the
-            // original when unescaped the same way JSON would.
             assert!(line.contains(&json_escape(payload)));
         }
     }

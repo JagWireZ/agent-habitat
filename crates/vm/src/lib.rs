@@ -1,52 +1,36 @@
 //! `habitat-vm` -- the containment boundary: launch, lifecycle, teardown.
 //!
-//! Phase 3 (see `tmp/wip/implementation-plan.md`):
 //! - [`launcher`]: builds the `podman run` invocation that starts a
-//!   session's microVM through the `krun` runtime (`crun-krun`, backed by
-//!   libkrun) against the `habitat-workspace`-built disk image
-//!   (`0003-container-engine-runtime-layer.md`), attached as a
-//!   `virtio-blk` block device (`0005-storage-layer.md`). No elevated
-//!   host privilege is required for this launch -- Podman runs entirely
-//!   as the calling user, with one-time `kvm` group membership as the
-//!   only host-side prerequisite; the security boundary is the
-//!   VM/kernel isolation, not the launcher (`docs/plan.md` Section 2.1).
-//! - [`session`]: the session identifier scheme
-//!   ([`session::SessionId`]) and the request/handle types
-//!   ([`session::LaunchRequest`], [`session::LaunchedSession`]) the
-//!   launcher operates on.
-//! - [`launcher::teardown`]: session teardown -- disk image deleted, VM
-//!   container force-removed, nothing persisted beyond what already
-//!   synced to host (Phase 4's job, not this crate's).
-//! - Resource-limit enforcement (CPU/memory caps) is read from the
-//!   shared config (`habitat_policy::resource_limits`) and applied as
-//!   `podman run` flags in [`launcher::build_run_args`].
-//! - No live/continuous file-share mount at any point (`AGENTS.md`
-//!   Section 2, invariant 1) -- the workspace disk crosses in exactly
-//!   once, as a launch-time block-device attach, never a bind mount.
+//!   session's microVM through the `krun` runtime against the
+//!   `habitat-workspace`-built disk image, attached as a `virtio-blk`
+//!   block device. No elevated host privilege is required -- Podman runs
+//!   as the calling user (with one-time `kvm` group membership); the
+//!   security boundary is the VM/kernel isolation, not the launcher.
+//! - [`session`]: the session identifier scheme ([`session::SessionId`])
+//!   and the request/handle types the launcher operates on.
+//! - [`launcher::teardown`]: disk image deleted, VM container
+//!   force-removed.
+//! - Resource-limit enforcement (CPU/memory caps) is read from
+//!   `habitat_policy::resource_limits` and applied in
+//!   [`launcher::build_run_args`].
+//! - No live/continuous file-share mount at any point -- the workspace
+//!   disk crosses in exactly once, as a launch-time block-device attach.
 //!
-//! **What this crate does not (yet) cover:** actually booting against
-//! real KVM and confirming a concrete escape attempt fails --
-//! `tests/manual/validate-vm-launch.sh` is that verification, since
-//! neither this dev container nor this project's CI has real hardware
-//! virtualization available (`AGENTS.md` Section 3). The full audit
-//! trail (Phase 6) is a later phase's responsibility.
+//! **Not covered here:** actually booting against real KVM --
+//! `tests/manual/validate-vm-launch.sh` does that, since this dev
+//! container and CI have no hardware virtualization.
 //!
-//! Phase 5 (`habitat-egress`): the launch command's `--network`/`--dns`
-//! flags come from `habitat_egress::network_setup::build_network_flags`
-//! -- a real `passt`-backed interface pinned to the session's egress
-//! proxy, replacing the Phase 3 `--network none` placeholder. This crate
-//! only splices that module's output into its own argv; the egress
-//! policy itself (the allowlist, the proxy, the reachability-restricting
-//! firewall ruleset) lives in `crates/egress`, per `file-structure.md`
-//! Section 2's "not duplicated per-domain" rule.
+//! The launch command's `--network`/`--dns` flags come from
+//! `habitat_egress::network_setup::build_network_flags` -- a real
+//! `passt`-backed interface pinned to the session's egress proxy. This
+//! crate only splices that module's output into its own argv; the
+//! egress policy itself lives in `crates/egress`.
 //!
-//! [`guest_ssh`] (`docs/decisions/0008-guest-exec-channel.md`): generates
-//! each session's ephemeral SSH keypair -- `podman exec` does not work
-//! against the `krun` runtime at all, so `launcher::build_run_args` bakes
-//! the session's public key into the guest via an environment variable
-//! (not a secret; the private half never leaves the host), and
-//! `launcher::launch` resolves the guest's address so
-//! `habitat-workspace`'s guest-exec channel can actually reach it.
+//! [`guest_ssh`]: generates each session's ephemeral SSH keypair --
+//! `podman exec` does not work against `krun`, so
+//! `launcher::build_run_args` bakes the public key into the guest via an
+//! env var, and `launcher::launch` resolves the guest's address so
+//! `habitat-workspace`'s guest-exec channel can reach it.
 
 pub mod command_runner;
 pub mod guest_ssh;

@@ -1,26 +1,14 @@
-//! Phase 1 exit-gate tests for `habitat-install` (`tmp/wip/implementation-plan.md`).
-//!
-//! These are black-box tests of the crate's public contract with the rest
-//! of the system -- run through `run_install_checks`/`run_preflight`
-//! exactly as `habitat-cli` calls them -- not pure internal logic, so per
-//! `file-structure.md` Section 2 they live here under `tests/unit/install/`
-//! rather than as inline `#[cfg(test)]` modules in `crates/install/src/`.
-//! Wired into `cargo test` via the `[[test]]` target in
-//! `crates/install/Cargo.toml`.
+//! Black-box exit-gate tests for `habitat-install`, run through
+//! `run_install_checks`/`run_preflight` as `habitat-cli` calls them.
 
 use habitat_audit::MemoryAuditSink;
 use habitat_install::testing::FakeEnvironment;
 use habitat_install::{run_install_checks, run_preflight};
 
-/// Exit gate: "run preflight on a machine/nested-VM without KVM exposed
-/// and confirm it actually reports absence, not a false positive
-/// (recorded test, not inspection)."
-///
 /// Every other check is satisfied; only `/dev/kvm` is absent, simulating a
-/// nested VM that hasn't had `/dev/kvm` passed through to it. Preflight
-/// must fail closed, attribute the failure to the `kvm` check by name (not
-/// a generic failure), and record exactly one distinctly-tagged
-/// `preflight-failure` audit event -- never a silent pass.
+/// nested VM without KVM passthrough. Preflight must fail closed,
+/// attribute the failure to the `kvm` check by name, and record exactly
+/// one `preflight-failure` audit event.
 #[test]
 fn preflight_reports_missing_kvm_not_a_false_positive() {
     let env = FakeEnvironment::linux()
@@ -49,14 +37,9 @@ fn preflight_reports_missing_kvm_not_a_false_positive() {
     assert_eq!(events[0].check.as_deref(), Some("kvm"));
 }
 
-/// Exit gate: "an intentionally-broken containerd/Kata install fails
-/// closed with a non-zero exit and a distinctly-tagged log entry" --
-/// carried over to the current stack as: an intentionally-broken
-/// Podman/krun install fails closed the same way.
-///
-/// `crun-krun` is present-but-broken (analogous to a misconfigured OCI
-/// runtime that fails to report its version) -- everything upstream of it
-/// (host OS, KVM, podman reachability) is otherwise healthy.
+/// An intentionally-broken Podman/krun install must fail closed with a
+/// distinctly-tagged log entry -- `crun-krun` is present but broken while
+/// everything upstream (host OS, KVM, podman reachability) is healthy.
 #[test]
 fn broken_krun_runtime_install_fails_closed_with_distinct_tag() {
     let env = FakeEnvironment::linux()
@@ -80,9 +63,7 @@ fn broken_krun_runtime_install_fails_closed_with_distinct_tag() {
     );
     assert_eq!(events[0].check.as_deref(), Some("krun-runtime"));
 
-    // Also exercised via `habitat install` directly (host-os check first,
-    // so use a fully Linux+podman-healthy env to reach the same
-    // krun-runtime failure through that entry point too).
+    // Also exercised via `habitat install` directly.
     let install_audit = MemoryAuditSink::default();
     let install_err = run_install_checks(&env, &install_audit)
         .expect_err("`habitat install` must also fail closed on a broken krun-runtime install");
@@ -91,12 +72,9 @@ fn broken_krun_runtime_install_fails_closed_with_distinct_tag() {
     assert_eq!(install_events[0].kind.tag(), "install-failure");
 }
 
-/// Exit gate: "preflight fails clearly when betterleaks is enabled but
-/// the binary is missing" -- content-based secrets scanning
-/// (`secrets_scan.content: enabled`, the default) must never silently
-/// degrade to no scanning at all just because the operator hasn't
-/// installed the scanner. Everything else on this host is healthy;
-/// `betterleaks` alone is absent.
+/// Content-based secrets scanning must never silently degrade to no
+/// scanning just because the operator hasn't installed the scanner.
+/// Everything else on this host is healthy; `betterleaks` alone is absent.
 #[test]
 fn preflight_fails_closed_when_betterleaks_enabled_but_binary_missing() {
     let env = FakeEnvironment::linux()
@@ -130,17 +108,10 @@ fn preflight_fails_closed_when_betterleaks_enabled_but_binary_missing() {
     assert!(audit_disabled.events.lock().unwrap().is_empty());
 }
 
-/// Exit gate: "installer run twice on an already-correct host produces no
-/// changes the second time."
-///
-/// `habitat install` is verify-only: nothing in `Environment` exposes a
-/// mutating operation (`os_family`, `path_exists`, `can_open_read_write`,
-/// `read_to_string`, `run_command` are all read-only probes), and
-/// `run_install_checks` takes `&E`, never `&mut E` -- so by construction it
-/// cannot leave the host in a different state than it found it. This test
-/// confirms the *observable* side of that: run against an
-/// already-correct host twice and get byte-identical outcomes (`Ok`, zero
-/// audit events) both times.
+/// `habitat install` is verify-only by construction (`Environment` exposes
+/// only read-only probes, and `run_install_checks` takes `&E` never `&mut
+/// E`) -- this confirms the observable side: two runs against an
+/// already-correct host produce byte-identical outcomes.
 #[test]
 fn install_run_twice_on_already_correct_host_makes_no_changes() {
     let env = FakeEnvironment::linux()

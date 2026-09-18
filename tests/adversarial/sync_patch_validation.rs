@@ -1,12 +1,7 @@
-//! Phase 4 adversarial tests for `habitat-workspace::sync`
-//! (`tmp/wip/implementation-plan.md`): the host->sandbox counterparts to
-//! `tests/unit/workspace/sync_exit_gate.rs`'s sandbox->host cases, plus a
-//! source-level check that this crate's sync mechanism never reaches the
-//! user's real remote (`AGENTS.md` Section 2, invariant 4).
-//!
-//! Wired into `cargo test` via the `[[test]]` target in
-//! `crates/workspace/Cargo.toml`, alongside `blocklist_disk_image.rs` and
-//! `content_scan_ruleset_tamper.rs`.
+//! Adversarial tests for `habitat-workspace::sync`: the host->sandbox
+//! counterparts to `tests/unit/workspace/sync_exit_gate.rs`'s sandbox->host
+//! cases, plus a source-level check that sync never reaches the user's real
+//! remote (`AGENTS.md` Section 2, invariant 4).
 
 use habitat_audit::{EventKind, MemoryAuditSink};
 use habitat_policy::blocklist;
@@ -20,9 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Both tests below resolve as `NoOp`/`Flagged` before ever touching the
-/// guest (that's the whole point -- a blocklisted or ruleset-touching
-/// change must never even reach it), so this endpoint is never actually
-/// dialed; its values are placeholders, not exercised.
+/// guest, so this endpoint is never actually dialed -- values are placeholders.
 fn unused_guest_endpoint() -> GuestEndpoint<'static> {
     GuestEndpoint {
         host: "unused",
@@ -66,17 +59,11 @@ fn git_init_committed(dir: &std::path::Path) {
         .unwrap();
 }
 
-/// Adversarial case: a project adds a genuinely new file that happens to
-/// match the blocklist (e.g. a developer drops a fresh `.env` into their
-/// working directory mid-session), with no other change alongside it.
-/// The host->sandbox side must never generate, let alone apply, a patch
-/// for it -- the same blocklist filter the initial disk build uses
-/// (`crate::staging::build_staging_dir`) is re-applied at snapshot-refresh
-/// time, before any diff is produced, so `.env` never reaches the
-/// host-side mirror, never appears in a patch, and no guest interaction
-/// is ever attempted for it (`AGENTS.md` Section 2, invariant 2). This is
-/// a stronger guarantee than "caught by a re-check after the fact": there
-/// is no window in which `.env`'s bytes are ever diffed at all.
+/// A newly added file matching the blocklist (e.g. a `.env` dropped in
+/// mid-session) must never reach the host-side mirror, appear in a patch,
+/// or trigger a guest interaction -- the blocklist filter is re-applied at
+/// snapshot-refresh time, before any diff is produced, so its bytes are
+/// never even diffed (`AGENTS.md` Section 2, invariant 2).
 #[test]
 fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
     let project = temp_dir("h2s-smuggle-project");
@@ -87,8 +74,6 @@ fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
     fs::write(mirror.join("main.rs"), "fn main() {}").unwrap();
     git_init_committed(&mirror);
 
-    // A secret file appears on the host side after the initial build --
-    // the only change since the last sync.
     fs::write(project.join(".env"), "SECRET=leaked").unwrap();
 
     let flagged_dir = temp_dir("h2s-smuggle-flagged");
@@ -101,13 +86,8 @@ fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
         patterns: &patterns,
         flagged_store: &store,
     };
-    // Real `SystemCommandRunner` throughout, for both host_runner and
-    // guest_runner -- since `.env` is the only change and it's filtered
-    // out before any diff exists, this sync must resolve as a true
-    // no-op, meaning `ssh` (present on this machine, but pointed at a
-    // guest address that was never actually launched) is never invoked.
-    // If the code ever tried to reach the guest here, that real `ssh`
-    // call against an unreachable address would fail the test loudly.
+    // Real SystemCommandRunner: if sync ever tried to reach the guest, the
+    // real `ssh` call against this unreachable address would fail loudly.
     let runner = SystemCommandRunner;
     let audit = MemoryAuditSink::default();
 
@@ -128,9 +108,9 @@ fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
     fs::remove_dir_all(&flagged_dir).unwrap();
 }
 
-/// Adversarial case: a `betterleaks.toml` edit on the host side must be
-/// flagged (never silently merged into the guest's governing snapshot),
-/// per `docs/decisions/0007-content-secrets-scan-snapshot.md`.
+/// A `betterleaks.toml` edit on the host side must be flagged, never
+/// silently merged into the guest's governing snapshot
+/// (`0007-content-secrets-scan-snapshot.md`).
 #[test]
 fn host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_event() {
     let project = temp_dir("h2s-ruleset-project");
@@ -181,13 +161,9 @@ fn host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_ev
     fs::remove_dir_all(&flagged_dir).unwrap();
 }
 
-/// Contract-level check (same posture as `containment_escape.rs` for
-/// `habitat-vm`): this crate's sync mechanism must contain no code path
-/// that pushes, or configures a remote, for either the guest's or the
-/// host mirror's git repo -- `AGENTS.md` Section 2, invariant 4. Grepping
-/// the source is a deliberately blunt, easy-to-keep-honest check: it errs
-/// on the side of false alarms (e.g. flags an innocent comment
-/// mentioning "remote") rather than missing a real regression.
+/// Sync must contain no code path that pushes or configures a remote for
+/// either repo (`AGENTS.md` Section 2, invariant 4). Grepping the source is
+/// deliberately blunt -- false alarms are fine, a missed regression isn't.
 #[test]
 fn sync_source_never_invokes_git_push_or_configures_a_remote() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

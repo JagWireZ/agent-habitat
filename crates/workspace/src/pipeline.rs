@@ -1,15 +1,10 @@
-//! Top-level orchestration for Phase 2's disk-build pipeline: project
-//! copy -> blocklist filter -> git-history seed -> disk image assembly.
-//! This is the entry point Phase 7's `habitat run` calls into; it just
-//! sequences the other modules in this crate rather than reimplementing
-//! any of their logic.
+//! Top-level orchestration for the disk-build pipeline: project copy ->
+//! blocklist filter -> git-history seed -> disk image assembly. Just
+//! sequences the other modules in this crate.
 //!
-//! Order matters and is fixed: the git-history toggle is resolved
-//! *before* anything is staged, so an invalid/unapproved toggle stops
-//! the whole build before the staging directory (let alone the disk
-//! image) is ever created -- consistent with "no code path where an
-//! excluded file/state ever touches the sandbox disk, even transiently"
-//! extended to the git-history decision, not just individual files.
+//! Order is fixed: the git-history toggle is resolved *before* anything
+//! is staged, so an invalid/unapproved toggle stops the whole build
+//! before the staging directory is ever created.
 
 use crate::command_runner::CommandRunner;
 use crate::diskimage::{self, DiskImageError};
@@ -54,19 +49,15 @@ pub struct BuildRequest<'a> {
     pub image_size_mb: u64,
     pub project_config: ProjectConfig,
     /// Where to write this build's resolved, merged content-scan ruleset
-    /// (baseline + the project's own `betterleaks.toml`, if any -- see
-    /// `habitat_policy::secrets_scan::load_effective_ruleset`). Only
-    /// written to, and only consulted, when
-    /// `project_config.secrets_scan.content` is enabled. This is the
-    /// snapshot taken once at session start (this build), per the
-    /// governance note in `docs/decisions/0007-content-secrets-scan-snapshot.md`
-    /// -- `crate::sync` (Phase 4) reuses this snapshot rather than
-    /// re-resolving it from a possibly-edited on-disk `betterleaks.toml`.
+    /// (see `habitat_policy::secrets_scan::load_effective_ruleset`). Only
+    /// written/consulted when `project_config.secrets_scan.content` is
+    /// enabled. This is a session-start snapshot -- `crate::sync` reuses
+    /// it rather than re-resolving from a possibly-edited on-disk
+    /// `betterleaks.toml` (`docs/decisions/0007-content-secrets-scan-snapshot.md`).
     pub content_ruleset_path: PathBuf,
 }
 
-/// What the build actually did, for the caller to log (Phase 6) or
-/// inspect (this phase's tests).
+/// What the build actually did, for the caller to log or inspect.
 #[derive(Debug, Clone)]
 pub struct BuildOutcome {
     pub git_history_mode: GitHistoryMode,
@@ -85,20 +76,16 @@ pub fn build<R: CommandRunner>(
     let git_history_mode = git_history::resolve(&request.project_config.git_history)
         .map_err(BuildError::GitHistory)?;
 
-    // The filename blocklist toggle: disabling it is an explicit,
-    // visible opt-out (empty pattern set), never the default -- see
-    // `habitat_policy::secrets_scan::Toggle`.
+    // Disabling the filename blocklist is an explicit, visible opt-out
+    // (empty pattern set), never the default.
     let patterns = if request.project_config.secrets_scan.filenames.is_enabled() {
         blocklist::effective_patterns(&request.project_config.blocklist_additions)
     } else {
         Vec::new()
     };
 
-    // Content scanning: resolve and write this build's effective ruleset
-    // snapshot *before* staging runs, same "resolved before anything is
-    // staged" ordering the git-history toggle already follows above --
-    // an invalid/unmergeable project ruleset must stop the whole build,
-    // not just silently scan with the baseline alone.
+    // Resolve and write the effective ruleset snapshot before staging
+    // runs -- an invalid/unmergeable ruleset must stop the whole build.
     let content_scan_enabled = request.project_config.secrets_scan.content.is_enabled();
     let content_scan_config = if content_scan_enabled {
         let effective_ruleset = secrets_scan::load_effective_ruleset(

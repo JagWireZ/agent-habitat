@@ -1,20 +1,11 @@
 //! Pins guest DNS resolution to the proxy path (`docs/decisions/
-//! 0004-networking-layer.md`'s open item): the guest's only reachable
-//! address is this proxy (`crate::network_setup` restricts everything
-//! else at the network layer), so its resolver must be pointed here too
-//! -- otherwise a leftover default DNS server the guest never actually
-//! *asks the proxy about* would be a way for the reachability
-//! restriction to quietly leak (the guest could still resolve names, or
-//! be handed poisoned answers, over a path the SNI proxy never sees).
+//! 0004-networking-layer.md`): a leftover default DNS server the guest
+//! never asks the proxy about would let the reachability restriction leak.
 //!
-//! This module does not filter *which* names may be resolved -- doing
-//! that would be redundant with, and weaker than, the real gate: the
-//! proxy already denies by destination hostname at connection setup
-//! (`crate::proxy`), so restricting resolution itself would only add a
-//! second, IP-flavored check of the exact kind `0004` deliberately
-//! avoids. It only forwards each query to a fixed upstream resolver and
-//! returns the answer verbatim -- resolution keeps working normally,
-//! and it stays on the one path this proxy can see.
+//! Deliberately doesn't filter *which* names may be resolved — that would
+//! duplicate the real gate (`crate::proxy` denies by destination hostname
+//! at connection setup). It only forwards each query to a fixed upstream
+//! and returns the answer verbatim.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -22,24 +13,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// A public resolver used as the fixed upstream in the absence of any
-/// project-specific override -- Phase 7's config file is expected to add
-/// an override field here the same way it extends every other Phase 2-5
-/// built-in default, not to replace this constant's role as the
-/// built-in fallback.
+/// Public resolver used as the fixed upstream absent a project-specific
+/// override.
 pub const DEFAULT_UPSTREAM_DNS: &str = "1.1.1.1:53";
 
-/// How long a single forwarded query waits for the upstream resolver to
-/// answer before giving up. A denial-by-timeout is the fail-closed
-/// outcome here too: no answer is sent back to the guest rather than
-/// blocking the forwarder loop indefinitely on one slow or absent
-/// upstream.
+/// How long a forwarded query waits for the upstream to answer before
+/// giving up; times out fail-closed, no answer sent to the guest.
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Forwards one raw DNS query datagram to `upstream` and returns its raw
-/// response datagram, unmodified. Uses a fresh ephemeral local socket per
-/// call rather than reusing the forwarder's own listening socket, so a
-/// slow upstream on one query can never block the receipt of another.
+/// Forwards one raw DNS query datagram to `upstream` and returns its
+/// response unmodified. Uses a fresh ephemeral socket per call so a slow
+/// upstream on one query can't block another.
 pub fn forward_query(query: &[u8], upstream: &str) -> io::Result<Vec<u8>> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
@@ -50,16 +34,13 @@ pub fn forward_query(query: &[u8], upstream: &str) -> io::Result<Vec<u8>> {
     Ok(buf[..n].to_vec())
 }
 
-/// Runs the forwarder's receive loop against `listen_addr` (the address
-/// the guest's resolver is pointed at) until `running` is cleared. Each
-/// query is forwarded and answered synchronously; on any forwarding
-/// failure (upstream unreachable, timed out, or a malformed response),
-/// no reply is sent to the guest at all -- fail closed on a broken
-/// upstream rather than fabricate or repeat a stale answer.
+/// Runs the forwarder's receive loop against `listen_addr` until `running`
+/// is cleared. Any forwarding failure means no reply is sent — fail closed
+/// rather than fabricate or repeat a stale answer.
 pub fn run(listen_addr: SocketAddr, upstream: &str, running: Arc<AtomicBool>) -> io::Result<()> {
     let socket = UdpSocket::bind(listen_addr)?;
-    // Bounded so the loop notices `running` being cleared promptly
-    // instead of blocking on `recv_from` forever with nothing arriving.
+    // Bounded so the loop notices `running` clearing promptly instead of
+    // blocking on `recv_from` forever.
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     let mut buf = [0u8; 4096];
     while running.load(Ordering::SeqCst) {
@@ -87,10 +68,8 @@ mod tests {
     use super::*;
     use std::thread;
 
-    /// A minimal fixture "upstream resolver": answers every query with a
-    /// fixed, recognizable response so the test can confirm the
-    /// forwarder relayed the query and returned the exact answer, not
-    /// some transformation of it.
+    /// Fixture "upstream resolver": answers every query with a fixed,
+    /// recognizable response.
     fn spawn_fixture_upstream() -> SocketAddr {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();

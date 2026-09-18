@@ -1,15 +1,8 @@
-//! Phase 2's required adversarial test (`tmp/wip/implementation-plan.md`
-//! exit gate): seeds a project with variants of every blocklisted file
-//! pattern and confirms none of them are present anywhere on the
-//! resulting disk image -- nor in the intermediate staging directory
-//! that fed it -- by actually building a real disk image (via `mke2fs`)
-//! and extracting its contents back out (via `debugfs`) to inspect, no
-//! shortcuts through the staging directory alone.
-//!
-//! Unlike Phase 3/5's containment/egress adversarial tests, this one
-//! needs no real KVM -- `git`/e2fsprogs are ordinary tooling available in
-//! this dev container and in this project's CI, so it runs for real
-//! here rather than being deferred to `tests/manual/`.
+//! Seeds a project with variants of every blocklisted file pattern and
+//! confirms none of them are present anywhere on the resulting disk image
+//! -- nor in the intermediate staging directory -- by actually building a
+//! real disk image (`mke2fs`) and extracting it back out (`debugfs`) to
+//! inspect, no shortcuts through staging alone.
 
 use habitat_policy::config::ProjectConfig;
 use habitat_workspace::command_runner::SystemCommandRunner;
@@ -38,12 +31,10 @@ fn write(path: &Path, contents: &str) {
     fs::write(path, contents).unwrap();
 }
 
-/// One representative variant per default blocklist pattern
-/// (`policy/blocklist.txt`), each carrying a unique, greppable secret
-/// value so the test can prove that exact byte sequence is absent from
-/// the built artifacts -- a stronger check than "the filename is
-/// missing" alone (e.g. a bug that flattened directories could still
-/// drop the filename check while leaking the bytes under another name).
+/// One variant per default blocklist pattern, each with a unique greppable
+/// secret value so the test can prove the bytes are absent, not just the
+/// filename (a directory-flattening bug could still leak bytes under
+/// another name).
 fn blocklisted_variants() -> Vec<(&'static str, &'static str)> {
     vec![
         (".env", "SECRET_TOKEN=aaaa1111"),
@@ -90,13 +81,8 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
         staging_dir: staging_dir.clone(),
         image_path: image_path.clone(),
         image_size_mb: 32,
-        // This test is about the filename blocklist specifically; content
-        // scanning has its own adversarial coverage in
-        // `content_scan_ruleset_tamper.rs` and its own exit gate in
-        // `tests/unit/workspace/content_scan_exit_gate.rs`. Disabled here
-        // so this test doesn't depend on `betterleaks` being installed
-        // (it isn't ordinary tooling guaranteed present, unlike
-        // `git`/e2fsprogs -- see `crates/install/src/checks.rs::betterleaks`).
+        // Content scanning has its own coverage elsewhere; disabled here so
+        // this doesn't depend on betterleaks being installed.
         project_config: ProjectConfig {
             secrets_scan: habitat_policy::secrets_scan::SecretsScanConfig {
                 content: habitat_policy::secrets_scan::Toggle::Disabled,
@@ -108,8 +94,7 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
     };
     let outcome = pipeline::build(request, &SystemCommandRunner).expect("build should succeed");
 
-    // 1. The intermediate staging artifact: walk it entirely and confirm
-    //    none of the blocklisted secret values appear anywhere in it.
+    // 1. The staging artifact must contain none of the secret values.
     let staging_contents = read_all_file_contents(&staging_dir);
     for (path, secret) in blocklisted_variants() {
         assert!(
@@ -128,9 +113,7 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
         );
     }
 
-    // 2. The actual disk image: extract it back out via debugfs (no
-    //    mount, no loop device, no root) and repeat the same checks
-    //    against what's really on the image, not just what fed it.
+    // 2. Extract the actual disk image via debugfs and repeat the checks.
     let dump_dir = workdir.join("dump");
     diskimage::dump_image_contents(&image_path, &dump_dir, &SystemCommandRunner)
         .expect("dumping the built image should succeed");
@@ -152,9 +135,8 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
         );
     }
 
-    // 3. Cross-check against the pipeline's own report: every blocklisted
-    //    variant must show up as explicitly skipped, not merely absent by
-    //    coincidence (e.g. because of an unrelated copy bug).
+    // 3. Every variant must show up as explicitly skipped, not merely
+    //    absent by coincidence.
     for (path, _) in blocklisted_variants() {
         assert!(
             outcome
@@ -169,8 +151,8 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
     fs::remove_dir_all(&workdir).unwrap();
 }
 
-/// Concatenates every regular file's contents under `root` into one
-/// string, for a simple "does this secret value appear anywhere" scan.
+/// Concatenates every regular file's contents under `root` for a simple
+/// "does this secret value appear anywhere" scan.
 fn read_all_file_contents(root: &Path) -> String {
     let mut combined = String::new();
     let mut stack = vec![root.to_path_buf()];

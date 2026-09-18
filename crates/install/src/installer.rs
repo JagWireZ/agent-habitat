@@ -1,12 +1,7 @@
 //! `habitat install`'s optional auto-install step.
 //!
-//! `checks.rs`/`preflight.rs` stay verify-only, as documented there; this
-//! module is the one place in the crate that actually mutates the host,
-//! and it only runs when the operator has explicitly asked it to (the
-//! "would you like to install the missing pieces?" confirmation lives in
-//! the CLI crate, which owns all operator-facing I/O -- this module just
-//! knows how to run the commands once told to, and reports what
-//! happened).
+//! The one place in the crate that mutates the host; runs only after the
+//! CLI crate has gotten the operator's explicit confirmation.
 
 use crate::checks::CheckId;
 use crate::environment::Environment;
@@ -30,14 +25,11 @@ pub enum InstallAttempt {
 
 /// Attempts to auto-install every check in `checks` that has a real
 /// package-manager fix on `family`, one at a time and in order, each run
-/// with inherited stdio so the operator sees -- and can respond to --
-/// `sudo`'s password prompt and the package manager's own output live.
+/// with inherited stdio so the operator sees and can respond to `sudo`'s
+/// password prompt.
 ///
 /// Every attempt (not just failures) is logged to `audit` as a distinct
-/// `install-action` event: running a privileged command on the
-/// operator's behalf is itself worth a durable record, independent of
-/// whether it succeeded (mirrors `preflight.rs`'s failure logging, which
-/// also never lets a sink error suppress the underlying outcome).
+/// `install-action` event.
 pub fn install_missing<E: Environment>(
     env: &E,
     audit: &dyn AuditSink,
@@ -56,16 +48,10 @@ fn attempt_one<E: Environment>(
     family: PackageFamily,
     check: CheckId,
 ) -> InstallAttempt {
-    // `crun`/`crun-krun` (Dnf family only): once `checks::crun_version`
-    // has failed at all, the installed build is necessarily older than
-    // the pinned, confirmed-good release it's now gated on
-    // (`checks::MIN_CRUN_VERSION_FOR_PASST` -- see that constant's doc
-    // comment for the real-hardware Fedora finding that raised it from
-    // "new enough to accept krun.use_passt" to "this exact trusted
-    // build"). So the fix here is always the pinned build via direct
-    // URL, on every Dnf-family host, never a plain `dnf install
-    // crun-krun` against the very repo package that just failed the
-    // check -- there's no version left for that to plausibly fix.
+    // Dnf-only: a failed crun_version check means the installed build is
+    // older than MIN_CRUN_VERSION_FOR_PASST, so always install the pinned
+    // build via direct URL rather than `dnf install crun-krun` against
+    // the same repo package that just failed.
     if family == PackageFamily::Dnf && check == CheckId::CrunVersion {
         return install_pinned_unless_already_current(
             env,
@@ -90,21 +76,11 @@ fn attempt_one<E: Environment>(
     }
 
     match (check, family) {
-        // `libkrunfw` fallback (Dnf family only): the primary attempt
-        // above just tried `dnf install libkrunfw` and it didn't work --
-        // on AlmaLinux 10 that's because EPEL has no `libkrunfw` package
-        // under any name to resolve (confirmed real-hardware,
-        // `tmp/wip/vm-launch-validation`), not a transient failure worth
-        // retrying as-is. Fall back to a pinned, already-confirmed-working
-        // binary from Fedora's own build system rather than leaving the
-        // operator stuck on a package name that will never resolve here.
-        // Rarely reached on a genuine Fedora host: `crun-krun` there
-        // normally pulls in a matching `libkrunfw` automatically, so
-        // `checks::libkrunfw` already passes and `install_missing` never
-        // calls this at all -- unlike `crun-krun` above, there's no known
-        // version-specific bug behind an already-present `libkrunfw`, so
-        // this stays a plain "try the repo, fall back only if that
-        // fails" rather than always bypassing the repo unconditionally.
+        // Dnf libkrunfw fallback: EPEL (e.g. AlmaLinux 10) has no
+        // libkrunfw package under any name, so fall back to a pinned
+        // binary from Fedora's build system rather than leaving the
+        // operator stuck. Rarely reached on real Fedora, where crun-krun
+        // pulls in a matching libkrunfw automatically.
         (CheckId::Libkrunfw, PackageFamily::Dnf) => {
             log(
                 audit,
@@ -129,14 +105,8 @@ fn attempt_one<E: Environment>(
 
 /// `crun-krun`'s pinned Dnf-family install: never downgrade a host
 /// that's already at or past `pinned_version` (a future Fedora repo
-/// release, or an operator's own manual install) by asking `rpm` what it
-/// actually has on record -- the one authoritative "what's installed"
-/// answer for this family (`package_manager::rpm_package_version`'s doc
-/// comment). In practice this only matters when `checks::crun_version`
-/// and `rpm`'s own record disagree (e.g. a from-source `krun` build
-/// installed outside `rpm` entirely) -- `crun_version` already failing
-/// is otherwise guaranteed to mean `rpm`'s version is too old as well,
-/// since both now compare against the same pinned cutoff.
+/// release, or an operator's own manual install) -- checked by asking
+/// `rpm` what it actually has installed.
 fn install_pinned_unless_already_current<E: Environment>(
     env: &E,
     audit: &dyn AuditSink,
@@ -172,20 +142,13 @@ fn install_pinned_unless_already_current<E: Environment>(
 }
 
 /// Runs one `dnf`/`apt-get install` against one or more `packages` (more
-/// than one only for the `crun`+`crun-krun` fallback, which must install
-/// both together -- see `package_manager::CRUN_FALLBACK_URL`'s doc
-/// comment) and reports the outcome. Split out of [`attempt_one`] so
-/// every fallback above can run this same logic again, against different
-/// packages, without duplicating the command-construction and
-/// audit-logging shape.
+/// than one only for the `crun`+`crun-krun` fallback) and reports the
+/// outcome.
 ///
-/// `packages` is what actually gets passed to `dnf`/`apt-get install`
-/// (and is what the audit log's `running:`/`succeeded:` lines show, in
-/// full -- never truncated, since that log is the accurate record of
-/// what really ran as `sudo`). `display_name` is what the returned
-/// [`InstallAttempt`] carries for the operator-facing checklist; the two
-/// differ for the fallback cases, where `packages` are Koji URLs but the
-/// checklist should still read as a plain package name.
+/// `packages` is what actually gets passed to the install command and
+/// logged in full. `display_name` is what the returned [`InstallAttempt`]
+/// carries for the operator-facing checklist -- differs from `packages`
+/// in the fallback cases, where `packages` are Koji URLs.
 fn run_package_command<E: Environment>(
     env: &E,
     audit: &dyn AuditSink,
@@ -227,9 +190,6 @@ fn run_package_command<E: Environment>(
 
 fn log(audit: &dyn AuditSink, check: CheckId, message: String) {
     let event = AuditEvent::now(EventKind::InstallAction, Some(check.name()), message);
-    // Same reasoning as `preflight.rs::log_and_wrap`: an audit-sink
-    // failure (e.g. disk full) must never suppress or alter the outcome
-    // being reported to the operator.
     let _ = audit.record(&event);
 }
 
@@ -304,7 +264,6 @@ mod tests {
                 },
             ]
         );
-        // krun-runtime never even reached run_command_inherited.
         assert_eq!(
             *env.inherited_invocations.borrow(),
             vec!["sudo apt-get install -y podman".to_string()]
@@ -313,9 +272,6 @@ mod tests {
 
     #[test]
     fn libkrunfw_falls_back_to_the_pinned_url_when_the_named_package_is_unavailable() {
-        // Mirrors real AlmaLinux 10 hardware: `dnf install libkrunfw`
-        // fails outright (no such package in EPEL), so the fallback URL
-        // must be the one that actually gets attempted second.
         let fallback_cmd = format!(
             "sudo dnf install -y {}",
             package_manager::LIBKRUNFW_FALLBACK_URL
@@ -364,9 +320,6 @@ mod tests {
 
     #[test]
     fn libkrunfw_never_falls_back_on_the_apt_family() {
-        // No `package_for` mapping at all on Apt, so this must report
-        // `NotAvailable` without running anything -- the same "None,
-        // never a guess" posture as `KrunRuntime` on Apt.
         let env = FakeEnvironment::linux();
         let audit = MemoryAuditSink::default();
 
@@ -383,8 +336,6 @@ mod tests {
 
     #[test]
     fn crun_version_installs_the_pinned_pair_when_rpm_shows_no_installed_version() {
-        // No `rpm -q crun-krun` configured -- rpm_package_version can't
-        // tell what's there, so this must not skip the install.
         let fallback_cmd = format!(
             "sudo dnf install -y {} {}",
             package_manager::CRUN_FALLBACK_URL,
@@ -407,9 +358,6 @@ mod tests {
 
     #[test]
     fn crun_version_skips_the_pinned_install_when_rpm_already_shows_that_version() {
-        // A host already on the pinned build (e.g. a second `habitat
-        // install` run after the first one already fixed it) must not
-        // reinstall the same rpm pair every time.
         let env = FakeEnvironment::linux()
             .with_command_ok("rpm -q --queryformat %{VERSION}\\n crun-krun", "1.29.1\n");
         let audit = MemoryAuditSink::default();
@@ -431,9 +379,6 @@ mod tests {
 
     #[test]
     fn crun_version_skips_the_pinned_install_when_rpm_already_shows_something_newer() {
-        // A host on something newer than the pinned build (a future
-        // Fedora repo release, or an operator's own manual install) must
-        // never be downgraded by this project's own pinned fallback.
         let env = FakeEnvironment::linux()
             .with_command_ok("rpm -q --queryformat %{VERSION}\\n crun-krun", "1.30.0\n");
         let audit = MemoryAuditSink::default();
@@ -452,10 +397,6 @@ mod tests {
 
     #[test]
     fn crun_version_still_installs_the_pinned_pair_when_rpm_shows_an_older_version() {
-        // The gap this whole mechanism exists for: real Fedora 44
-        // hardware where `rpm -qa` shows `crun-krun-1.28-1.fc44` --
-        // older than the pinned, confirmed-good build `checks::
-        // crun_version` now requires.
         let fallback_cmd = format!(
             "sudo dnf install -y {} {}",
             package_manager::CRUN_FALLBACK_URL,

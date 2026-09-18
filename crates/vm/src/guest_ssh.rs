@@ -3,15 +3,10 @@
 //! (`docs/decisions/0008-guest-exec-channel.md`), since `podman exec`
 //! does not work against the `krun` runtime at all.
 //!
-//! A fresh keypair every session, never reused: the private key never
-//! leaves the host, lives only at a session-scoped path, and is deleted
-//! at teardown alongside the rest of the session's disposable state
-//! (`crate::launcher::teardown`) -- the same disposability principle
-//! `0005-storage-layer.md` applies to the workspace disk, applied here to
-//! a credential instead. The public key is not a secret; baking it into
-//! the guest as a plaintext environment variable
-//! (`crate::launcher::AUTHORIZED_KEY_ENV`) does not violate `AGENTS.md`
-//! Section 2 invariant 5, which is about credentials and API keys.
+//! A fresh keypair every session: the private key never leaves the host
+//! and is deleted at teardown (`crate::launcher::teardown`). The public
+//! key is not a secret, so baking it into the guest as a plaintext env
+//! var (`crate::launcher::AUTHORIZED_KEY_ENV`) is fine.
 
 use crate::command_runner::CommandRunner;
 use std::fmt;
@@ -51,13 +46,10 @@ fn public_key_path(private_key_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Generates a fresh ed25519 keypair at `private_key_path` (and a
-/// sibling `<private_key_path>.pub`), with no passphrase -- this key is
-/// disposable, machine-generated, and never leaves the host, so an
-/// interactive passphrase would only add friction (and would hang this
-/// call, since there is no operator present to answer a prompt) with no
-/// real security benefit. Fails closed on any `ssh-keygen` error rather
-/// than falling back to a weaker key type or a placeholder value.
+/// Generates a fresh ed25519 keypair at `private_key_path` (and sibling
+/// `<private_key_path>.pub`), with no passphrase -- there's no operator
+/// present to answer an interactive prompt. Fails closed on any
+/// `ssh-keygen` error.
 pub fn generate<R: CommandRunner>(
     private_key_path: &Path,
     runner: &R,
@@ -114,11 +106,8 @@ pub fn generate<R: CommandRunner>(
     })
 }
 
-/// Removes both halves of a session's keypair. Idempotent -- an
-/// already-removed key (or one that was never generated) is not an
-/// error, matching this project's standing idempotency bar (`AGENTS.md`
-/// Section 7) and `crate::launcher::teardown`'s own handling of an
-/// already-gone disk image.
+/// Removes both halves of a session's keypair. Idempotent -- a
+/// missing/already-removed key is not an error.
 pub fn cleanup(private_key_path: &Path) -> std::io::Result<()> {
     for path in [
         private_key_path.to_path_buf(),
