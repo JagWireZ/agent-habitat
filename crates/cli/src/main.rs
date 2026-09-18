@@ -96,8 +96,9 @@ OPTIONS:\n\
 \n\
 EXAMPLES:\n\
     habitat install\n\
-    habitat run -- claude-code\n\
-    habitat run --config sandbox.yaml -- claude-code --print\n"
+    habitat run\n\
+    habitat run claude\n\
+    habitat run --config sandbox.yaml codex --print\n"
         .to_string()
 }
 
@@ -121,19 +122,25 @@ OPTIONS:\n\
 }
 
 fn run_help() -> String {
-    "habitat run -- run an agent inside a disposable sandbox of the current project.\n\
+    "habitat run -- run an agent (or a shell) inside a disposable sandbox of the current \
+project.\n\
 \n\
 Runs preflight checks, builds a disposable copy of the current project onto a \
-sandbox disk, launches it in an isolated VM, then reads prompts from stdin one at a \
-time: each prompt is synced into the sandbox, run through the named agent once, and \
-its results synced back out to your real project as a patch. Type 'exit' or 'quit' \
-(or send EOF) to end the session -- the sandbox, its egress firewall, and the VM are \
-torn down automatically.\n\
+sandbox disk, and launches it in an isolated VM. With no agent named, drops you into \
+an interactive shell inside the sandbox -- your changes sync in before the shell \
+opens, periodically while it's open, and once more when you exit it. With an agent \
+named, reads prompts from stdin one at a time instead: each prompt is synced into the \
+sandbox, run through the named agent once, and its results synced back out to your \
+real project as a patch. Type 'exit' or 'quit' (or send EOF) to end a prompt session, \
+or exit the shell to end a shell session -- the sandbox, its egress firewall, and the \
+VM are torn down automatically either way.\n\
 \n\
 USAGE:\n\
-    habitat run [--config <path>] [-v|--verbose] -- <agent> [agent-args...]\n\
+    habitat run [--config <path>] [-v|--verbose] [<agent> [agent-args...]]\n\
 \n\
-The `--` separator and an agent command after it are required.\n\
+<agent> is one of: claude, codex, opencode -- or `-- <command> [args...]` to run any \
+other agent binary that supports a one-shot, single-prompt invocation mode. Omit it \
+entirely for an interactive shell.\n\
 \n\
 OPTIONS:\n\
     --config <path>   Path to the project's config file (default: sandbox.yaml)\n\
@@ -141,8 +148,10 @@ OPTIONS:\n\
     -h, --help        Print this help\n\
 \n\
 EXAMPLES:\n\
-    habitat run -- claude-code\n\
-    habitat run --config sandbox.yaml -- claude-code --print\n"
+    habitat run\n\
+    habitat run claude\n\
+    habitat run --config sandbox.yaml codex --print\n\
+    habitat run -- my-custom-agent --print\n"
         .to_string()
 }
 
@@ -606,11 +615,6 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    println!(
-        "{}",
-        s.green_bold("Session ready. Type a prompt and press enter (or 'exit' to end the session).")
-    );
-
     let patterns = if config.secrets_scan.filenames.is_enabled() {
         habitat_policy::blocklist::effective_patterns(&config.blocklist_additions)
     } else {
@@ -621,30 +625,55 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
         port: launched.guest_ssh_port,
         private_key_path: &launched.guest_ssh_private_key_path,
     };
-    let prompts = std::io::stdin().lines().map_while(Result::ok);
 
-    let loop_result = run::run_prompt_loop(
-        &project_root,
-        &paths,
-        guest,
-        &patterns,
-        &run_args.agent,
-        &ws_runner,
-        &ws_runner,
-        &audit,
-        prompts,
-        |round| {
-            print!("{}", round.agent_stdout);
-            if !round.agent_stderr.is_empty() {
-                eprint!("{}", round.agent_stderr);
-            }
-        },
-    );
+    let session_result: Result<(), run::RunError> = match &run_args.mode {
+        run::RunMode::Shell => {
+            println!(
+                "{}",
+                s.green_bold("Session ready. Opening a shell in your sandbox -- exit it to end the session.")
+            );
+            run::run_shell_session(
+                &project_root,
+                &paths,
+                guest,
+                &patterns,
+                &ws_runner,
+                &ws_runner,
+                &audit,
+            )
+            .map(|_| ())
+        }
+        run::RunMode::Agent(agent) => {
+            println!(
+                "{}",
+                s.green_bold("Session ready. Type a prompt and press enter (or 'exit' to end the session).")
+            );
+            let prompts = std::io::stdin().lines().map_while(Result::ok);
+            run::run_prompt_loop(
+                &project_root,
+                &paths,
+                guest,
+                &patterns,
+                agent,
+                &ws_runner,
+                &ws_runner,
+                &audit,
+                prompts,
+                |round| {
+                    print!("{}", round.agent_stdout);
+                    if !round.agent_stderr.is_empty() {
+                        eprint!("{}", round.agent_stderr);
+                    }
+                },
+            )
+            .map(|_| ())
+        }
+    };
 
     let _ = run::remove_egress_firewall_in_container(&vm_runner, session_id.as_str());
     let teardown_result = habitat_vm::launcher::teardown(&launched, &vm_runner, &audit);
 
-    if let Err(e) = loop_result {
+    if let Err(e) = session_result {
         eprintln!("habitat run: {e}");
         print_detail_pointer(&s, &raw_audit, verbose);
         return ExitCode::FAILURE;
