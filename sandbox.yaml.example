@@ -1,0 +1,69 @@
+# Default project config for `habitat run`, showing every recognized key
+# with its default value. This file is optional -- a missing config file
+# behaves exactly like every key below being left at its default.
+#
+# Format notes:
+#   - This is a strict, hand-rolled subset of YAML: no flow style
+#     (`{ }` / `[ ]`), no multi-line scalars, no anchors. Plain `key: value`
+#     and `- item` list entries only. 2-space indentation for nested keys.
+#   - An unrecognized top-level or nested key is a hard load error, not a
+#     silently ignored typo.
+#   - Copy this file to sandbox.yaml (or pass --config <path>) and trim it
+#     to just the keys you want to override.
+
+# Extra filename patterns to block from entering the sandboxed workspace,
+# on top of the built-in blocklist. Glob-style patterns.
+# Default: empty list.
+blocklist_additions:
+  - "*.mysecret"
+  - local.creds
+
+# Whether the session's git history is real or synthetic.
+git_history:
+  # Default: false -- seed a brand-new, synthetic repo with no real
+  # history. Setting this to true shares the real .git, read-only, but
+  # requires a complete approval below (all three fields non-empty) or
+  # resolution fails hard.
+  enabled: false
+  # Required (non-empty) when enabled: true. Who reviewed and approved
+  # sharing real git history with the agent.
+  approved_by: Jane Doe
+  # Required (non-empty) when enabled: true. When the approval was given.
+  approved_date: 2026-09-14
+  # Required (non-empty) when enabled: true. Why real history is needed
+  # (e.g. "legacy blame needed").
+  reason: legacy blame needed
+
+# Secrets scanning, run against the workspace before it's handed to the
+# agent.
+secrets_scan:
+  # Filename-based blocklist mechanism. Default: enabled.
+  filenames: enabled
+  # Betterleaks-based content scan. Default: enabled.
+  content: enabled
+  # Optional path to a project-specific Betterleaks rules file. Its rules
+  # are additive to the bundled baseline, never a full replacement.
+  # Default: none (baseline rules only).
+  content_rules_path: "./custom-betterleaks.toml"
+
+# CPU/memory caps applied to the session's microVM at launch. There is no
+# separate disk-limit knob -- disk is capped by the fixed build-time size
+# of the session's disk image.
+resource_limits:
+  # Number of vCPUs, as a positive number (fractional allowed, e.g. 1.5).
+  # Default: 2.
+  cpus: 2
+  # Memory cap in megabytes, as a positive integer. Default: 2048.
+  memory_mb: 2048
+
+# Extra hostnames/patterns to allow through the egress firewall, on top of
+# the built-in allowlist.
+# Default: empty list.
+egress_allowlist_additions:
+  - internal.registry.example
+  - "*.corp.example"
+
+# Audit log verbosity. Default: enabled. This only controls a handful of
+# suppressible, non-invariant-critical log entries -- it never disables the
+# boundary audit trail itself.
+audit: enabled
