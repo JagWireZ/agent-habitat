@@ -1,5 +1,14 @@
 //! `habitat-audit` -- the unified audit log for everything crossing the
-//! host/sandbox boundary. Boundary-only; in-sandbox activity is out of scope.
+//! host/sandbox boundary. Boundary-only; in-sandbox activity is out of
+//! scope.
+//!
+//! **Scope note:** this log records events at the host/sandbox boundary --
+//! session start/stop, preflight/install pass/fail, egress allow/deny,
+//! sync applied/flagged -- never what an agent ran or produced *inside*
+//! the guest. Full in-sandbox activity logging is an explicitly deferred
+//! feature (AGENTS.md §4); nothing in this crate is a step toward it, and
+//! an operator should not read a clean audit log as "nothing happened in
+//! the sandbox," only as "nothing crossed the boundary unexpectedly."
 //!
 //! Log content is attacker-influenced (e.g. command stderr), so every string
 //! is JSON-escaped by hand before it touches disk -- no `serde_json` dep,
@@ -49,6 +58,27 @@ pub enum EventKind {
     /// allowlist. Fails closed either way; emitted before the connection is
     /// dropped, never after a best-effort forward.
     EgressDenied,
+    /// `habitat run`'s preflight subroutine completed with every check
+    /// green. The failure half (`PreflightFailure`) already existed from
+    /// Phase 1; this is its missing "pass" counterpart, needed so a clean
+    /// run is visible in the log at all, not just failures.
+    PreflightPass,
+    /// `habitat install` completed with every check green -- the "pass"
+    /// counterpart to `InstallFailure`, same reasoning as `PreflightPass`.
+    InstallPass,
+    /// A session's microVM launch was attempted (`launcher::launch`
+    /// entered, before `podman run` is invoked). Marks the start of a
+    /// session's lifecycle in the log even if the launch itself then
+    /// fails -- an attempt is boundary-relevant on its own.
+    SessionStart,
+    /// A session's teardown (`launcher::teardown`) completed: container
+    /// force-removed, disk image deleted, SSH keypair deleted. Marks the
+    /// end of a session's lifecycle. There is no separate
+    /// `VmLaunch`/`VmTeardown` pair -- in this codebase a "session" *is*
+    /// exactly the span between one launch and one teardown, so a second
+    /// event pair with identical timing would just be a second name for
+    /// the same fact.
+    SessionStop,
 }
 
 impl EventKind {
@@ -62,8 +92,58 @@ impl EventKind {
             EventKind::SyncFlagged => "sync-flagged",
             EventKind::EgressAllowed => "egress-allowed",
             EventKind::EgressDenied => "egress-denied",
+            EventKind::PreflightPass => "preflight-pass",
+            EventKind::InstallPass => "install-pass",
+            EventKind::SessionStart => "session-start",
+            EventKind::SessionStop => "session-stop",
         }
     }
+
+    /// Whether this event kind may be dropped when a project's config sets
+    /// `audit: disabled` (`habitat_policy::config::ProjectConfig::audit`,
+    /// Phase 7). Scoped deliberately narrow: only routine, low-signal
+    /// events that duplicate information already implied by their absence
+    /// (a clean preflight, an allowed connection, a cleanly-applied sync,
+    /// an install action already surfaced to the operator interactively).
+    /// AGENTS.md invariants 3, 10, 11, and 12 all assume a preflight
+    /// failure, a flagged patch, an egress denial, a mid-session ruleset
+    /// edit, and a session's start/stop are always visible in the audit
+    /// trail -- so none of those may ever answer `true` here, regardless
+    /// of config. See `docs/decisions/0009-run-driver-prompt-loop.md`.
+    pub fn is_suppressible_when_audit_disabled(self) -> bool {
+        match self {
+            EventKind::PreflightPass
+            | EventKind::InstallPass
+            | EventKind::SyncApplied
+            | EventKind::EgressAllowed
+            | EventKind::InstallAction => true,
+            EventKind::PreflightFailure
+            | EventKind::InstallFailure
+            | EventKind::ContentRulesetMidSessionEdit
+            | EventKind::SyncFlagged
+            | EventKind::EgressDenied
+            | EventKind::SessionStart
+            | EventKind::SessionStop => false,
+        }
+    }
+
+    /// Every variant, for exhaustiveness checks (e.g. tag uniqueness) --
+    /// kept next to the enum so a newly added variant is an obvious two-line
+    /// diff away from being covered, rather than silently missing.
+    pub const ALL: &'static [EventKind] = &[
+        EventKind::PreflightFailure,
+        EventKind::InstallFailure,
+        EventKind::InstallAction,
+        EventKind::ContentRulesetMidSessionEdit,
+        EventKind::SyncApplied,
+        EventKind::SyncFlagged,
+        EventKind::EgressAllowed,
+        EventKind::EgressDenied,
+        EventKind::PreflightPass,
+        EventKind::InstallPass,
+        EventKind::SessionStart,
+        EventKind::SessionStop,
+    ];
 }
 
 impl fmt::Display for EventKind {
@@ -140,6 +220,16 @@ pub trait AuditSink {
     fn record(&self, event: &AuditEvent) -> io::Result<()>;
 }
 
+/// Lets a shared reference to any sink (including `&dyn AuditSink`) be used
+/// anywhere an owned `S: AuditSink` is expected -- e.g. wrapping a sink a
+/// caller doesn't want to give up ownership of, such as in
+/// [`FilteringAuditSink`].
+impl<S: AuditSink + ?Sized> AuditSink for &S {
+    fn record(&self, event: &AuditEvent) -> io::Result<()> {
+        (**self).record(event)
+    }
+}
+
 /// Appends one JSON line per event to a file, creating parent directories
 /// and the file itself if needed. Never truncates -- the audit log is
 /// append-only.
@@ -170,6 +260,32 @@ impl AuditSink for FileAuditSink {
     }
 }
 
+/// Wraps another sink, dropping events for which
+/// `EventKind::is_suppressible_when_audit_disabled` is `true` when
+/// `enabled` is `false`. When `enabled` is `true` this is a transparent
+/// passthrough. The non-suppressible event set is fixed by `EventKind`
+/// itself, not configurable here -- this type only ever narrows what a
+/// config's `audit: disabled` can affect, never widens it.
+pub struct FilteringAuditSink<S: AuditSink> {
+    inner: S,
+    enabled: bool,
+}
+
+impl<S: AuditSink> FilteringAuditSink<S> {
+    pub fn new(inner: S, enabled: bool) -> Self {
+        FilteringAuditSink { inner, enabled }
+    }
+}
+
+impl<S: AuditSink> AuditSink for FilteringAuditSink<S> {
+    fn record(&self, event: &AuditEvent) -> io::Result<()> {
+        if !self.enabled && event.kind.is_suppressible_when_audit_disabled() {
+            return Ok(());
+        }
+        self.inner.record(event)
+    }
+}
+
 /// In-memory sink, exposed (not test-only) so other crates' unit tests can
 /// assert on exactly what was logged.
 #[derive(Default)]
@@ -197,27 +313,29 @@ mod tests {
             EventKind::ContentRulesetMidSessionEdit.tag(),
             "content-ruleset-mid-session-edit"
         );
-        assert_ne!(
-            EventKind::PreflightFailure.tag(),
-            EventKind::InstallFailure.tag()
-        );
-        assert_ne!(
-            EventKind::InstallAction.tag(),
-            EventKind::InstallFailure.tag()
-        );
-        assert_ne!(
-            EventKind::ContentRulesetMidSessionEdit.tag(),
-            EventKind::InstallAction.tag()
-        );
         assert_eq!(EventKind::SyncApplied.tag(), "sync-applied");
         assert_eq!(EventKind::SyncFlagged.tag(), "sync-flagged");
-        assert_ne!(EventKind::SyncApplied.tag(), EventKind::SyncFlagged.tag());
         assert_eq!(EventKind::EgressAllowed.tag(), "egress-allowed");
         assert_eq!(EventKind::EgressDenied.tag(), "egress-denied");
-        assert_ne!(
-            EventKind::EgressAllowed.tag(),
-            EventKind::EgressDenied.tag()
-        );
+        assert_eq!(EventKind::PreflightPass.tag(), "preflight-pass");
+        assert_eq!(EventKind::InstallPass.tag(), "install-pass");
+        assert_eq!(EventKind::SessionStart.tag(), "session-start");
+        assert_eq!(EventKind::SessionStop.tag(), "session-stop");
+    }
+
+    /// Exhaustive pairwise-uniqueness check over `EventKind::ALL`, so a
+    /// future added variant that collides with an existing tag fails this
+    /// test even if nobody remembers to hand-write a new assertion for it.
+    #[test]
+    fn every_event_kind_tag_is_pairwise_unique() {
+        let tags: Vec<&str> = EventKind::ALL.iter().map(|k| k.tag()).collect();
+        for (i, a) in tags.iter().enumerate() {
+            for (j, b) in tags.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "duplicate audit event tag: {a}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -245,6 +363,59 @@ mod tests {
             assert!(line.contains("\"kind\":\"preflight-failure\""));
             assert!(line.contains(&json_escape(payload)));
         }
+    }
+
+    #[test]
+    fn invariant_critical_events_are_never_suppressible() {
+        let never_suppressible = [
+            EventKind::PreflightFailure,
+            EventKind::InstallFailure,
+            EventKind::ContentRulesetMidSessionEdit,
+            EventKind::SyncFlagged,
+            EventKind::EgressDenied,
+            EventKind::SessionStart,
+            EventKind::SessionStop,
+        ];
+        for kind in never_suppressible {
+            assert!(
+                !kind.is_suppressible_when_audit_disabled(),
+                "{kind} must never be suppressible"
+            );
+        }
+    }
+
+    #[test]
+    fn filtering_sink_passes_everything_through_when_enabled() {
+        let inner = MemoryAuditSink::default();
+        let sink = FilteringAuditSink::new(&inner, true);
+        sink.record(&AuditEvent::now(EventKind::PreflightPass, None, "ok"))
+            .unwrap();
+        sink.record(&AuditEvent::now(EventKind::SessionStart, None, "start"))
+            .unwrap();
+        assert_eq!(inner.events.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn filtering_sink_drops_only_suppressible_events_when_disabled() {
+        let inner = MemoryAuditSink::default();
+        let sink = FilteringAuditSink::new(&inner, false);
+        sink.record(&AuditEvent::now(EventKind::PreflightPass, None, "ok"))
+            .unwrap();
+        sink.record(&AuditEvent::now(EventKind::SyncApplied, None, "applied"))
+            .unwrap();
+        sink.record(&AuditEvent::now(
+            EventKind::PreflightFailure,
+            None,
+            "failed",
+        ))
+        .unwrap();
+        sink.record(&AuditEvent::now(EventKind::SessionStart, None, "start"))
+            .unwrap();
+
+        let events = inner.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "only the two non-suppressible events");
+        assert_eq!(events[0].kind.tag(), "preflight-failure");
+        assert_eq!(events[1].kind.tag(), "session-start");
     }
 
     #[test]

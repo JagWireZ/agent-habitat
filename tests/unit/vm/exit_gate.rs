@@ -3,6 +3,7 @@
 //! them. A concrete escape attempt from inside an actually-booted guest
 //! needs real KVM; see `tests/manual/validate-vm-launch.sh` instead.
 
+use habitat_audit::MemoryAuditSink;
 use habitat_policy::resource_limits::ResourceLimitsConfig;
 use habitat_vm::command_runner::testing::FakeCommandRunner;
 use habitat_vm::launcher::{self, build_run_args};
@@ -36,7 +37,8 @@ fn resource_limits_from_config_reach_the_launch_command() {
             "127.0.0.1:34567\n",
         );
 
-    let launched = launcher::launch(&request, &runner).expect("launch must succeed");
+    let audit = MemoryAuditSink::default();
+    let launched = launcher::launch(&request, &runner, &audit).expect("launch must succeed");
     assert_eq!(launched.session_id, request.session_id);
 
     let cpus_idx = args.iter().position(|a| a == "--cpus").unwrap();
@@ -74,7 +76,8 @@ fn teardown_leaves_no_residual_disk_image_or_container() {
         "habitat-exit-gate-teardown\n",
     );
 
-    launcher::teardown(&session, &runner).expect("teardown must succeed");
+    let audit = MemoryAuditSink::default();
+    launcher::teardown(&session, &runner, &audit).expect("teardown must succeed");
 
     assert!(
         !image_path.exists(),
@@ -106,9 +109,10 @@ fn teardown_run_twice_makes_no_further_changes() {
         "",
     );
 
-    assert!(launcher::teardown(&session, &runner).is_ok());
+    let audit = MemoryAuditSink::default();
+    assert!(launcher::teardown(&session, &runner, &audit).is_ok());
     assert!(
-        launcher::teardown(&session, &runner).is_ok(),
+        launcher::teardown(&session, &runner, &audit).is_ok(),
         "second teardown of an already-gone session must not error"
     );
 }

@@ -52,6 +52,9 @@
 # `validate-vm-launch.sh` made for its own Step 4, see that script's
 # history) -- teardown ran immediately after printing the instructions,
 # so there was never a window to actually act on them. `habitat run`
+# (superseded for full end-to-end coverage by
+# tests/manual/validate-habitat-run.sh, now that Phase 7's driver exists;
+# this script remains useful for isolating the sync mechanism on its own)
 # doesn't wire up the sync calls yet (Phase 7 territory), so this script
 # drives `crates/workspace/examples/manual_sync_round.rs`, a small example
 # binary that exists solely for this runbook and makes one real,

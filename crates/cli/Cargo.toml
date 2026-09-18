@@ -5,15 +5,40 @@ edition.workspace = true
 publish.workspace = true
 description = "The `habitat` binary entrypoint: `habitat install` and `habitat run`."
 
+[lib]
+name = "habitat_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "habitat"
 path = "src/main.rs"
 
 [dependencies]
-# Phase 1 wires up `habitat install` and `habitat run`'s preflight
-# subroutine only. Phase 7 finishes assembling the real CLI, adding
-# habitat-workspace, habitat-vm, and habitat-egress for the rest of
-# `run`'s session lifecycle.
+# Phase 1 wired up `habitat install` and `habitat run`'s preflight
+# subroutine only. Phase 7 finishes assembling the real CLI: the rest of
+# `run`'s session lifecycle (disk build, VM launch/teardown, two-point
+# sync, egress) is assembled in `src/run.rs` from these crates' own
+# already-tested APIs, not reimplemented here.
 habitat-install = { path = "../install" }
 habitat-audit = { path = "../audit" }
 habitat-policy = { path = "../policy" }
+habitat-workspace = { path = "../workspace" }
+habitat-vm = { path = "../vm" }
+habitat-egress = { path = "../egress" }
+
+# Exit-gate and adversarial tests live under the top-level tests/unit/
+# and tests/adversarial/ (mirroring the source tree, per
+# file-structure.md) rather than as inline #[cfg(test)] modules, since
+# they cover this crate's contract with the rest of the system rather
+# than pure internal logic.
+[[test]]
+name = "cli_run_driver"
+path = "../../tests/unit/cli/run_driver.rs"
+
+[[test]]
+name = "config_cannot_weaken_invariants"
+path = "../../tests/adversarial/config_cannot_weaken_invariants.rs"
+
+[[test]]
+name = "run_session_end_to_end"
+path = "../../tests/integration/run_session_end_to_end.rs"

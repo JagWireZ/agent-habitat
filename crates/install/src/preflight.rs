@@ -8,7 +8,8 @@
 //!
 //! Both stop at the first failing check and log exactly one
 //! `preflight-failure` / `install-failure` audit event naming that check
-//! before returning.
+//! before returning. A clean run logs exactly one `preflight-pass` /
+//! `install-pass` event instead -- a pass is not silence.
 
 use crate::checks::{self, CheckFailure};
 use crate::environment::Environment;
@@ -169,6 +170,7 @@ pub fn run_install_checks<E: Environment>(
     checks::crun_version(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
     checks::passt(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
     checks::libkrunfw(env).map_err(|f| log_and_wrap(audit, EventKind::InstallFailure, f))?;
+    let _ = audit.record(&AuditEvent::now(EventKind::InstallPass, None, "install checks passed"));
     Ok(())
 }
 
@@ -194,6 +196,7 @@ pub fn run_preflight<E: Environment>(
         checks::betterleaks(env)
             .map_err(|f| log_and_wrap(audit, EventKind::PreflightFailure, f))?;
     }
+    let _ = audit.record(&AuditEvent::now(EventKind::PreflightPass, None, "preflight passed"));
     Ok(())
 }
 
@@ -229,7 +232,9 @@ mod tests {
             .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n");
         let audit = MemoryAuditSink::default();
         assert!(run_install_checks(&env, &audit).is_ok());
-        assert!(audit.events.lock().unwrap().is_empty());
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "a clean run logs its pass, not silence");
+        assert_eq!(events[0].kind.tag(), "install-pass");
     }
 
     #[test]
@@ -279,7 +284,9 @@ mod tests {
             .with_command_ok("ldconfig -p", "\tlibkrunfw.so.5 => /lib64/libkrunfw.so.5\n");
         let audit = MemoryAuditSink::default();
         assert!(run_preflight(&env, &audit, false).is_ok());
-        assert!(audit.events.lock().unwrap().is_empty());
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1, "a clean run logs its pass, not silence");
+        assert_eq!(events[0].kind.tag(), "preflight-pass");
     }
 
     #[test]

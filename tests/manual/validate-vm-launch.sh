@@ -50,6 +50,13 @@
 # real hardware, then fixed" pattern Phase 1 hit with the crun-krun
 # package/binary name split.
 #
+# **Phase 7 update:** `habitat run`'s own lifecycle driver now exists
+# (`crates/cli/src/run.rs`) and is validated end to end by
+# `tests/manual/validate-habitat-run.sh`. This script remains useful on
+# its own for isolating VM launch/escape-attempt validation without the
+# rest of a full session -- it is not superseded, just no longer the only
+# way to exercise a real launch.
+#
 # Requires: an AlmaLinux/Fedora host (dnf-family) with Podman + crun-krun
 # installed and /dev/kvm exposed to the current user -- i.e. a host that
 # already passes `habitat install`'s checks

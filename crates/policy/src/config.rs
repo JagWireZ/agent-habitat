@@ -28,6 +28,13 @@ pub struct ProjectConfig {
     pub secrets_scan: SecretsScanConfig,
     pub resource_limits: ResourceLimitsConfig,
     pub egress_allowlist_additions: Vec<String>,
+    /// Audit log verbosity, default enabled. Scoped as a verbosity
+    /// control on the log only -- see
+    /// `habitat_audit::EventKind::is_suppressible_when_audit_disabled` and
+    /// `docs/decisions/0009-run-driver-prompt-loop.md`. Never disables the
+    /// boundary audit trail itself; a handful of invariant-critical event
+    /// kinds are always recorded regardless of this toggle.
+    pub audit: Toggle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +138,11 @@ pub fn parse(contents: &str) -> Result<ProjectConfig, ConfigError> {
                 let (items, consumed) = parse_list(&lines, i + 1)?;
                 config.egress_allowlist_additions = items;
                 i += 1 + consumed;
+            }
+            "audit" => {
+                let value = unquote(rest);
+                config.audit = Toggle::parse(&value).map_err(|e| err(format!("audit: {e}")))?;
+                i += 1;
             }
             other => {
                 return Err(err(format!(
@@ -486,5 +498,23 @@ mod tests {
     fn egress_allowlist_additions_rejects_a_bare_value() {
         let err = parse("egress_allowlist_additions: pypi.org\n").unwrap_err();
         assert!(err.message.contains("egress_allowlist_additions"));
+    }
+
+    #[test]
+    fn audit_defaults_to_enabled_when_absent() {
+        let config = parse("").unwrap();
+        assert!(config.audit.is_enabled());
+    }
+
+    #[test]
+    fn parses_audit_disabled() {
+        let config = parse("audit: disabled\n").unwrap();
+        assert!(!config.audit.is_enabled());
+    }
+
+    #[test]
+    fn audit_rejects_a_non_enabled_disabled_value() {
+        let err = parse("audit: sometimes\n").unwrap_err();
+        assert!(err.message.contains("audit"));
     }
 }

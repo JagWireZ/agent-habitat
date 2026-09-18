@@ -72,3 +72,20 @@ manager, a real `sudo` prompt).
   `tests/adversarial/egress_bypass.rs` instead. Reused, not duplicated,
   at Phase 8's validation run-book -- and, per this phase's own exit
   gate, re-run after any allowlist ruleset change.
+
+- `validate-habitat-run.sh` -- Phase 7's real-hardware exit gate: an
+  end-to-end `habitat run --config sandbox.yaml -- <agent>` session
+  across multiple prompts, with a real host-side edit made between
+  prompts and a real agent tool call (a tiny fake one-shot agent
+  fixture), confirming the expected audit event sequence and that the
+  agent's own change is really synced back into the project directory --
+  not just reported. Unlike the three scripts above, this one drives the
+  real `habitat` binary directly instead of hand-rolling the
+  `podman`/`ssh` commands it builds, since that binary (Phase 7's own
+  deliverable) now exists. Also the confirmation point for
+  `habitat_cli::run::apply_egress_firewall_in_container`'s `nsenter`-based
+  firewall wiring, ported from this script's own `PASTA_IFACE` discovery
+  but not yet exercised by that exact function on real hardware. Not yet
+  run against real hardware in this session -- do not treat Phase 7 as
+  fully real-hardware-validated until this runbook's checkboxes are
+  filled in from an actual run.

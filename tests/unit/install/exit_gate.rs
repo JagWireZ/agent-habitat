@@ -105,7 +105,9 @@ fn preflight_fails_closed_when_betterleaks_enabled_but_binary_missing() {
         run_preflight(&env, &audit_disabled, false).is_ok(),
         "disabled content scanning must not require betterleaks"
     );
-    assert!(audit_disabled.events.lock().unwrap().is_empty());
+    let events = audit_disabled.events.lock().unwrap();
+    assert_eq!(events.len(), 1, "a clean run logs its pass, not silence");
+    assert_eq!(events[0].kind.tag(), "preflight-pass");
 }
 
 /// `habitat install` is verify-only by construction (`Environment` exposes
@@ -124,13 +126,18 @@ fn install_run_twice_on_already_correct_host_makes_no_changes() {
     let first_audit = MemoryAuditSink::default();
     let first = run_install_checks(&env, &first_audit);
     assert!(first.is_ok());
-    assert!(first_audit.events.lock().unwrap().is_empty());
+    let first_events = first_audit.events.lock().unwrap();
+    assert_eq!(first_events.len(), 1);
+    assert_eq!(first_events[0].kind.tag(), "install-pass");
 
     let second_audit = MemoryAuditSink::default();
     let second = run_install_checks(&env, &second_audit);
     assert!(second.is_ok());
-    assert!(
-        second_audit.events.lock().unwrap().is_empty(),
-        "second run must produce no audit events either -- no new state, no new log entries"
+    let second_events = second_audit.events.lock().unwrap();
+    assert_eq!(
+        second_events.len(),
+        1,
+        "second run must produce the same single pass event -- no new state, no new log shape"
     );
+    assert_eq!(second_events[0].kind.tag(), "install-pass");
 }

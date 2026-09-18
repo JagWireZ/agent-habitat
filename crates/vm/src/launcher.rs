@@ -20,6 +20,7 @@
 
 use crate::command_runner::CommandRunner;
 use crate::session::{LaunchRequest, LaunchedSession};
+use habitat_audit::{AuditEvent, AuditSink, EventKind};
 use std::fmt;
 
 /// Path to the `krun` binary invoked as podman's `--runtime`. Not
@@ -123,7 +124,20 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
 pub fn launch<R: CommandRunner>(
     request: &LaunchRequest,
     runner: &R,
+    audit: &dyn AuditSink,
 ) -> Result<LaunchedSession, LaunchError> {
+    // Marks the start of this session's lifecycle -- emitted for the
+    // attempt itself, before we know whether `podman run` will succeed,
+    // since an attempt is boundary-relevant on its own.
+    let _ = audit.record(&AuditEvent::now(
+        EventKind::SessionStart,
+        None,
+        format!(
+            "launching session {} (guest image {})",
+            request.session_id, request.guest_image
+        ),
+    ));
+
     let args = build_run_args(request);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
@@ -188,6 +202,7 @@ pub fn guest_ssh_port<R: CommandRunner>(
 pub fn teardown<R: CommandRunner>(
     session: &LaunchedSession,
     runner: &R,
+    audit: &dyn AuditSink,
 ) -> Result<(), LaunchError> {
     // `--ignore` makes `podman rm` treat "no such container" as success.
     let name = session.session_id.to_string();
@@ -218,7 +233,14 @@ pub fn teardown<R: CommandRunner>(
             "could not remove session SSH key {}: {e}",
             session.guest_ssh_private_key_path.display()
         ))
-    })
+    })?;
+
+    let _ = audit.record(&AuditEvent::now(
+        EventKind::SessionStop,
+        None,
+        format!("session {} torn down", session.session_id),
+    ));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -226,6 +248,7 @@ mod tests {
     use super::*;
     use crate::command_runner::testing::FakeCommandRunner;
     use crate::session::SessionId;
+    use habitat_audit::MemoryAuditSink;
     use habitat_policy::resource_limits::ResourceLimitsConfig;
     use std::path::PathBuf;
 
@@ -356,8 +379,13 @@ mod tests {
         let runner = FakeCommandRunner::default()
             .with_failure(&invocation, "error: no such runtime handler krun");
 
-        let err = launch(&request, &runner).unwrap_err();
+        let audit = MemoryAuditSink::default();
+        let err = launch(&request, &runner, &audit).unwrap_err();
         assert!(err.message.contains("non-zero"));
+        // The attempt itself is still audited even though it failed.
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.tag(), "session-start");
     }
 
     fn port_invocation(session_name: &str) -> String {
@@ -377,7 +405,8 @@ mod tests {
                 "127.0.0.1:34567\n",
             );
 
-        let launched = launch(&request, &runner).unwrap();
+        let audit = MemoryAuditSink::default();
+        let launched = launch(&request, &runner, &audit).unwrap();
         assert_eq!(launched.session_id, request.session_id);
         assert_eq!(launched.guest_ssh_host, GUEST_SSH_HOST);
         assert_eq!(launched.guest_ssh_port, 34567);
@@ -385,6 +414,9 @@ mod tests {
             launched.guest_ssh_private_key_path,
             request.guest_ssh_private_key_path
         );
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.tag(), "session-start");
     }
 
     #[test]
@@ -397,7 +429,8 @@ mod tests {
             .with_ok(&invocation, "abc123containerid\n")
             .with_ok(&port_invocation("habitat-test-session"), "");
 
-        let err = launch(&request, &runner).unwrap_err();
+        let audit = MemoryAuditSink::default();
+        let err = launch(&request, &runner, &audit).unwrap_err();
         assert!(err.message.contains("did not parse"));
     }
 
@@ -405,7 +438,8 @@ mod tests {
     fn launch_fails_closed_when_podman_is_not_on_path() {
         let request = sample_request();
         let runner = FakeCommandRunner::default();
-        let err = launch(&request, &runner).unwrap_err();
+        let audit = MemoryAuditSink::default();
+        let err = launch(&request, &runner, &audit).unwrap_err();
         assert!(err.message.contains("PATH"));
     }
 
@@ -442,7 +476,8 @@ mod tests {
             "habitat-teardown-session\n",
         );
 
-        teardown(&session, &runner).unwrap();
+        let audit = MemoryAuditSink::default();
+        teardown(&session, &runner, &audit).unwrap();
         assert!(
             !image_path.exists(),
             "the disk image must be deleted on teardown -- no residual artifact"
@@ -451,6 +486,9 @@ mod tests {
             !key_path.exists() && !dir.join("session-key.pub").exists(),
             "the session's SSH key must be deleted on teardown -- no residual credential"
         );
+        let events = audit.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind.tag(), "session-stop");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -463,8 +501,9 @@ mod tests {
         );
         let runner = FakeCommandRunner::default()
             .with_ok("podman rm --force --ignore habitat-teardown-session", "");
-        assert!(teardown(&session, &runner).is_ok());
-        assert!(teardown(&session, &runner).is_ok());
+        let audit = MemoryAuditSink::default();
+        assert!(teardown(&session, &runner, &audit).is_ok());
+        assert!(teardown(&session, &runner, &audit).is_ok());
     }
 
     #[test]
@@ -477,7 +516,8 @@ mod tests {
             "podman rm --force --ignore habitat-teardown-session",
             "error: unable to stop container: timed out",
         );
-        let err = teardown(&session, &runner).unwrap_err();
+        let audit = MemoryAuditSink::default();
+        let err = teardown(&session, &runner, &audit).unwrap_err();
         assert!(err.message.contains("non-zero"));
     }
 }

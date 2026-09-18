@@ -5,11 +5,13 @@
 //!   anything's missing, offers to install it: detects the host's dnf/apt
 //!   package-manager family, runs `sudo <pkg-mgr> install` for each
 //!   fixable check, then re-verifies before reporting the final result.
-//! - `habitat run` -- runs `habitat-install::run_preflight` and stops; the
-//!   rest of the session lifecycle is assembled elsewhere.
+//! - `habitat run --config <path> -- <agent> [agent-args...]` -- runs
+//!   preflight, then assembles the full session lifecycle from
+//!   `habitat_cli::run` (Phase 7): disk build, VM launch, a prompt loop
+//!   with two-point sync, and teardown.
 //!
-//! No arg-parsing dependency: only two subcommands and one flag
-//! (`--verbose`/`-v`), so hand-rolled parsing is simpler.
+//! No arg-parsing dependency: only two subcommands and a handful of flags,
+//! so hand-rolled parsing (`habitat_cli::run::parse_run_args`) is simpler.
 //!
 //! Default output is a plain-English pass/fail checklist, then (only if
 //! something's missing) a separate "here's what to do" section with one
@@ -18,8 +20,7 @@
 //! the audit log and `--verbose` detail. Exact binaries/packages/error
 //! text are reserved for `--verbose` and the audit log.
 
-mod output;
-
+use habitat_cli::{output, run};
 use habitat_install::{
     detect_package_family, install_missing, install_report, preflight_report, run_install_checks,
     run_preflight, CheckId, CheckStatus, InstallAttempt, PackageFamily, SystemEnvironment,
@@ -30,22 +31,119 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
-    match args
-        .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(String::as_str)
-    {
-        Some("install") => cmd_install(verbose),
-        Some("run") => cmd_run(verbose),
-        Some(other) => {
+    let subcommand = args.iter().position(|a| !a.starts_with('-'));
+    match subcommand.map(|i| (args[i].as_str(), i)) {
+        Some(("install", i)) if wants_help(&args[i + 1..]) => {
+            print!("{}", install_help());
+            ExitCode::SUCCESS
+        }
+        Some(("install", _)) => cmd_install(verbose),
+        Some(("run", i)) if wants_help(&args[i + 1..]) => {
+            print!("{}", run_help());
+            ExitCode::SUCCESS
+        }
+        Some(("run", i)) => cmd_run(verbose, &args[i + 1..]),
+        Some(("help", _)) => {
+            print!("{}", top_level_help());
+            ExitCode::SUCCESS
+        }
+        Some((other, _)) => {
             eprintln!("habitat: unknown subcommand '{other}' (expected 'install' or 'run')");
+            eprintln!("Run `habitat --help` for usage.");
             ExitCode::FAILURE
+        }
+        None if wants_help(&args) => {
+            print!("{}", top_level_help());
+            ExitCode::SUCCESS
         }
         None => {
             eprintln!("habitat: expected a subcommand ('install' or 'run')");
+            eprintln!("Run `habitat --help` for usage.");
             ExitCode::FAILURE
         }
     }
+}
+
+/// True if `--help`/`-h` appears anywhere in `args`. Checked ahead of a
+/// subcommand's own argument parsing so `habitat run --help` (which has
+/// no `--` separator or agent command) prints help instead of a parse
+/// error.
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
+}
+
+fn top_level_help() -> String {
+    "habitat -- give an AI coding agent its own disposable, sandboxed copy of your \
+project to work in.\n\
+\n\
+Each `habitat run` session builds a fresh sandbox workspace from your project, \
+launches it in an isolated VM, runs the agent you name against your prompts, and \
+syncs its changes back out as a normal patch -- your real files are never touched \
+directly. Network access from inside the sandbox is restricted to an allowlist, and \
+secrets are filtered out before they ever reach it. Every check and session is \
+logged.\n\
+\n\
+USAGE:\n\
+    habitat <SUBCOMMAND> [OPTIONS]\n\
+\n\
+SUBCOMMANDS:\n\
+    install    Check (and optionally install) what this machine needs to run sandboxes\n\
+    run        Run an agent inside a disposable sandbox of the current project\n\
+\n\
+OPTIONS:\n\
+    -v, --verbose    Show technical detail alongside the plain-English output\n\
+    -h, --help       Print this help (or `habitat <SUBCOMMAND> --help` for subcommand help)\n\
+\n\
+EXAMPLES:\n\
+    habitat install\n\
+    habitat run -- claude-code\n\
+    habitat run --config sandbox.yaml -- claude-code --print\n"
+        .to_string()
+}
+
+fn install_help() -> String {
+    "habitat install -- check this machine's readiness to run Agent Habitat sandboxes.\n\
+\n\
+Verifies the operating system, hardware virtualization (KVM), rootless Podman, the \
+crun-krun/libkrun sandbox runtime, passt networking, the libkrunfw guest kernel, and \
+(if this project's config enables it) the betterleaks secrets scanner. Prints a \
+pass/fail checklist; if anything's missing, offers to install it via this system's \
+package manager (dnf on AlmaLinux/Fedora/RHEL-family, apt on Debian/Ubuntu-family) \
+and re-verifies before reporting the final result.\n\
+\n\
+USAGE:\n\
+    habitat install [OPTIONS]\n\
+\n\
+OPTIONS:\n\
+    -v, --verbose    Show the technical reason and fix for each failed check\n\
+    -h, --help       Print this help\n"
+        .to_string()
+}
+
+fn run_help() -> String {
+    "habitat run -- run an agent inside a disposable sandbox of the current project.\n\
+\n\
+Runs preflight checks, builds a disposable copy of the current project onto a \
+sandbox disk, launches it in an isolated VM, then reads prompts from stdin one at a \
+time: each prompt is synced into the sandbox, run through the named agent once, and \
+its results synced back out to your real project as a patch. Type 'exit' or 'quit' \
+(or send EOF) to end the session -- the sandbox, its egress firewall, and the VM are \
+torn down automatically.\n\
+\n\
+USAGE:\n\
+    habitat run [--config <path>] [-v|--verbose] -- <agent> [agent-args...]\n\
+\n\
+The `--` separator and an agent command after it are required.\n\
+\n\
+OPTIONS:\n\
+    --config <path>   Path to the project's config file (default: sandbox.yaml)\n\
+    -v, --verbose     Show technical detail alongside the plain-English output\n\
+    -h, --help        Print this help\n\
+\n\
+EXAMPLES:\n\
+    habitat run -- claude-code\n\
+    habitat run --config sandbox.yaml -- claude-code --print\n"
+        .to_string()
 }
 
 fn audit_sink() -> habitat_audit::FileAuditSink {
@@ -377,39 +475,186 @@ fn cmd_install(verbose: bool) -> ExitCode {
     }
 }
 
-fn cmd_run(verbose: bool) -> ExitCode {
-    let env = SystemEnvironment;
-    let audit = audit_sink();
+/// Guest image every session launches against -- a fixed Alpine image,
+/// independent of the host roadmap (`docs/decisions/0002-guest-os-layer.md`).
+const GUEST_IMAGE: &str = "localhost/habitat-guest:alpine";
+
+/// This session's local egress proxy/DNS-forwarder address. Fixed rather
+/// than an ephemeral port: the firewall ruleset applied at launch time
+/// needs to know it in advance, and `crate::run::start_egress`'s
+/// `TcpListener::bind` has to agree with it. Matches
+/// `tests/manual/validate-egress.sh`'s own `PROXY_ADDR`.
+///
+/// **Known open item, not solved here:** the DNS forwarder half needs
+/// port 53, a privileged port under Linux's default
+/// `net.ipv4.ip_unprivileged_port_start` -- the same assumption
+/// `validate-egress.sh` already makes and has not yet confirmed against
+/// a hardened default sysctl. Not new to Phase 7.
+const EGRESS_PROXY_ADDR: &str = "127.0.0.1:8443";
+
+fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
+    let s = style();
+    let run_args = match run::parse_run_args(rest) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("habitat run: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let config = match habitat_policy::config::load(&run_args.config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "habitat run: could not load {}: {e}",
+                run_args.config_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let raw_audit = audit_sink();
+    let audit = habitat_audit::FilteringAuditSink::new(&raw_audit, config.audit.is_enabled());
+
     print_intro("Getting your session ready");
-    // A missing `sandbox.yaml` in the current directory resolves to
-    // `ProjectConfig::default()` (`habitat_policy::config::load`).
-    let secrets_scan_content_enabled =
-        habitat_policy::config::load(std::path::Path::new("sandbox.yaml"))
-            .map(|c| c.secrets_scan.content.is_enabled())
-            .unwrap_or(true);
+    let env = SystemEnvironment;
+    let secrets_scan_content_enabled = config.secrets_scan.content.is_enabled();
     let statuses = preflight_report(&env, secrets_scan_content_enabled);
     print_checklist(&statuses);
-    let s = style();
-    match run_preflight(&env, &audit, secrets_scan_content_enabled) {
-        Ok(()) => {
-            eprintln!(
-                "{}",
-                s.green_bold(
-                    "Everything looks good, but starting a session isn't supported yet (still being built)."
-                )
-            );
-            ExitCode::FAILURE
-        }
-        Err(_) => {
-            print_required_steps(&statuses, verbose);
-            eprintln!(
-                "{}",
-                s.red_bold("Your session can't start yet -- a couple of things need to be installed first (see above).")
-            );
-            print_detail_pointer(&s, &audit, verbose);
-            ExitCode::FAILURE
-        }
+
+    if run_preflight(&env, &audit, secrets_scan_content_enabled).is_err() {
+        print_required_steps(&statuses, verbose);
+        eprintln!(
+            "{}",
+            s.red_bold("Your session can't start yet -- a couple of things need to be installed first (see above).")
+        );
+        print_detail_pointer(&s, &raw_audit, verbose);
+        return ExitCode::FAILURE;
     }
+
+    let project_root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("habitat run: could not read the current directory: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let state_dir = std::env::temp_dir().join(format!("habitat-session-{}", std::process::id()));
+    let paths = run::SessionPaths::new(&state_dir);
+
+    let vm_runner = habitat_vm::command_runner::SystemCommandRunner;
+    let ws_runner = habitat_workspace::command_runner::SystemCommandRunner;
+    let proxy_addr: std::net::SocketAddr = EGRESS_PROXY_ADDR.parse().expect("valid fixed address");
+
+    // Egress (proxy + DNS forwarder) is boundary infrastructure for the
+    // whole session, started once here -- not per-prompt -- and left to
+    // be reclaimed by process exit; see `docs/decisions/
+    // 0009-run-driver-prompt-loop.md` for why no graceful shutdown is
+    // attempted for these threads specifically.
+    let egress_audit = habitat_audit::FilteringAuditSink::new(
+        habitat_audit::FileAuditSink::new(raw_audit.path()),
+        config.audit.is_enabled(),
+    );
+    run::start_egress(
+        proxy_addr,
+        run::effective_egress_allowlist(&config),
+        std::sync::Arc::new(egress_audit),
+    );
+
+    let build_request = run::build_request(&project_root, &paths, &config);
+    if let Err(e) = habitat_workspace::pipeline::build(build_request, &ws_runner) {
+        eprintln!("habitat run: disk build failed: {e}");
+        print_detail_pointer(&s, &raw_audit, verbose);
+        return ExitCode::FAILURE;
+    }
+
+    let keypair =
+        match habitat_vm::guest_ssh::generate(&paths.guest_ssh_key_path(), &vm_runner) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("habitat run: could not generate session SSH key: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let session_id = habitat_vm::session::SessionId::generate();
+    let launch_req = run::launch_request(
+        session_id.clone(),
+        &paths,
+        &config,
+        GUEST_IMAGE.to_string(),
+        proxy_addr,
+        keypair.public_key,
+        keypair.private_key_path.clone(),
+    );
+
+    let launched = match habitat_vm::launcher::launch(&launch_req, &vm_runner, &audit) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("habitat run: VM launch failed: {e}");
+            print_detail_pointer(&s, &raw_audit, verbose);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Best-current-understanding, real-hardware-unconfirmed step -- see
+    // `run::apply_egress_firewall_in_container`'s own doc comment.
+    if let Err(e) =
+        run::apply_egress_firewall_in_container(&vm_runner, session_id.as_str(), proxy_addr)
+    {
+        eprintln!("habitat run: could not apply the session's egress firewall rules: {e}");
+        let _ = habitat_vm::launcher::teardown(&launched, &vm_runner, &audit);
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "{}",
+        s.green_bold("Session ready. Type a prompt and press enter (or 'exit' to end the session).")
+    );
+
+    let patterns = if config.secrets_scan.filenames.is_enabled() {
+        habitat_policy::blocklist::effective_patterns(&config.blocklist_additions)
+    } else {
+        Vec::new()
+    };
+    let guest = habitat_workspace::guest_exec::GuestEndpoint {
+        host: &launched.guest_ssh_host,
+        port: launched.guest_ssh_port,
+        private_key_path: &launched.guest_ssh_private_key_path,
+    };
+    let prompts = std::io::stdin().lines().map_while(Result::ok);
+
+    let loop_result = run::run_prompt_loop(
+        &project_root,
+        &paths,
+        guest,
+        &patterns,
+        &run_args.agent,
+        &ws_runner,
+        &ws_runner,
+        &audit,
+        prompts,
+        |round| {
+            print!("{}", round.agent_stdout);
+            if !round.agent_stderr.is_empty() {
+                eprint!("{}", round.agent_stderr);
+            }
+        },
+    );
+
+    let _ = run::remove_egress_firewall_in_container(&vm_runner, session_id.as_str());
+    let teardown_result = habitat_vm::launcher::teardown(&launched, &vm_runner, &audit);
+
+    if let Err(e) = loop_result {
+        eprintln!("habitat run: {e}");
+        print_detail_pointer(&s, &raw_audit, verbose);
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = teardown_result {
+        eprintln!("habitat run: teardown failed: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("{}", s.green_bold("Session ended."));
+    ExitCode::SUCCESS
 }
 
 /// Points at the audit log for full technical detail; nudges towards

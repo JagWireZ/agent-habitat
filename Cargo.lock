@@ -11,8 +11,11 @@ name = "habitat-cli"
 version = "0.1.0"
 dependencies = [
  "habitat-audit",
+ "habitat-egress",
  "habitat-install",
  "habitat-policy",
+ "habitat-vm",
+ "habitat-workspace",
 ]
 
 [[package]]
@@ -40,6 +43,7 @@ version = "0.1.0"
 name = "habitat-vm"
 version = "0.1.0"
 dependencies = [
+ "habitat-audit",
  "habitat-egress",
  "habitat-policy",
 ]
@@ -49,6 +53,8 @@ name = "habitat-workspace"
 version = "0.1.0"
 dependencies = [
  "habitat-audit",
+ "habitat-egress",
+ "habitat-install",
  "habitat-policy",
  "habitat-vm",
 ]

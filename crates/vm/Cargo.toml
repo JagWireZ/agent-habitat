@@ -8,6 +8,7 @@ description = "VM launch via rootless Podman + the krun runtime (libkrun), and s
 [dependencies]
 habitat-policy = { path = "../policy" }
 habitat-egress = { path = "../egress" }
+habitat-audit = { path = "../audit" }
 
 # Exit-gate and adversarial tests live under the top-level tests/unit/ and
 # tests/adversarial/ (mirroring the source tree, per file-structure.md)

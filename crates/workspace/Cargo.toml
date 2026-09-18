@@ -10,6 +10,16 @@ habitat-policy = { path = "../policy" }
 habitat-vm = { path = "../vm" }
 habitat-audit = { path = "../audit" }
 
+# `habitat-install` and `habitat-egress` only as dev-dependencies, for
+# tests/integration/audit_end_to_end.rs below, which drives all four
+# subsystems (install/vm/egress/workspace) against one shared audit sink.
+# Safe for the same reason `habitat-egress`'s own dev-dependency on
+# `habitat-vm` is: dev-dependencies aren't part of the library's real
+# dependency graph.
+[dev-dependencies]
+habitat-install = { path = "../install" }
+habitat-egress = { path = "../egress" }
+
 # Exit-gate and adversarial tests live under the top-level tests/unit/
 # and tests/adversarial/ (mirroring the source tree, per
 # file-structure.md) rather than as inline #[cfg(test)] modules, since
@@ -39,3 +49,11 @@ path = "../../tests/unit/workspace/sync_exit_gate.rs"
 [[test]]
 name = "sync_patch_validation"
 path = "../../tests/adversarial/sync_patch_validation.rs"
+
+# Phase 6 boundary-audit-logging smoke test -- lives under
+# tests/integration/ (not tests/unit/workspace/) since it exercises
+# install + vm + egress + workspace together against one shared audit
+# sink, per tests/integration/README.md's stated purpose.
+[[test]]
+name = "audit_end_to_end"
+path = "../../tests/integration/audit_end_to_end.rs"
