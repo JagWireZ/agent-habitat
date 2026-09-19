@@ -638,7 +638,6 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
                 guest,
                 &patterns,
                 &ws_runner,
-                &ws_runner,
                 &audit,
             )
             .map(|_| ())

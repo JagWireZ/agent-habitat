@@ -8,53 +8,46 @@
 //!
 //! Usage:
 //!   cargo run -p habitat-workspace --example manual_sync_round -- \
-//!     <host-to-sandbox|sandbox-to-host> <ssh-host> <ssh-port> <ssh-key-path> <state-dir>
+//!     <host-to-sandbox|sandbox-to-host> <state-dir>
+//!
+//! `<state-dir>/workspace` must already be the disposable, git-seeded
+//! staging directory bind-mounted into the guest at `/workspace` (see
+//! `sync`'s own module doc -- there is no separate host-only mirror
+//! anymore, and no guest endpoint to pass, since sync runs entirely
+//! locally against that shared directory).
 //!
 //! Run `host-to-sandbox` first (Step 4): seeds/updates a file under
-//! `<state-dir>/project` and syncs it into the guest's `/workspace`.
-//! Then run `sandbox-to-host` (Step 5) with the same `<state-dir>`: the
-//! guest's `/workspace` now has that untracked file sitting in it, so
-//! `sync_sandbox_to_host` has something real to detect and pull back.
+//! `<state-dir>/project` and syncs it into `<state-dir>/workspace`
+//! (the guest's `/workspace`, via the bind mount). Then run
+//! `sandbox-to-host` (Step 5) with the same `<state-dir>`: the guest
+//! should have written something new directly into that same directory
+//! by then, so `sync_sandbox_to_host` has something real to detect and
+//! pull back into `<state-dir>/project`.
 
 use habitat_audit::MemoryAuditSink;
 use habitat_policy::blocklist;
 use habitat_workspace::command_runner::SystemCommandRunner;
-use habitat_workspace::guest_exec::GuestEndpoint;
-use habitat_workspace::sync::{
-    self, FlaggedPatchStore, HostToSandboxRequest, SandboxToHostRequest,
-};
-use std::path::{Path, PathBuf};
+use habitat_workspace::sync::{self, FlaggedPatchStore, HostToSandboxRequest, SandboxToHostRequest};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [direction, host, port, key_path, state_dir] = match <[String; 5]>::try_from(args) {
+    let [direction, state_dir] = match <[String; 2]>::try_from(args) {
         Ok(a) => a,
         Err(_) => {
             eprintln!(
-                "usage: manual_sync_round <host-to-sandbox|sandbox-to-host> <ssh-host> <ssh-port> <ssh-key-path> <state-dir>"
+                "usage: manual_sync_round <host-to-sandbox|sandbox-to-host> <state-dir>"
             );
-            return ExitCode::FAILURE;
-        }
-    };
-    let port: u16 = match port.parse() {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("manual_sync_round: '{port}' is not a valid port number");
             return ExitCode::FAILURE;
         }
     };
 
     let state_dir = PathBuf::from(state_dir);
     let project_root = state_dir.join("project");
-    let mirror_dir = state_dir.join("mirror");
+    let workspace_dir = state_dir.join("workspace");
     let flagged_dir = state_dir.join("flagged");
 
-    let guest = GuestEndpoint {
-        host: &host,
-        port,
-        private_key_path: Path::new(&key_path),
-    };
     let patterns = blocklist::default_patterns();
     let store = FlaggedPatchStore::new(&flagged_dir);
     let runner = SystemCommandRunner;
@@ -66,18 +59,13 @@ fn main() -> ExitCode {
                 eprintln!("manual_sync_round: could not create project_root: {e}");
                 return ExitCode::FAILURE;
             }
-            if !mirror_dir.join(".git").exists() {
-                if let Err(e) = std::fs::create_dir_all(&mirror_dir) {
-                    eprintln!("manual_sync_round: could not create mirror_dir: {e}");
-                    return ExitCode::FAILURE;
-                }
-                let init = std::process::Command::new("git")
-                    .args(["-C", mirror_dir.to_str().unwrap(), "init", "--quiet"])
-                    .output();
-                if let Err(e) = init {
-                    eprintln!("manual_sync_round: could not git init mirror_dir: {e}");
-                    return ExitCode::FAILURE;
-                }
+            if !workspace_dir.join(".git").exists() {
+                eprintln!(
+                    "manual_sync_round: {} is not a git-seeded workspace directory yet -- \
+                     build/launch the session first so the bind-mounted staging directory exists",
+                    workspace_dir.display()
+                );
+                return ExitCode::FAILURE;
             }
             // Real edit every run, so this is never a no-op even when
             // re-run against an already-synced state dir.
@@ -95,22 +83,20 @@ fn main() -> ExitCode {
 
             let request = HostToSandboxRequest {
                 project_root: &project_root,
-                mirror_dir: &mirror_dir,
-                guest,
+                workspace_dir: &workspace_dir,
                 patterns: &patterns,
                 flagged_store: &store,
             };
-            sync::sync_host_to_sandbox(&request, &runner, &runner, &audit)
+            sync::sync_host_to_sandbox(&request, &runner, &audit)
         }
         "sandbox-to-host" => {
             let request = SandboxToHostRequest {
                 project_root: &project_root,
-                mirror_dir: &mirror_dir,
-                guest,
+                workspace_dir: &workspace_dir,
                 patterns: &patterns,
                 flagged_store: &store,
             };
-            sync::sync_sandbox_to_host(&request, &runner, &runner, &audit)
+            sync::sync_sandbox_to_host(&request, &runner, &audit)
         }
         other => {
             eprintln!(

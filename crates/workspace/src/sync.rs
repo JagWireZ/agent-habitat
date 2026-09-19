@@ -6,28 +6,46 @@
 //! re-check, the content-ruleset special case, and
 //! [`patch::structurally_valid`]) -- anything that fails is
 //! [`SyncOutcome::Flagged`], never silently merged or dropped (`AGENTS.md`
-//! Section 2, invariant 10) -- and only then apply, to the guest's tree
-//! for host->sandbox or the real host working directory for
-//! sandbox->host (invariant 3: the applied patch is the authoritative
-//! change record).
+//! Section 2, invariant 10) -- and only then apply, to the shared
+//! workspace directory for host->sandbox or the real host working
+//! directory for sandbox->host (invariant 3: the applied patch is the
+//! authoritative change record).
 //!
-//! `mirror_dir` is the host-side baseline to diff against: the same
-//! staging directory Phase 2's pipeline git-seeded
-//! (`crate::pipeline::BuildRequest::staging_dir`), advanced one commit per
-//! successful sync so it always reflects the last-agreed state.
+//! **There is no separate host-only mirror.** `workspace_dir` is the
+//! disposable, git-seeded staging directory `crate::pipeline`/
+//! `crate::gitseed` built and bind-mounted into the guest at
+//! [`GUEST_WORKSPACE_DIR`] -- host and guest see the exact same physical
+//! directory and the exact same `.git`. That directory is both what the
+//! agent sees under `git_history` config *and* the sync diff baseline;
+//! there is nothing else to keep in sync with it.
 //!
-//! Every guest-side step is one discrete `ssh`/`scp` invocation
-//! (`crate::guest_exec::GuestExecRunner`) -- no long-lived connection or
-//! background process (invariant 1). This was `podman exec`/`podman cp`
-//! until a real `krun` guest run showed `podman exec` doesn't work
-//! against that runtime; see `docs/decisions/0008-guest-exec-channel.md`.
+//! Validate-before-mutate is still preserved without a persistent mirror:
+//! `sync_host_to_sandbox` builds an ephemeral, blocklist-filtered scratch
+//! snapshot of `project_root` each round
+//! (`crate::staging::build_staging_dir`) and diffs it against the live
+//! workspace directory via `git diff --no-index` -- read-only, never
+//! touching the live tree -- so an invalid patch can still be flagged and
+//! discarded before anything the agent can see is touched. Only a patch
+//! that passes validation gets applied to the live directory.
+//!
+//! **SSH plays no part in sync.** Every git operation here (`git apply
+//! --check`/`git apply`, `git add`, `git commit`, `git status`, `git
+//! diff`) runs locally on the host directly against the bind-mounted
+//! workspace directory, via the same synthetic-identity mechanism
+//! (`crate::gitseed::run_git_with_identity`) already in place. SSH
+//! (`crate::guest_exec::GuestExecRunner`) is reserved for what actually
+//! needs the guest: invoking the agent process, and the interactive shell
+//! session -- neither of which lives in this module.
+//!
+//! Sync's own `"habitat sync"` bookkeeping commits land in the same
+//! repo/`.git` the agent's own `git log` shows, alongside whatever
+//! `git_history` mode produced -- no separate, host-only git layer.
 //!
 //! No code path here ever runs `git push` or sets a `remote` (invariant
 //! 4), pinned by `tests/adversarial/sync_patch_validation.rs`.
 
 use crate::command_runner::CommandRunner;
-use crate::gitseed::{run_git_with_identity, SYNTHETIC_AUTHOR_EMAIL, SYNTHETIC_AUTHOR_NAME};
-use crate::guest_exec::{GuestEndpoint, GuestExecRunner};
+use crate::gitseed::run_git_with_identity;
 use crate::patch;
 use crate::staging;
 use habitat_audit::{AuditEvent, AuditSink, EventKind};
@@ -37,12 +55,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Where, inside the guest, the workspace disk is mounted -- confirmed
-/// against a real booted guest by `tests/manual/validate-sync.sh`.
+/// Where, inside the guest, the workspace directory is bind-mounted --
+/// confirmed against a real booted guest by `tests/manual/validate-sync.sh`.
 pub const GUEST_WORKSPACE_DIR: &str = "/workspace";
 
-/// Commit message for every sync-driven commit, on both mirror and guest --
-/// distinct from `crate::gitseed`'s initial-seed message.
+/// Commit message for every sync-driven commit -- distinct from
+/// `crate::gitseed`'s initial-seed message.
 const SYNC_COMMIT_MESSAGE: &str = "habitat sync";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +247,9 @@ fn emit_applied<A: AuditSink>(audit: &A, direction: SyncDirection, touched_paths
     ));
 }
 
+/// `git add -A` + `git commit --allow-empty` under the synthetic identity,
+/// against `dir` directly -- shared by both directions, since both now
+/// commit straight into the one shared workspace repo.
 fn commit_with_synthetic_identity<R: CommandRunner>(
     runner: &R,
     dir: &Path,
@@ -236,7 +257,7 @@ fn commit_with_synthetic_identity<R: CommandRunner>(
 ) -> Result<(), SyncError> {
     let dir_str = dir
         .to_str()
-        .ok_or_else(|| err("mirror directory path is not valid UTF-8"))?;
+        .ok_or_else(|| err("workspace directory path is not valid UTF-8"))?;
     run_git_with_identity(runner, dir_str, &["add", "-A"]).map_err(|e| err(e.to_string()))?;
     run_git_with_identity(
         runner,
@@ -288,54 +309,42 @@ fn apply_patch_to_dir<R: CommandRunner>(
 /// Everything needed to run one host->sandbox sync round.
 pub struct HostToSandboxRequest<'a> {
     pub project_root: &'a Path,
-    /// The host-side mirror of "what the guest currently has" (see module doc).
-    pub mirror_dir: &'a Path,
-    /// This session's guest exec endpoint (`docs/decisions/0008-guest-exec-channel.md`).
-    pub guest: GuestEndpoint<'a>,
+    /// The disposable, git-seeded staging directory bind-mounted into the
+    /// guest at [`GUEST_WORKSPACE_DIR`] (see module doc) -- host and
+    /// guest see the same physical directory.
+    pub workspace_dir: &'a Path,
     pub patterns: &'a [String],
     pub flagged_store: &'a FlaggedPatchStore,
 }
 
-/// Host->sandbox sync, run immediately before each prompt: detects
-/// host-side changes since the last sync, re-filters through the
-/// blocklist, produces a patch, and applies it inside the guest.
-///
-/// Takes two separate `CommandRunner`s -- `host_runner` for local `git`
-/// against the host-side mirror, `guest_runner` for the `ssh`/`scp` calls
-/// that reach the guest. Both are the same `SystemCommandRunner` in
-/// production; kept distinct so tests can fake the guest side while
-/// exercising real `git` on the host side.
-pub fn sync_host_to_sandbox<H: CommandRunner, G: CommandRunner, A: AuditSink>(
+/// Host->sandbox sync, run immediately before each prompt: builds an
+/// ephemeral, blocklist-filtered snapshot of `project_root`, diffs it
+/// read-only against the live workspace directory, re-filters that diff
+/// through the blocklist, and only then applies it to the workspace
+/// directory the guest already has bind-mounted.
+pub fn sync_host_to_sandbox<R: CommandRunner, A: AuditSink>(
     request: &HostToSandboxRequest<'_>,
-    host_runner: &H,
-    guest_runner: &G,
+    runner: &R,
     audit: &A,
 ) -> Result<SyncOutcome, SyncError> {
-    refresh_mirror_from_project(request.project_root, request.mirror_dir, request.patterns)?;
+    let scratch = scratch_dir_path("host-to-sandbox");
+    let build_result = staging::build_staging_dir(request.project_root, &scratch, request.patterns, None)
+        .map_err(|e| err(format!("could not stage a fresh host snapshot: {e}")));
+    if let Err(e) = build_result {
+        let _ = std::fs::remove_dir_all(&scratch);
+        return Err(e);
+    }
 
-    let mirror_str = request
-        .mirror_dir
-        .to_str()
-        .ok_or_else(|| err("mirror directory path is not valid UTF-8"))?;
-    run_git_with_identity(host_runner, mirror_str, &["add", "-A"])
-        .map_err(|e| err(e.to_string()))?;
-    let diff = capture_git(host_runner, mirror_str, &["diff", "--cached"])?;
+    let diff_result = diff_no_index(runner, request.workspace_dir, &scratch);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let diff = diff_result?;
 
     if diff.trim().is_empty() {
-        // No guest interaction for a true no-op -- just unstage.
-        run_git_with_identity(host_runner, mirror_str, &["reset", "--quiet"])
-            .map_err(|e| err(e.to_string()))?;
         return Ok(SyncOutcome::NoOp);
     }
 
     let (touched, flag) = non_structural_gate(&diff, request.patterns);
     if let Some(reason) = flag {
-        run_git_with_identity(
-            host_runner,
-            mirror_str,
-            &["reset", "--hard", "--quiet", "HEAD"],
-        )
-        .map_err(|e| err(e.to_string()))?;
         record_flagged(
             request.flagged_store,
             SyncDirection::HostToSandbox,
@@ -350,33 +359,30 @@ pub fn sync_host_to_sandbox<H: CommandRunner, G: CommandRunner, A: AuditSink>(
         });
     }
 
-    let guest = GuestExecRunner::new(guest_runner, request.guest);
-    match apply_patch_in_guest(&guest, GUEST_WORKSPACE_DIR, &diff)? {
-        GuestApplyOutcome::Applied => {}
-        GuestApplyOutcome::Rejected(detail) => {
-            run_git_with_identity(
-                host_runner,
-                mirror_str,
-                &["reset", "--hard", "--quiet", "HEAD"],
-            )
-            .map_err(|e| err(e.to_string()))?;
-            let reason = FlagReason::MalformedPatch(detail);
-            record_flagged(
-                request.flagged_store,
-                SyncDirection::HostToSandbox,
-                &reason,
-                &diff,
-            )?;
-            emit_flagged(audit, SyncDirection::HostToSandbox, &reason);
-            return Ok(SyncOutcome::Flagged {
-                direction: SyncDirection::HostToSandbox,
-                reason,
-                patch: diff,
-            });
-        }
+    let structurally_ok = patch::structurally_valid(runner, request.workspace_dir, &diff)
+        .map_err(|e| err(e.to_string()))?;
+    if !structurally_ok {
+        let reason = FlagReason::MalformedPatch(
+            "`git apply --check` rejected this patch against the live workspace directory"
+                .to_string(),
+        );
+        record_flagged(
+            request.flagged_store,
+            SyncDirection::HostToSandbox,
+            &reason,
+            &diff,
+        )?;
+        emit_flagged(audit, SyncDirection::HostToSandbox, &reason);
+        return Ok(SyncOutcome::Flagged {
+            direction: SyncDirection::HostToSandbox,
+            reason,
+            patch: diff,
+        });
     }
 
-    commit_with_synthetic_identity(host_runner, request.mirror_dir, SYNC_COMMIT_MESSAGE)?;
+    apply_patch_to_dir(runner, request.workspace_dir, &diff)?;
+    commit_with_synthetic_identity(runner, request.workspace_dir, SYNC_COMMIT_MESSAGE)?;
+
     emit_applied(audit, SyncDirection::HostToSandbox, &touched);
     Ok(SyncOutcome::Applied {
         direction: SyncDirection::HostToSandbox,
@@ -388,77 +394,35 @@ pub fn sync_host_to_sandbox<H: CommandRunner, G: CommandRunner, A: AuditSink>(
 /// Everything needed to run one sandbox->host sync round.
 pub struct SandboxToHostRequest<'a> {
     pub project_root: &'a Path,
-    pub mirror_dir: &'a Path,
-    /// See [`HostToSandboxRequest::guest`].
-    pub guest: GuestEndpoint<'a>,
+    /// See [`HostToSandboxRequest::workspace_dir`].
+    pub workspace_dir: &'a Path,
     pub patterns: &'a [String],
     pub flagged_store: &'a FlaggedPatchStore,
 }
 
 /// Sandbox->host sync, run immediately after each tool call: detects
-/// guest-side changes, commits them inside the guest's repo, produces a
+/// changes the agent made directly in the (bind-mounted, shared)
+/// workspace directory, commits them into that same repo, produces a
 /// patch, and -- once validated -- applies it directly to the real host
-/// working directory. Same two-runner split as [`sync_host_to_sandbox`].
-pub fn sync_sandbox_to_host<H: CommandRunner, G: CommandRunner, A: AuditSink>(
+/// working directory.
+pub fn sync_sandbox_to_host<R: CommandRunner, A: AuditSink>(
     request: &SandboxToHostRequest<'_>,
-    host_runner: &H,
-    guest_runner: &G,
+    runner: &R,
     audit: &A,
 ) -> Result<SyncOutcome, SyncError> {
-    let guest = GuestExecRunner::new(guest_runner, request.guest);
+    let workspace_str = request
+        .workspace_dir
+        .to_str()
+        .ok_or_else(|| err("workspace directory path is not valid UTF-8"))?;
 
-    let status = guest
-        .exec("git", &["-C", GUEST_WORKSPACE_DIR, "status", "--porcelain"])
-        .map_err(|e| err(format!("could not run guest `git status`: {e}")))?;
-    if !status.status.success() {
-        return Err(err(format!(
-            "guest `git status` exited non-zero: {}",
-            String::from_utf8_lossy(&status.stderr)
-        )));
-    }
-    if status.stdout.is_empty() {
+    let status = capture_git(runner, workspace_str, &["status", "--porcelain"])?;
+    if status.is_empty() {
         return Ok(SyncOutcome::NoOp);
     }
 
-    let identity_env: [(&str, &str); 4] = [
-        ("GIT_AUTHOR_NAME", SYNTHETIC_AUTHOR_NAME),
-        ("GIT_AUTHOR_EMAIL", SYNTHETIC_AUTHOR_EMAIL),
-        ("GIT_COMMITTER_NAME", SYNTHETIC_AUTHOR_NAME),
-        ("GIT_COMMITTER_EMAIL", SYNTHETIC_AUTHOR_EMAIL),
-    ];
-    guest_git_ok(
-        &guest,
-        &identity_env,
-        &["-C", GUEST_WORKSPACE_DIR, "add", "-A"],
-        "guest `git add`",
-    )?;
-    guest_git_ok(
-        &guest,
-        &identity_env,
-        &[
-            "-C",
-            GUEST_WORKSPACE_DIR,
-            "commit",
-            "--quiet",
-            "-m",
-            SYNC_COMMIT_MESSAGE,
-        ],
-        "guest `git commit`",
-    )?;
+    commit_with_synthetic_identity(runner, request.workspace_dir, SYNC_COMMIT_MESSAGE)?;
 
-    let diff_output = guest
-        .exec(
-            "git",
-            &["-C", GUEST_WORKSPACE_DIR, "diff", "HEAD~1", "HEAD"],
-        )
-        .map_err(|e| err(format!("could not run guest `git diff`: {e}")))?;
-    if !diff_output.status.success() {
-        return Err(err(format!(
-            "guest `git diff HEAD~1 HEAD` exited non-zero: {}",
-            String::from_utf8_lossy(&diff_output.stderr)
-        )));
-    }
-    let patch_text = String::from_utf8_lossy(&diff_output.stdout).into_owned();
+    let patch_text = capture_git(runner, workspace_str, &["diff", "HEAD~1", "HEAD"])?;
 
     let (touched, flag) = non_structural_gate(&patch_text, request.patterns);
     if let Some(reason) = flag {
@@ -476,7 +440,7 @@ pub fn sync_sandbox_to_host<H: CommandRunner, G: CommandRunner, A: AuditSink>(
         });
     }
 
-    let structurally_ok = patch::structurally_valid(host_runner, request.project_root, &patch_text)
+    let structurally_ok = patch::structurally_valid(runner, request.project_root, &patch_text)
         .map_err(|e| err(e.to_string()))?;
     if !structurally_ok {
         let reason = FlagReason::MalformedPatch(
@@ -497,9 +461,7 @@ pub fn sync_sandbox_to_host<H: CommandRunner, G: CommandRunner, A: AuditSink>(
         });
     }
 
-    apply_patch_to_dir(host_runner, request.project_root, &patch_text)?;
-    apply_patch_to_dir(host_runner, request.mirror_dir, &patch_text)?;
-    commit_with_synthetic_identity(host_runner, request.mirror_dir, SYNC_COMMIT_MESSAGE)?;
+    apply_patch_to_dir(runner, request.project_root, &patch_text)?;
 
     emit_applied(audit, SyncDirection::SandboxToHost, &touched);
     Ok(SyncOutcome::Applied {
@@ -507,121 +469,6 @@ pub fn sync_sandbox_to_host<H: CommandRunner, G: CommandRunner, A: AuditSink>(
         patch: patch_text,
         touched_paths: touched,
     })
-}
-
-fn guest_git_ok<R: CommandRunner>(
-    guest: &GuestExecRunner<'_, R>,
-    env: &[(&str, &str)],
-    args: &[&str],
-    what: &str,
-) -> Result<(), SyncError> {
-    let output = guest
-        .exec_with_env(env, "git", args)
-        .map_err(|e| err(format!("could not run {what}: {e}")))?;
-    if !output.status.success() {
-        return Err(err(format!(
-            "{what} exited non-zero: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
-}
-
-enum GuestApplyOutcome {
-    Applied,
-    /// `git apply --check` rejected the patch, run for real inside the guest.
-    Rejected(String),
-}
-
-/// Copies `patch_text` into the guest and applies it: `--check` first
-/// against the actual guest tree, then the real apply only if that
-/// check passes.
-fn apply_patch_in_guest<R: CommandRunner>(
-    guest: &GuestExecRunner<'_, R>,
-    guest_workdir: &str,
-    patch_text: &str,
-) -> Result<GuestApplyOutcome, SyncError> {
-    let tmp = patch::write_temp_patch_file(patch_text).map_err(|e| err(e.to_string()))?;
-    let result = (|| {
-        let host_path = tmp
-            .to_str()
-            .ok_or_else(|| err("temp patch path is not valid UTF-8"))?;
-        let guest_path = format!(
-            "/tmp/habitat-sync-{}.patch",
-            tmp.file_name().and_then(|n| n.to_str()).unwrap_or("patch")
-        );
-
-        let cp = guest
-            .copy_in(host_path, &guest_path)
-            .map_err(|e| err(format!("could not `scp` patch into guest: {e}")))?;
-        if !cp.status.success() {
-            return Err(err(format!(
-                "`scp` into guest exited non-zero: {}",
-                String::from_utf8_lossy(&cp.stderr)
-            )));
-        }
-
-        let check = guest
-            .exec(
-                "git",
-                &["-C", guest_workdir, "apply", "--check", &guest_path],
-            )
-            .map_err(|e| err(format!("could not run guest `git apply --check`: {e}")))?;
-        if !check.status.success() {
-            let _ = guest.exec("rm", &["-f", &guest_path]);
-            return Ok(GuestApplyOutcome::Rejected(
-                String::from_utf8_lossy(&check.stderr).into_owned(),
-            ));
-        }
-
-        let apply = guest
-            .exec("git", &["-C", guest_workdir, "apply", &guest_path])
-            .map_err(|e| err(format!("could not run guest `git apply`: {e}")))?;
-        let _ = guest.exec("rm", &["-f", &guest_path]);
-        if !apply.status.success() {
-            // Passed --check but still failed: an infrastructure problem,
-            // not a validation case -- hard error, not a flagged patch.
-            return Err(err(format!(
-                "guest `git apply` exited non-zero after `--check` passed: {}",
-                String::from_utf8_lossy(&apply.stderr)
-            )));
-        }
-
-        guest_git_ok(
-            guest,
-            &[
-                ("GIT_AUTHOR_NAME", SYNTHETIC_AUTHOR_NAME),
-                ("GIT_AUTHOR_EMAIL", SYNTHETIC_AUTHOR_EMAIL),
-                ("GIT_COMMITTER_NAME", SYNTHETIC_AUTHOR_NAME),
-                ("GIT_COMMITTER_EMAIL", SYNTHETIC_AUTHOR_EMAIL),
-            ],
-            &["-C", guest_workdir, "add", "-A"],
-            "guest `git add` (post-sync)",
-        )?;
-        guest_git_ok(
-            guest,
-            &[
-                ("GIT_AUTHOR_NAME", SYNTHETIC_AUTHOR_NAME),
-                ("GIT_AUTHOR_EMAIL", SYNTHETIC_AUTHOR_EMAIL),
-                ("GIT_COMMITTER_NAME", SYNTHETIC_AUTHOR_NAME),
-                ("GIT_COMMITTER_EMAIL", SYNTHETIC_AUTHOR_EMAIL),
-            ],
-            &[
-                "-C",
-                guest_workdir,
-                "commit",
-                "--quiet",
-                "--allow-empty",
-                "-m",
-                SYNC_COMMIT_MESSAGE,
-            ],
-            "guest `git commit` (post-sync)",
-        )?;
-
-        Ok(GuestApplyOutcome::Applied)
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    result
 }
 
 fn capture_git<R: CommandRunner>(
@@ -644,79 +491,129 @@ fn capture_git<R: CommandRunner>(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Refreshes `mirror_dir`'s working tree (everything except `.git`) to
-/// exactly match a fresh blocklist-filtered copy of `project_root`, via
-/// `crate::staging::build_staging_dir`.
-fn refresh_mirror_from_project(
-    project_root: &Path,
-    mirror_dir: &Path,
-    patterns: &[String],
-) -> Result<(), SyncError> {
-    let scratch = std::env::temp_dir().join(format!(
-        "habitat-sync-scratch-{}-{}",
+fn scratch_dir_path(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "habitat-sync-scratch-{label}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
-    ));
-    staging::build_staging_dir(project_root, &scratch, patterns, None)
-        .map_err(|e| err(format!("could not stage a fresh host snapshot: {e}")))?;
-    let result = mirror_tree_contents(&scratch, mirror_dir)
-        .map_err(|e| err(format!("could not refresh sync mirror: {e}")));
-    let _ = std::fs::remove_dir_all(&scratch);
-    result
+    ))
 }
 
-/// Makes every non-`.git` path under `dest` match `src` exactly: copies
-/// everything from `src` into `dest`, then removes anything under `dest`
-/// that isn't `.git` and has no counterpart in `src`.
-fn mirror_tree_contents(src: &Path, dest: &Path) -> io::Result<()> {
-    copy_all(src, src, dest)?;
-    prune_stale(src, dest, dest)?;
-    Ok(())
+/// Diffs `old_dir`'s current contents against `new_dir` via `git diff
+/// --no-index`, read-only -- neither directory is touched, and this
+/// works whether or not either side is itself a git repository (`git
+/// diff --no-index` compares plain filesystem trees, not git objects).
+/// This is the "validate before mutate" read: the caller decides whether
+/// to apply the result to `old_dir` only after it passes the gate.
+///
+/// `--no-index` exits `1` (not `0`) whenever it finds any difference at
+/// all -- that is the expected, successful "there's a diff" outcome
+/// here, not a failure; only some other exit status means `git` itself
+/// could not complete the comparison.
+fn diff_no_index<R: CommandRunner>(
+    runner: &R,
+    old_dir: &Path,
+    new_dir: &Path,
+) -> Result<String, SyncError> {
+    let old_abs = std::fs::canonicalize(old_dir)
+        .map_err(|e| err(format!("could not resolve {}: {e}", old_dir.display())))?;
+    let new_abs = std::fs::canonicalize(new_dir)
+        .map_err(|e| err(format!("could not resolve {}: {e}", new_dir.display())))?;
+    let old_str = old_abs
+        .to_str()
+        .ok_or_else(|| err("workspace directory path is not valid UTF-8"))?;
+    let new_str = new_abs
+        .to_str()
+        .ok_or_else(|| err("scratch directory path is not valid UTF-8"))?;
+
+    let output = runner
+        .run("git", &["diff", "--no-index", "--", old_str, new_str])
+        .map_err(|e| err(format!("could not run `git diff --no-index`: {e}")))?;
+    match output.status.code() {
+        Some(0) | Some(1) => {}
+        _ => {
+            return Err(err(format!(
+                "`git diff --no-index` exited abnormally: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )))
+        }
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    Ok(strip_dot_git_blocks(&normalize_no_index_diff(
+        &raw, old_str, new_str,
+    )))
 }
 
-fn copy_all(root: &Path, dir: &Path, dest_root: &Path) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path.strip_prefix(root).unwrap_or(&path);
-        let dest = dest_root.join(relative);
-        if entry.file_type()?.is_dir() {
-            std::fs::create_dir_all(&dest)?;
-            copy_all(root, &path, dest_root)?;
+/// Drops every per-file block touching a `.git/...` path. `git diff
+/// --no-index` has no concept of "this is a git repo" -- it walks
+/// `old_dir` as a plain directory tree, `.git` included -- but `old_dir`
+/// here is always the live workspace directory (which has a real `.git`)
+/// and `new_dir` is always a `crate::staging::build_staging_dir` scratch
+/// copy (which never has one, by that function's own contract). Left
+/// unfiltered, every round would produce a patch that deletes the entire
+/// workspace repository's `.git`. Must run after [`normalize_no_index_diff`]
+/// so paths are already plain `a/<relpath> b/<relpath>`.
+fn strip_dot_git_blocks(diff: &str) -> String {
+    let mut out = String::with_capacity(diff.len());
+    let mut skip_current_block = false;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            skip_current_block = diff_git_line_touches_dot_git(line);
+        }
+        if !skip_current_block {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+fn diff_git_line_touches_dot_git(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("diff --git a/") else {
+        return false;
+    };
+    let Some(idx) = rest.find(" b/") else {
+        return false;
+    };
+    let a_path = &rest[..idx];
+    let b_path = rest[idx + 3..].trim_end();
+    is_dot_git_path(a_path) || is_dot_git_path(b_path)
+}
+
+fn is_dot_git_path(path: &str) -> bool {
+    path == ".git" || path.starts_with(".git/")
+}
+
+/// Undoes the absolute-path prefixes `git diff --no-index` bakes into its
+/// `diff --git a/<...> b/<...>`/`--- a/<...>`/`+++ b/<...>` header lines
+/// (`git` strips a leading `/` and prepends its own `a/`/`b/` prefix to
+/// whichever path was given on the command line), so the result reads
+/// like an ordinary in-repo diff: real repo-relative paths, appliable
+/// with plain `git apply`'s default `-p1`, and correctly parsed by
+/// [`patch::extract_touched_paths`] for the blocklist/content-ruleset
+/// gate. Only rewrites recognized header lines -- never hunk-body
+/// content, which can start with `+`/`-`/` ` followed by anything,
+/// including text that happens to look like a path.
+fn normalize_no_index_diff(raw: &str, old_dir: &str, new_dir: &str) -> String {
+    let old_prefix = format!("a/{}/", old_dir.trim_start_matches('/'));
+    let new_prefix = format!("b/{}/", new_dir.trim_start_matches('/'));
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            out.push_str("diff --git ");
+            out.push_str(&rest.replacen(&old_prefix, "a/", 1).replacen(&new_prefix, "b/", 1));
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            out.push_str("--- ");
+            out.push_str(&rest.replacen(&old_prefix, "a/", 1));
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            out.push_str("+++ ");
+            out.push_str(&rest.replacen(&new_prefix, "b/", 1));
         } else {
-            if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&path, &dest)?;
+            out.push_str(line);
         }
     }
-    Ok(())
-}
-
-fn prune_stale(src_root: &Path, dir: &Path, dest_root: &Path) -> io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let relative = path.strip_prefix(dest_root).unwrap_or(&path);
-        if relative.starts_with(".git") {
-            continue;
-        }
-        let src_counterpart = src_root.join(relative);
-        if entry.file_type()?.is_dir() {
-            if src_counterpart.is_dir() {
-                prune_stale(src_root, &path, dest_root)?;
-            } else {
-                std::fs::remove_dir_all(&path)?;
-            }
-        } else if !src_counterpart.is_file() {
-            std::fs::remove_file(&path)?;
-        }
-    }
-    Ok(())
+    out
 }

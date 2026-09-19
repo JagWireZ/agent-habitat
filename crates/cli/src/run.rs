@@ -175,13 +175,6 @@ impl SessionPaths {
     pub fn content_ruleset_path(&self) -> PathBuf {
         self.state_dir.join("effective-betterleaks.toml")
     }
-    /// The host-side mirror `sync` diffs against (`sync`'s own module
-    /// doc) -- distinct from `staging_dir`, which is the disk-build
-    /// pipeline's own working area and is never touched again after the
-    /// image is built.
-    pub fn mirror_dir(&self) -> PathBuf {
-        self.state_dir.join("mirror")
-    }
     pub fn flagged_dir(&self) -> PathBuf {
         self.state_dir.join("flagged")
     }
@@ -280,42 +273,18 @@ pub struct SessionSummary {
     pub rounds: Vec<PromptRoundOutcome>,
 }
 
-/// Ensures `mirror_dir` is a git repository before the first sync round
-/// -- `sync`'s own module doc names this as the caller's responsibility;
-/// mirrors `crates/workspace/examples/manual_sync_round.rs`'s same
-/// one-time setup step.
-fn ensure_mirror_initialized<R: WsCommandRunner>(mirror_dir: &Path, runner: &R) -> Result<(), RunError> {
-    if mirror_dir.join(".git").exists() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(mirror_dir)
-        .map_err(|e| run_err(format!("could not create mirror dir {}: {e}", mirror_dir.display())))?;
-    let mirror_str = mirror_dir
-        .to_str()
-        .ok_or_else(|| run_err("mirror directory path is not valid UTF-8"))?;
-    let output = runner
-        .run("git", &["-C", mirror_str, "init", "--quiet"])
-        .map_err(|e| run_err(format!("could not `git init` the mirror dir: {e}")))?;
-    if !output.status.success() {
-        return Err(run_err(format!(
-            "`git init` on the mirror dir exited non-zero: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
-}
-
 /// Runs the prompt loop for one launched session: for each prompt from
 /// `prompts`, host->sandbox sync, one discrete agent exec, then
 /// sandbox->host sync (`docs/decisions/0009-run-driver-prompt-loop.md`).
 /// Stops at the first prompt equal to [`EXIT_COMMANDS`] or when `prompts`
 /// is exhausted.
 ///
-/// Generic over the host-side runner (real `git` against the mirror) and
-/// the guest-side runner (`ssh`/`scp`) separately, matching
-/// `sync::sync_host_to_sandbox`/`sync_sandbox_to_host`'s own split --
-/// production passes the same `SystemCommandRunner` for both, tests fake
-/// only the guest side.
+/// Generic over the host-side runner (real `git`, run locally against the
+/// bind-mounted workspace directory -- `sync::sync_host_to_sandbox`/
+/// `sync_sandbox_to_host` no longer touch the guest at all) and the
+/// guest-side runner (`ssh`/`scp`, used only for the agent exec itself)
+/// separately -- production passes the same `SystemCommandRunner` for
+/// both, tests fake only the guest side.
 #[allow(clippy::too_many_arguments)]
 pub fn run_prompt_loop<WH, WG, A>(
     project_root: &Path,
@@ -334,9 +303,8 @@ where
     WG: WsCommandRunner,
     A: AuditSink,
 {
-    ensure_mirror_initialized(&paths.mirror_dir(), host_runner)?;
     let flagged_store = FlaggedPatchStore::new(paths.flagged_dir());
-    let mirror_dir = paths.mirror_dir();
+    let workspace_dir = paths.staging_dir();
     let mut summary = SessionSummary::default();
 
     for prompt in prompts {
@@ -346,12 +314,11 @@ where
 
         let host_request = HostToSandboxRequest {
             project_root,
-            mirror_dir: &mirror_dir,
-            guest,
+            workspace_dir: &workspace_dir,
             patterns,
             flagged_store: &flagged_store,
         };
-        let host_to_sandbox = sync::sync_host_to_sandbox(&host_request, host_runner, guest_runner, audit)
+        let host_to_sandbox = sync::sync_host_to_sandbox(&host_request, host_runner, audit)
             .map_err(|e| run_err(format!("host->sandbox sync failed: {e}")))?;
 
         let exec_runner = GuestExecRunner::new(guest_runner, guest);
@@ -363,12 +330,11 @@ where
 
         let sandbox_request = SandboxToHostRequest {
             project_root,
-            mirror_dir: &mirror_dir,
-            guest,
+            workspace_dir: &workspace_dir,
             patterns,
             flagged_store: &flagged_store,
         };
-        let sandbox_to_host = sync::sync_sandbox_to_host(&sandbox_request, host_runner, guest_runner, audit)
+        let sandbox_to_host = sync::sync_sandbox_to_host(&sandbox_request, host_runner, audit)
             .map_err(|e| run_err(format!("sandbox->host sync failed: {e}")))?;
 
         let round = PromptRoundOutcome {
@@ -416,43 +382,38 @@ pub struct ShellSessionOutcome {
 /// own discrete host->sandbox + sandbox->host round through the same
 /// `sync` API the prompt loop uses, not a persistent channel -- the PTY
 /// itself carries only terminal I/O, never a file share).
-pub fn run_shell_session<WH, WG, A>(
+pub fn run_shell_session<WH, A>(
     project_root: &Path,
     paths: &SessionPaths,
     guest: GuestEndpoint<'_>,
     patterns: &[String],
     host_runner: &WH,
-    guest_runner: &WG,
     audit: &A,
 ) -> Result<ShellSessionOutcome, RunError>
 where
     WH: WsCommandRunner + Sync,
-    WG: WsCommandRunner + Sync,
     A: AuditSink + Sync,
 {
-    ensure_mirror_initialized(&paths.mirror_dir(), host_runner)?;
     let flagged_store = FlaggedPatchStore::new(paths.flagged_dir());
-    let mirror_dir = paths.mirror_dir();
+    let workspace_dir = paths.staging_dir();
 
     let sync_round = || -> Result<(), RunError> {
         let host_request = HostToSandboxRequest {
             project_root,
-            mirror_dir: &mirror_dir,
-            guest,
+            workspace_dir: &workspace_dir,
             patterns,
             flagged_store: &flagged_store,
         };
-        sync::sync_host_to_sandbox(&host_request, host_runner, guest_runner, audit)
+        sync::sync_host_to_sandbox(&host_request, host_runner, audit)
             .map_err(|e| run_err(format!("host->sandbox sync failed: {e}")))?;
 
         let sandbox_request = SandboxToHostRequest {
             project_root,
-            mirror_dir: &mirror_dir,
-            guest,
+            workspace_dir: &workspace_dir,
             patterns,
             flagged_store: &flagged_store,
         };
-        sync::sync_sandbox_to_host(&sandbox_request, host_runner, guest_runner, audit)
+        sync::sync_sandbox_to_host(&sandbox_request, host_runner, audit)
             .map_err(|e| run_err(format!("sandbox->host sync failed: {e}")))?;
         Ok(())
     };
