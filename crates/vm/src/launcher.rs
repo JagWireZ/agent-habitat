@@ -1,15 +1,16 @@
 //! Builds and runs the `podman run` invocation that starts one session's
-//! microVM against a Phase 2 disk image, and the corresponding teardown
-//! invocation. Argv construction ([`build_run_args`]) is pure logic and
-//! fully unit-tested here; actually booting against real KVM is
-//! `tests/manual`'s job, since neither this dev container nor CI has
-//! `/dev/kvm`.
+//! microVM, bind-mounting its staging directory in at `/workspace`, and
+//! the corresponding teardown invocation. Argv construction
+//! ([`build_run_args`]) is pure logic and fully unit-tested here; actually
+//! booting against real KVM is `tests/manual`'s job, since neither this
+//! dev container nor CI has `/dev/kvm`.
 //!
-//! **Real-hardware caveat:** the OCI annotation crun-krun expects for
-//! attaching the extra `virtio-blk` device ([`WORKSPACE_DISK_ANNOTATION`])
-//! is this launcher's current best understanding, not yet confirmed
-//! against real crun-krun (`tests/manual/validate-vm-launch.sh` covers
-//! that).
+//! **Real-hardware caveat:** the crun-krun package/binary name split
+//! ([`KRUN_RUNTIME`]'s doc comment) is this launcher's current best
+//! understanding, not yet confirmed against real crun-krun
+//! (`tests/manual/validate-vm-launch.sh` covers that). The `-v` bind-mount
+//! flag itself has been confirmed working by hand on real hardware (see
+//! `docs/decisions/0005-storage-layer.md`'s Correction section).
 //!
 //! **Guest reachability under `pasta` is by published port, not guest
 //! IP:** `podman inspect`'s `NetworkSettings` fields come back empty for
@@ -28,10 +29,8 @@ use std::fmt;
 /// why the package and binary names differ.
 pub const KRUN_RUNTIME: &str = "krun";
 
-/// OCI annotation key telling crun-krun which extra disk image to attach
-/// to the guest as a `virtio-blk` device. See this module's doc comment
-/// for the real-hardware caveat on this key.
-pub const WORKSPACE_DISK_ANNOTATION: &str = "io.habitat.vm.workspace-disk";
+/// Guest-side path the workspace staging directory is bind-mounted at.
+pub const GUEST_WORKSPACE_MOUNT: &str = "/workspace";
 
 /// Env var carrying the guest's per-session authorized SSH public key
 /// (`guest/entrypoint.sh` installs it into `~/.ssh/authorized_keys`).
@@ -72,12 +71,15 @@ fn err(message: impl Into<String>) -> LaunchError {
 /// Builds the argv for `podman run ...` from a [`LaunchRequest`] -- pure,
 /// no side effects, fully testable without Podman/krun/KVM present.
 ///
-/// Deliberately never includes: a `-v`/`--mount type=bind` flag (the
-/// workspace disk crosses in exactly once, via the `--annotation`
-/// below, never a live mounted share), or any host-privilege-widening
-/// flag (`--privileged`, `--cap-add`, `--pid=host`, `--network=host`) --
-/// the containment boundary is the VM itself. `tests/adversarial/
-/// containment_escape.rs` pins both absences.
+/// Exactly one bind mount is ever included: `request.workspace_host_dir`
+/// (the disposable, git-seeded staging copy) at [`GUEST_WORKSPACE_MOUNT`].
+/// `project_root` itself, or any other arbitrary host path, is never
+/// passed to `podman run` as a bind-mount source -- the two sync moments
+/// (`habitat_workspace::sync`) remain the only path for changes to reach
+/// or leave the real project directory. No host-privilege-widening flag
+/// (`--privileged`, `--cap-add`, `--pid=host`, `--network=host`) is ever
+/// included either -- the containment boundary is the VM itself.
+/// `tests/adversarial/containment_escape.rs` pins both properties.
 ///
 /// Networking: `habitat_egress::network_setup::build_network_flags`
 /// supplies `--network`/`--dns`, a real `passt`-backed interface pinned
@@ -101,10 +103,10 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
         format!("{}", request.resource_limits.cpus),
         "--memory".to_string(),
         format!("{}m", request.resource_limits.memory_mb),
-        "--annotation".to_string(),
+        "-v".to_string(),
         format!(
-            "{WORKSPACE_DISK_ANNOTATION}={}",
-            request.workspace_disk_path.display()
+            "{}:{GUEST_WORKSPACE_MOUNT}",
+            request.workspace_host_dir.display()
         ),
         "--env".to_string(),
         format!("{AUTHORIZED_KEY_ENV}={}", request.guest_ssh_public_key),
@@ -156,7 +158,7 @@ pub fn launch<R: CommandRunner>(
 
     Ok(LaunchedSession {
         session_id: request.session_id.clone(),
-        workspace_disk_path: request.workspace_disk_path.clone(),
+        workspace_host_dir: request.workspace_host_dir.clone(),
         guest_ssh_host: GUEST_SSH_HOST.to_string(),
         guest_ssh_port,
         guest_ssh_private_key_path: request.guest_ssh_private_key_path.clone(),
@@ -196,9 +198,9 @@ pub fn guest_ssh_port<R: CommandRunner>(
 
 /// Tears a session down: force-removes the podman container (covers a
 /// hung/uncleanly-stopped guest, beyond what `--rm` handles on a normal
-/// stop), deletes the disk image, and deletes the ephemeral SSH keypair.
-/// All three steps are idempotent -- tearing down an already-gone
-/// session succeeds rather than erroring.
+/// stop), removes the workspace staging directory, and deletes the
+/// ephemeral SSH keypair. All three steps are idempotent -- tearing down
+/// an already-gone session succeeds rather than erroring.
 pub fn teardown<R: CommandRunner>(
     session: &LaunchedSession,
     runner: &R,
@@ -217,13 +219,13 @@ pub fn teardown<R: CommandRunner>(
         )));
     }
 
-    match std::fs::remove_file(&session.workspace_disk_path) {
+    match std::fs::remove_dir_all(&session.workspace_host_dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             return Err(err(format!(
-                "could not remove disk image {}: {e}",
-                session.workspace_disk_path.display()
+                "could not remove workspace directory {}: {e}",
+                session.workspace_host_dir.display()
             )))
         }
     }
@@ -255,7 +257,7 @@ mod tests {
     fn sample_request() -> LaunchRequest {
         LaunchRequest {
             session_id: SessionId::from_name("habitat-test-session").unwrap(),
-            workspace_disk_path: PathBuf::from("/tmp/habitat-test-session.img"),
+            workspace_host_dir: PathBuf::from("/tmp/habitat-test-session-workspace"),
             guest_image: "localhost/habitat-guest:alpine".to_string(),
             resource_limits: ResourceLimitsConfig {
                 cpus: 2.0,
@@ -332,22 +334,21 @@ mod tests {
     }
 
     #[test]
-    fn build_run_args_attaches_the_workspace_disk_via_annotation() {
+    fn build_run_args_bind_mounts_the_workspace_host_dir_at_the_guest_workspace_path() {
         let args = build_run_args(&sample_request());
-        let expected_value = format!("{WORKSPACE_DISK_ANNOTATION}=/tmp/habitat-test-session.img");
-        // There are two `--annotation` flags in the argv (build_network_flags
-        // emits its own), so match on the value, not the first flag found.
-        let ann_idx = args
+        let expected_value = format!("/tmp/habitat-test-session-workspace:{GUEST_WORKSPACE_MOUNT}");
+        let v_idx = args
             .iter()
             .position(|a| a == &expected_value)
-            .expect("workspace-disk annotation value must be present");
-        assert_eq!(args[ann_idx - 1], "--annotation");
+            .expect("workspace bind-mount value must be present");
+        assert_eq!(args[v_idx - 1], "-v");
     }
 
     #[test]
-    fn build_run_args_never_includes_a_bind_mount_flag() {
+    fn build_run_args_bind_mounts_only_the_workspace_host_dir() {
         let args = build_run_args(&sample_request());
-        assert!(!args.iter().any(|a| a == "-v" || a == "--volume"));
+        let v_flags: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "-v").map(|(i, _)| i).collect();
+        assert_eq!(v_flags.len(), 1, "exactly one -v flag must be present, got {args:?}");
         assert!(!args
             .iter()
             .any(|a| a.starts_with("--mount") || a.contains("type=bind")));
@@ -443,10 +444,10 @@ mod tests {
         assert!(err.message.contains("PATH"));
     }
 
-    fn sample_session(image_path: PathBuf, key_path: PathBuf) -> crate::session::LaunchedSession {
+    fn sample_session(workspace_host_dir: PathBuf, key_path: PathBuf) -> crate::session::LaunchedSession {
         crate::session::LaunchedSession {
             session_id: SessionId::from_name("habitat-teardown-session").unwrap(),
-            workspace_disk_path: image_path,
+            workspace_host_dir,
             guest_ssh_host: GUEST_SSH_HOST.to_string(),
             guest_ssh_port: 34567,
             guest_ssh_private_key_path: key_path,
@@ -454,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn teardown_removes_the_container_disk_image_and_ssh_key() {
+    fn teardown_removes_the_container_workspace_dir_and_ssh_key() {
         let dir = std::env::temp_dir().join(format!(
             "habitat-vm-teardown-test-{}-{}",
             std::process::id(),
@@ -464,13 +465,14 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let image_path = dir.join("session.img");
-        std::fs::write(&image_path, b"pretend disk image contents").unwrap();
+        let workspace_dir = dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        std::fs::write(workspace_dir.join("pretend-file.txt"), b"pretend staged contents").unwrap();
         let key_path = dir.join("session-key");
         std::fs::write(&key_path, b"pretend private key").unwrap();
         std::fs::write(dir.join("session-key.pub"), b"pretend public key").unwrap();
 
-        let session = sample_session(image_path.clone(), key_path.clone());
+        let session = sample_session(workspace_dir.clone(), key_path.clone());
         let runner = FakeCommandRunner::default().with_ok(
             "podman rm --force --ignore habitat-teardown-session",
             "habitat-teardown-session\n",
@@ -479,8 +481,8 @@ mod tests {
         let audit = MemoryAuditSink::default();
         teardown(&session, &runner, &audit).unwrap();
         assert!(
-            !image_path.exists(),
-            "the disk image must be deleted on teardown -- no residual artifact"
+            !workspace_dir.exists(),
+            "the workspace staging directory must be removed on teardown -- no residual artifact"
         );
         assert!(
             !key_path.exists() && !dir.join("session-key.pub").exists(),
@@ -494,9 +496,9 @@ mod tests {
     }
 
     #[test]
-    fn teardown_is_idempotent_when_the_disk_image_and_key_are_already_gone() {
+    fn teardown_is_idempotent_when_the_workspace_dir_and_key_are_already_gone() {
         let session = sample_session(
-            PathBuf::from("/tmp/habitat-already-gone-does-not-exist.img"),
+            PathBuf::from("/tmp/habitat-already-gone-does-not-exist-workspace"),
             PathBuf::from("/tmp/habitat-already-gone-does-not-exist-key"),
         );
         let runner = FakeCommandRunner::default()
@@ -509,7 +511,7 @@ mod tests {
     #[test]
     fn teardown_fails_closed_when_podman_rm_exits_non_zero_for_a_real_reason() {
         let session = sample_session(
-            PathBuf::from("/tmp/habitat-stuck-session-does-not-exist.img"),
+            PathBuf::from("/tmp/habitat-stuck-session-does-not-exist-workspace"),
             PathBuf::from("/tmp/habitat-stuck-session-does-not-exist-key"),
         );
         let runner = FakeCommandRunner::default().with_failure(

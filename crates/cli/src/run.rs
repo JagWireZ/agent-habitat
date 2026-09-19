@@ -235,11 +235,7 @@ pub fn launch_request(
 ) -> LaunchRequest {
     LaunchRequest {
         session_id,
-        // Stopgap: the disk image is gone (task 2 of the bind-mount
-        // migration), but the launcher still expects
-        // `workspace_disk_path` to name something on disk until task 3
-        // rewires it to bind-mount `staging_dir` directly.
-        workspace_disk_path: paths.staging_dir(),
+        workspace_host_dir: paths.staging_dir(),
         guest_image,
         resource_limits: config.resource_limits.clone(),
         egress_proxy_addr,
@@ -684,8 +680,8 @@ fn run_nft<VR: VmCommandRunner>(runner: &VR, ruleset: &str) -> Result<(), RunErr
 /// other way to reach that namespace.
 ///
 /// **Real-hardware caveat, same shape as this project's others
-/// (`WORKSPACE_DISK_ANNOTATION`, the crun-krun package/binary split):**
-/// this is this module's best current understanding of how to apply the
+/// (the crun-krun package/binary split):** this is this module's best
+/// current understanding of how to apply the
 /// ruleset from the host side without `podman exec`, ported from
 /// `validate-egress.sh`'s own hand-verified steps, but not yet exercised
 /// by this exact function against real hardware -- see

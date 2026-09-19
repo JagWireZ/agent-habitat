@@ -61,9 +61,10 @@ impl fmt::Display for SessionId {
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
     pub session_id: SessionId,
-    /// Disk image to attach as the guest's extra `virtio-blk` workspace
-    /// device -- never the guest's root filesystem itself.
-    pub workspace_disk_path: PathBuf,
+    /// Host directory bind-mounted into the guest at `/workspace` -- the
+    /// disposable, git-seeded staging copy built by `habitat-workspace`'s
+    /// pipeline, never `project_root` or any other arbitrary host path.
+    pub workspace_host_dir: PathBuf,
     /// Guest OS container image reference -- a fixed Alpine image, never
     /// chosen independently per project or session.
     pub guest_image: String,
@@ -88,7 +89,7 @@ pub struct LaunchRequest {
 #[derive(Debug, Clone)]
 pub struct LaunchedSession {
     pub session_id: SessionId,
-    pub workspace_disk_path: PathBuf,
+    pub workspace_host_dir: PathBuf,
     /// Host address the guest's `sshd` port was published to -- always
     /// `launcher::GUEST_SSH_HOST` (loopback).
     pub guest_ssh_host: String,
@@ -98,7 +99,8 @@ pub struct LaunchedSession {
     /// instead).
     pub guest_ssh_port: u16,
     /// Where this session's ephemeral private SSH key lives on the host,
-    /// so `teardown` can delete it alongside the disk image.
+    /// so `teardown` can delete it alongside the workspace staging
+    /// directory.
     pub guest_ssh_private_key_path: PathBuf,
 }
 
