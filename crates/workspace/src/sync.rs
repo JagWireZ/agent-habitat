@@ -476,7 +476,11 @@ fn capture_git<R: CommandRunner>(
     dir: &str,
     args: &[&str],
 ) -> Result<String, SyncError> {
-    let mut full_args = vec!["-C", dir];
+    // See the matching comment in gitseed.rs::run_git: the bind-mounted
+    // staging dir can appear host-side as owned by a UID other than ours,
+    // which git's ownership check would otherwise refuse outright.
+    let safe_directory = format!("safe.directory={dir}");
+    let mut full_args = vec!["-c", safe_directory.as_str(), "-C", dir];
     full_args.extend_from_slice(args);
     let output = runner
         .run("git", &full_args)

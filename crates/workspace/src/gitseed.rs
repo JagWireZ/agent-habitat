@@ -151,7 +151,14 @@ fn set_read_only_recursive(path: &Path) -> io::Result<()> {
 }
 
 fn run_git<R: CommandRunner>(runner: &R, dir: &str, args: &[&str]) -> Result<(), GitSeedError> {
-    let mut full_args = vec!["-C", dir];
+    // The staging dir is bind-mounted into the guest VM, whose user-namespace
+    // UID mapping can leave it owned (from the host's point of view) by a
+    // UID other than ours once the sandbox has written to it. Git's
+    // ownership check would otherwise refuse every command here with
+    // "dubious ownership" -- scope the trust to just this disposable,
+    // per-session repo rather than mutating the operator's global git config.
+    let safe_directory = format!("safe.directory={dir}");
+    let mut full_args = vec!["-c", safe_directory.as_str(), "-C", dir];
     full_args.extend_from_slice(args);
     let output = runner
         .run("git", &full_args)

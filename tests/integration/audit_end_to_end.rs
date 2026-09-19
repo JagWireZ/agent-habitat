@@ -74,20 +74,27 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
+fn safe_dir_prefix(workspace_str: &str) -> String {
+    format!("-c safe.directory={workspace_str} -C {workspace_str}")
+}
+
 fn status_key(workspace_str: &str) -> String {
-    format!("git -C {workspace_str} status --porcelain")
+    format!("git {} status --porcelain", safe_dir_prefix(workspace_str))
 }
 
 fn add_key(workspace_str: &str) -> String {
-    format!("git -C {workspace_str} add -A")
+    format!("git {} add -A", safe_dir_prefix(workspace_str))
 }
 
 fn commit_key(workspace_str: &str) -> String {
-    format!("git -C {workspace_str} commit --quiet --allow-empty -m habitat sync")
+    format!(
+        "git {} commit --quiet --allow-empty -m habitat sync",
+        safe_dir_prefix(workspace_str)
+    )
 }
 
 fn diff_key(workspace_str: &str) -> String {
-    format!("git -C {workspace_str} diff HEAD~1 HEAD")
+    format!("git {} diff HEAD~1 HEAD", safe_dir_prefix(workspace_str))
 }
 
 fn launch_request() -> LaunchRequest {
