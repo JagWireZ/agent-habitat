@@ -90,7 +90,10 @@ fn preflight_failure_stops_before_disk_build_or_launch() {
         vm_runner.invocations.borrow().is_empty(),
         "nothing should reach the VM runner once preflight has already failed"
     );
-    assert!(!paths.image_path().exists(), "no disk image should be built");
+    assert!(
+        !paths.staging_dir().exists(),
+        "no workspace staging directory should be built"
+    );
 
     let events = audit.events.lock().unwrap();
     assert_eq!(events.len(), 1);
@@ -125,7 +128,7 @@ fn happy_path_builds_a_real_disk_launches_and_tears_down_with_an_immediate_exit(
     let session_id = SessionId::from_name("habitat-driver-test-happy-path").unwrap();
     let launch_req = LaunchRequest {
         session_id: session_id.clone(),
-        workspace_disk_path: paths.image_path(),
+        workspace_host_dir: paths.staging_dir(),
         guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: config.resource_limits.clone(),
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),

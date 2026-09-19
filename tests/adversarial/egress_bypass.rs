@@ -13,7 +13,7 @@ use std::path::PathBuf;
 fn sample_request() -> LaunchRequest {
     LaunchRequest {
         session_id: SessionId::from_name("habitat-adversarial-session").unwrap(),
-        workspace_disk_path: PathBuf::from("/tmp/habitat-adversarial-session.img"),
+        workspace_host_dir: PathBuf::from("/tmp/habitat-adversarial-session-workspace"),
         guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: ResourceLimitsConfig::default(),
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
@@ -22,21 +22,53 @@ fn sample_request() -> LaunchRequest {
     }
 }
 
-/// No bind-mount route back to the host filesystem may ever appear in the
-/// launch argv (`AGENTS.md` Section 2, invariant 1) -- the workspace disk
-/// crosses in only via the block-device annotation.
+/// Exactly one bind mount may ever appear in the launch argv (`AGENTS.md`
+/// Section 2, invariant 1) -- the disposable workspace staging directory,
+/// via `-v`, never a `--mount type=bind` flag.
 #[test]
-fn launch_command_never_bind_mounts_the_host_filesystem() {
+fn launch_command_bind_mounts_exactly_once_via_dash_v() {
     let args = build_run_args(&sample_request());
+    let v_count = args.iter().filter(|a| a.as_str() == "-v").count();
+    assert_eq!(
+        v_count, 1,
+        "expected exactly one -v bind-mount flag, got {v_count}: {args:?}"
+    );
     assert!(
-        !args.iter().any(|a| a == "-v" || a == "--volume"),
-        "a -v/--volume flag would be a host filesystem bind mount: {args:?}"
+        !args.iter().any(|a| a == "--volume"),
+        "expected the short -v form, not --volume: {args:?}"
     );
     assert!(
         !args
             .iter()
             .any(|a| a.starts_with("--mount") || a.contains("type=bind")),
-        "a --mount type=bind flag would be a host filesystem bind mount: {args:?}"
+        "a --mount type=bind flag would be a second, redundant bind-mount mechanism: {args:?}"
+    );
+}
+
+/// The only bind-mount source ever passed to `podman run` is the session's
+/// disposable workspace staging directory -- never `project_root` or any
+/// other arbitrary host path (`AGENTS.md` Section 2, invariant 1). A
+/// regression that widens the bind-mount source must fail this test
+/// clearly, rather than just changing what the flag-shape test above
+/// happens to assert.
+#[test]
+fn launch_command_bind_mounts_only_the_expected_workspace_staging_dir() {
+    let request = sample_request();
+    let args = build_run_args(&request);
+    let v_idx = args
+        .iter()
+        .position(|a| a == "-v")
+        .expect("-v must be present");
+    let mapping = &args[v_idx + 1];
+    let expected_source = request.workspace_host_dir.display().to_string();
+    assert!(
+        mapping.starts_with(&format!("{expected_source}:")),
+        "the only bind-mount source must be the session's workspace staging directory, got \
+         {mapping:?}"
+    );
+    assert!(
+        args.iter().filter(|a| a.as_str() == "-v").count() == 1,
+        "a second -v flag could smuggle in a bind mount of an arbitrary host path: {args:?}"
     );
 }
 
@@ -112,10 +144,10 @@ fn launch_command_pins_guest_dns_to_the_egress_proxy() {
     assert_eq!(args[dns_idx + 1], network_setup::HOST_LOOPBACK_ADDR);
 }
 
-/// The shared guest image reference and the per-session workspace disk
-/// must never be conflated into the same argument.
+/// The shared guest image reference and the per-session workspace
+/// staging directory must never be conflated into the same argument.
 #[test]
-fn workspace_disk_and_guest_image_are_passed_as_distinct_arguments() {
+fn workspace_host_dir_and_guest_image_are_passed_as_distinct_arguments() {
     let request = sample_request();
     let args = build_run_args(&request);
     assert_eq!(
@@ -125,8 +157,9 @@ fn workspace_disk_and_guest_image_are_passed_as_distinct_arguments() {
     );
     assert!(
         args.iter()
-            .any(|a| a.contains(&request.workspace_disk_path.display().to_string())),
-        "the workspace disk path must appear (via the annotation), separately from the image ref"
+            .any(|a| a.contains(&request.workspace_host_dir.display().to_string())),
+        "the workspace staging directory must appear (via the -v bind mount), separately from \
+         the image ref"
     );
 }
 

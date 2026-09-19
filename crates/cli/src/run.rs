@@ -936,8 +936,6 @@ mod tests {
         let request = build_request(project_root, &paths, &config);
         assert_eq!(request.project_root, project_root);
         assert_eq!(request.staging_dir, paths.staging_dir());
-        assert_eq!(request.image_path, paths.image_path());
-        assert_eq!(request.image_size_mb, DEFAULT_IMAGE_SIZE_MB);
         assert_eq!(
             request.project_config.blocklist_additions,
             vec!["*.mysecret".to_string()]
@@ -973,7 +971,7 @@ mod tests {
         );
         assert_eq!(req.resource_limits.cpus, 4.0);
         assert_eq!(req.resource_limits.memory_mb, 8192);
-        assert_eq!(req.workspace_disk_path, paths.image_path());
+        assert_eq!(req.workspace_host_dir, paths.staging_dir());
     }
 
     #[test]

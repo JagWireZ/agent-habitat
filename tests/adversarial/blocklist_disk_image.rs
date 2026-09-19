@@ -1,12 +1,13 @@
 //! Seeds a project with variants of every blocklisted file pattern and
-//! confirms none of them are present anywhere on the resulting disk image
-//! -- nor in the intermediate staging directory -- by actually building a
-//! real disk image (`mke2fs`) and extracting it back out (`debugfs`) to
-//! inspect, no shortcuts through staging alone.
+//! confirms none of them are present anywhere in the built staging
+//! directory. That directory *is*, byte-for-byte, what the guest sees --
+//! bind-mounted directly at `/workspace`, never baked into a built image
+//! (`docs/decisions/0005-storage-layer.md`'s Correction section) -- so
+//! proving they're absent here is proving they're absent from the guest,
+//! with no separate extraction step needed.
 
 use habitat_policy::config::ProjectConfig;
 use habitat_workspace::command_runner::SystemCommandRunner;
-use habitat_workspace::diskimage;
 use habitat_workspace::pipeline::{self, BuildRequest};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,7 +64,7 @@ fn safe_files() -> Vec<(&'static str, &'static str)> {
 }
 
 #[test]
-fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
+fn blocklisted_variants_never_reach_the_staging_directory() {
     let project = temp_dir("project");
     for (path, contents) in blocklisted_variants() {
         write(&project.join(path), contents);
@@ -74,13 +75,10 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
 
     let workdir = temp_dir("workdir");
     let staging_dir = workdir.join("staging");
-    let image_path = workdir.join("session.img");
 
     let request = BuildRequest {
         project_root: &project,
         staging_dir: staging_dir.clone(),
-        image_path: image_path.clone(),
-        image_size_mb: 32,
         // Content scanning has its own coverage elsewhere; disabled here so
         // this doesn't depend on betterleaks being installed.
         project_config: ProjectConfig {
@@ -94,7 +92,8 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
     };
     let outcome = pipeline::build(request, &SystemCommandRunner).expect("build should succeed");
 
-    // 1. The staging artifact must contain none of the secret values.
+    // The staging directory *is* what the guest sees, bind-mounted
+    // directly -- so this is the only place that needs checking.
     let staging_contents = read_all_file_contents(&staging_dir);
     for (path, secret) in blocklisted_variants() {
         assert!(
@@ -113,30 +112,8 @@ fn blocklisted_variants_never_reach_the_disk_image_or_the_staging_artifact() {
         );
     }
 
-    // 2. Extract the actual disk image via debugfs and repeat the checks.
-    let dump_dir = workdir.join("dump");
-    diskimage::dump_image_contents(&image_path, &dump_dir, &SystemCommandRunner)
-        .expect("dumping the built image should succeed");
-    let image_contents = read_all_file_contents(&dump_dir);
-    for (path, secret) in blocklisted_variants() {
-        assert!(
-            !dump_dir.join(path).exists(),
-            "blocklisted file {path} must not exist on the built disk image"
-        );
-        assert!(
-            !image_contents.contains(secret),
-            "secret value for {path} ({secret}) must not appear anywhere on the built disk image"
-        );
-    }
-    for (path, _) in safe_files() {
-        assert!(
-            dump_dir.join(path).exists(),
-            "non-blocklisted file {path} should be present on the built disk image"
-        );
-    }
-
-    // 3. Every variant must show up as explicitly skipped, not merely
-    //    absent by coincidence.
+    // Every variant must show up as explicitly skipped, not merely
+    // absent by coincidence.
     for (path, _) in blocklisted_variants() {
         assert!(
             outcome

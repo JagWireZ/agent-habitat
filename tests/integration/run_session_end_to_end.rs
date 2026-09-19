@@ -7,26 +7,22 @@
 //! Runs through `habitat_cli::run::run_full_session` -- the actual Phase 7
 //! driver, not hand-driven subsystems the way Phase 6's own
 //! `tests/integration/audit_end_to_end.rs` stood in for the (then
-//! nonexistent) driver. VM launch/teardown and the guest exec channel are
+//! nonexistent) driver. VM launch/teardown and the agent exec channel are
 //! faked (no real KVM/SSH in this dev container or CI, same constraint
-//! every other phase's exit gate hits); the disk-build pipeline and the
-//! host side of every sync round run for real (`git`, `mke2fs`,
-//! `debugfs`, matching Phase 2's own precedent that those are ordinary
-//! dev-container/CI tooling, unlike KVM/Podman/krun).
+//! every other phase's exit gate hits); the staging-directory build and
+//! *every* sync round's `git` now run for real, locally, against the
+//! bind-mounted workspace directory (`sync` no longer touches the guest
+//! at all -- see `crates/workspace/src/sync.rs`'s module doc).
 //!
-//! **Why a custom, pattern-matching guest runner instead of the shared
-//! `WsFakeCommandRunner`:** `sync::sync_host_to_sandbox`'s guest-apply
-//! step copies the patch to a randomly-named temp file
-//! (`patch::write_temp_patch_file`) both on the host and inside the
-//! `scp`/`git apply` argv it builds for the guest, so the exact
-//! invocation string is not known ahead of time and can't be pre-keyed
-//! into a plain exact-match fake -- the same reason
-//! `tests/integration/audit_end_to_end.rs` only ever exercises
-//! `sync_sandbox_to_host`'s "Applied" path with the shared fake, never
-//! `sync_host_to_sandbox`'s. This test needs *both* directions to
-//! actually apply (to cover the exit gate's host-edit-between-prompts
-//! and agent-tool-call requirements in one real run), so it uses a small
-//! bespoke runner matching on command shape instead of an exact string.
+//! **Why a custom guest runner instead of the shared `WsFakeCommandRunner`:**
+//! `run_prompt_loop` still reaches the guest for exactly one thing, the
+//! agent invocation itself (`GuestExecRunner`, over `ssh`). Since there is
+//! no real guest here, [`ScriptedGuestRunner`] fakes that one `ssh`
+//! invocation -- and, standing in for the agent's own tool call writing
+//! into `/workspace`, writes a real file directly into the shared
+//! workspace directory on its final invocation, so the following real
+//! `sync_sandbox_to_host` round has something genuine to detect and apply
+//! back to `project_root`.
 
 use habitat_audit::MemoryAuditSink;
 use habitat_cli::run::{self, AgentInvocation, SessionDeps, SessionPaths};
@@ -65,35 +61,32 @@ fn ok_output(stdout: &str) -> Output {
     }
 }
 
-/// The fixed patch the guest reports on its one "dirty" round: a new file,
-/// same shape as `tests/integration/audit_end_to_end.rs`'s own fixture
-/// (proven to apply cleanly via real `git apply`).
-const AGENT_PATCH: &str = "diff --git a/from-agent.txt b/from-agent.txt\n\
-new file mode 100644\n\
-index 0000000..1111111\n\
---- /dev/null\n\
-+++ b/from-agent.txt\n\
-@@ -0,0 +1 @@\n\
-+hello from the agent\n";
+/// What the fake agent "writes" into the shared workspace directory on
+/// its final turn -- a real file, not a fabricated patch, since sync now
+/// runs real local `git` against that directory.
+const AGENT_FILE_CONTENT: &str = "hello from the agent\n";
 
-/// Matches on command *shape* (program + substrings of the joined,
-/// shell-quoted remote command) rather than an exact string, so
-/// `sync_host_to_sandbox`'s randomly-named temp patch file doesn't need
-/// to be predicted. Stateful only for `git status --porcelain`: empty on
-/// every call except the last, so exactly one `sync_sandbox_to_host`
-/// round (the final one) finds a real guest-side change to sync back --
-/// avoiding a second, doomed re-application of the same fixed patch.
+/// Fakes the one guest-reaching call left in the prompt loop: the agent
+/// invocation over `ssh` (`GuestExecRunner`). On its last call, also
+/// writes [`AGENT_FILE_CONTENT`] directly into the shared workspace
+/// directory -- standing in for "the agent, inside the guest, wrote a
+/// file into its bind-mounted `/workspace`" -- so the following real
+/// `sync_sandbox_to_host` round (run for real via `host_runner`) has a
+/// genuine change to detect, commit, diff, and apply back to
+/// `project_root`.
 struct ScriptedGuestRunner {
-    total_status_calls: u32,
-    status_call_count: Cell<u32>,
+    workspace_dir: PathBuf,
+    total_agent_calls: u32,
+    agent_call_count: Cell<u32>,
     invocations: RefCell<Vec<String>>,
 }
 
 impl ScriptedGuestRunner {
-    fn new(total_status_calls: u32) -> Self {
+    fn new(workspace_dir: PathBuf, total_agent_calls: u32) -> Self {
         ScriptedGuestRunner {
-            total_status_calls,
-            status_call_count: Cell::new(0),
+            workspace_dir,
+            total_agent_calls,
+            agent_call_count: Cell::new(0),
             invocations: RefCell::new(Vec::new()),
         }
     }
@@ -106,24 +99,15 @@ impl CommandRunner for ScriptedGuestRunner {
         let last = args.last().copied().unwrap_or("");
 
         match program {
-            "scp" => Ok(ok_output("")),
-            "ssh" if last.contains("'status' '--porcelain'") => {
-                let n = self.status_call_count.get() + 1;
-                self.status_call_count.set(n);
-                if n == self.total_status_calls {
-                    Ok(ok_output(" M guest-dirty-marker\n"))
-                } else {
-                    Ok(ok_output(""))
+            "ssh" if last.contains("'fake-agent'") => {
+                let n = self.agent_call_count.get() + 1;
+                self.agent_call_count.set(n);
+                if n == self.total_agent_calls {
+                    std::fs::write(self.workspace_dir.join("from-agent.txt"), AGENT_FILE_CONTENT)
+                        .unwrap();
                 }
+                Ok(ok_output("agent turn completed\n"))
             }
-            "ssh" if last.contains("'add' '-A'") => Ok(ok_output("")),
-            "ssh" if last.contains("'commit' '--quiet'") => Ok(ok_output("")),
-            "ssh" if last.contains("'diff' '") && last.contains("'HEAD'") => {
-                Ok(ok_output(AGENT_PATCH))
-            }
-            "ssh" if last.contains("'apply' '--check'") => Ok(ok_output("")),
-            "ssh" if last.contains("'apply' '") => Ok(ok_output("")),
-            "ssh" if last.contains("'fake-agent'") => Ok(ok_output("agent turn completed\n")),
             _ => Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("ScriptedGuestRunner: unrecognized invocation: {program} {joined}"),
@@ -166,7 +150,7 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
     let session_id = SessionId::from_name("habitat-run-e2e-session").unwrap();
     let launch_req = LaunchRequest {
         session_id: session_id.clone(),
-        workspace_disk_path: paths.image_path(),
+        workspace_host_dir: paths.staging_dir(),
         guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: config.resource_limits.clone(),
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
@@ -199,9 +183,9 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
         .with_ok(&format!("podman rm --force --ignore {session_id}"), "");
 
     let host_runner = SystemCommandRunner;
-    // Two prompts -> two `git status --porcelain` calls total; only the
-    // last (second) one reports a guest-side change.
-    let guest_runner = ScriptedGuestRunner::new(2);
+    // Two prompts -> two agent invocations total; only the last (second)
+    // one "writes" a real file into the shared workspace directory.
+    let guest_runner = ScriptedGuestRunner::new(paths.staging_dir(), 2);
     let audit = MemoryAuditSink::default();
 
     let deps = SessionDeps {
@@ -312,8 +296,8 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
     );
 
     assert!(
-        !paths.image_path().exists(),
-        "teardown must have deleted the disposable disk image"
+        !paths.staging_dir().exists(),
+        "teardown must have deleted the disposable workspace staging directory"
     );
 
     std::fs::remove_dir_all(&project_root).unwrap();

@@ -45,8 +45,6 @@ fn flipping_git_history_on_without_approval_hard_fails_the_whole_build_before_st
     let request = BuildRequest {
         project_root: &project,
         staging_dir: workdir.join("staging"),
-        image_path: workdir.join("session.img"),
-        image_size_mb: 16,
         project_config: ProjectConfig {
             blocklist_additions: vec![],
             git_history: GitHistoryConfig {
@@ -85,8 +83,6 @@ fn default_off_git_history_builds_a_synthetic_repo() {
     let request = BuildRequest {
         project_root: &project,
         staging_dir: workdir.join("staging"),
-        image_path: workdir.join("session.img"),
-        image_size_mb: 16,
         project_config: ProjectConfig {
             secrets_scan: content_scan_disabled(),
             ..Default::default()
@@ -120,8 +116,6 @@ fn approved_git_history_toggle_shares_real_history() {
     let request = BuildRequest {
         project_root: &project,
         staging_dir: workdir.join("staging"),
-        image_path: workdir.join("session.img"),
-        image_size_mb: 16,
         project_config: ProjectConfig {
             blocklist_additions: vec![],
             git_history: GitHistoryConfig {

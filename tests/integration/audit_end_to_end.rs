@@ -11,6 +11,13 @@
 //! attacker-controlled SNI hostname (containing shell metacharacters)
 //! flows through `EgressDenied` and comes out JSON-escaped, never in a
 //! form that could execute anywhere the log is displayed or parsed.
+//!
+//! Sync now runs entirely locally against the shared workspace directory
+//! (no guest, no SSH -- see `crates/workspace/src/sync.rs`'s module doc),
+//! through a single runner. The "flagged/corrupted sync" step below fakes
+//! `status`/`add`/`commit`/`diff` but lets any `git apply` invocation run
+//! for real via [`HybridRunner`], since `structurally_valid`'s temp patch
+//! file path is only known at call time.
 
 use habitat_audit::{EventKind, MemoryAuditSink};
 use habitat_egress::dialer::testing::FakeDialer;
@@ -23,13 +30,36 @@ use habitat_vm::command_runner::testing::FakeCommandRunner as VmFakeCommandRunne
 use habitat_vm::launcher::{self, build_run_args};
 use habitat_vm::session::{LaunchRequest, LaunchedSession, SessionId};
 use habitat_workspace::command_runner::testing::FakeCommandRunner as WsFakeCommandRunner;
-use habitat_workspace::command_runner::SystemCommandRunner;
-use habitat_workspace::guest_exec::{ssh_exec_args, GuestEndpoint};
+use habitat_workspace::command_runner::{CommandRunner, SystemCommandRunner};
 use habitat_workspace::sync::{self, FlaggedPatchStore, SandboxToHostRequest, SyncOutcome};
+use std::io;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::process::Output;
 use std::thread;
+
+/// See `tests/unit/workspace/sync_exit_gate.rs`'s own `HybridRunner` --
+/// same reasoning, duplicated here rather than shared since neither crate
+/// exposes test-only helpers to the other.
+struct HybridRunner {
+    fake: WsFakeCommandRunner,
+}
+
+impl CommandRunner for HybridRunner {
+    fn run_with_env(
+        &self,
+        env: &[(&str, &str)],
+        program: &str,
+        args: &[&str],
+    ) -> io::Result<Output> {
+        if program == "git" && args.contains(&"apply") {
+            SystemCommandRunner.run_with_env(env, program, args)
+        } else {
+            self.fake.run_with_env(env, program, args)
+        }
+    }
+}
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -44,50 +74,26 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn git_init_committed(dir: &Path) {
-    let d = dir.to_str().unwrap();
-    std::process::Command::new("git")
-        .args(["-C", d, "init", "--quiet"])
-        .output()
-        .unwrap();
-    std::process::Command::new("git")
-        .args(["-C", d, "commit", "--quiet", "--allow-empty", "-m", "seed"])
-        .env("GIT_AUTHOR_NAME", "Agent Habitat")
-        .env("GIT_AUTHOR_EMAIL", "sandbox@agent-habitat.invalid")
-        .env("GIT_COMMITTER_NAME", "Agent Habitat")
-        .env("GIT_COMMITTER_EMAIL", "sandbox@agent-habitat.invalid")
-        .output()
-        .unwrap();
+fn status_key(workspace_str: &str) -> String {
+    format!("git -C {workspace_str} status --porcelain")
 }
 
-const GUEST_HOST: &str = "127.0.0.1";
-const GUEST_PORT: u16 = 34567;
-const GUEST_KEY_PATH: &str = "/tmp/habitat-audit-e2e-guest-key";
-
-fn guest_endpoint() -> GuestEndpoint<'static> {
-    GuestEndpoint {
-        host: GUEST_HOST,
-        port: GUEST_PORT,
-        private_key_path: Path::new(GUEST_KEY_PATH),
-    }
+fn add_key(workspace_str: &str) -> String {
+    format!("git -C {workspace_str} add -A")
 }
 
-const SYNC_IDENTITY_ENV: [(&str, &str); 4] = [
-    ("GIT_AUTHOR_NAME", "Agent Habitat"),
-    ("GIT_AUTHOR_EMAIL", "sandbox@agent-habitat.invalid"),
-    ("GIT_COMMITTER_NAME", "Agent Habitat"),
-    ("GIT_COMMITTER_EMAIL", "sandbox@agent-habitat.invalid"),
-];
+fn commit_key(workspace_str: &str) -> String {
+    format!("git -C {workspace_str} commit --quiet --allow-empty -m habitat sync")
+}
 
-fn ssh_invocation(env: &[(&str, &str)], program: &str, args: &[&str]) -> String {
-    let full = ssh_exec_args(&guest_endpoint(), env, program, args);
-    format!("ssh {}", full.join(" "))
+fn diff_key(workspace_str: &str) -> String {
+    format!("git -C {workspace_str} diff HEAD~1 HEAD")
 }
 
 fn launch_request() -> LaunchRequest {
     LaunchRequest {
         session_id: SessionId::from_name("habitat-audit-e2e-session").unwrap(),
-        workspace_disk_path: PathBuf::from("/tmp/habitat-audit-e2e-session.img"),
+        workspace_host_dir: PathBuf::from("/tmp/habitat-audit-e2e-session-workspace"),
         guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: ResourceLimitsConfig {
             cpus: 2.0,
@@ -176,10 +182,10 @@ fn every_boundary_event_kind_appears_in_the_unified_log() {
     assert!(matches!(outcome, ConnectionOutcome::Denied { .. }));
     guest_deny_handle.join().unwrap();
 
-    // 4. A clean sync (sandbox -> host apply).
+    // 4. A clean sync (sandbox -> host apply). `status`/`add`/`commit`/
+    // `diff` are faked; the real apply runs via `HybridRunner`.
     let project = temp_dir("project");
-    let mirror = temp_dir("mirror");
-    git_init_committed(&mirror);
+    let workspace = temp_dir("workspace");
     let flagged_dir = temp_dir("flagged");
     let store = FlaggedPatchStore::new(&flagged_dir);
     let new_file_patch = "diff --git a/from-guest.txt b/from-guest.txt\n\
@@ -189,82 +195,54 @@ index 0000000..1111111\n\
 +++ b/from-guest.txt\n\
 @@ -0,0 +1 @@\n\
 +hello from the guest\n";
-    let clean_runner = WsFakeCommandRunner::default()
-        .with_ok(
-            &ssh_invocation(&[], "git", &["-C", sync::GUEST_WORKSPACE_DIR, "status", "--porcelain"]),
-            "?? from-guest.txt\n",
-        )
-        .with_ok(
-            &ssh_invocation(&SYNC_IDENTITY_ENV, "git", &["-C", sync::GUEST_WORKSPACE_DIR, "add", "-A"]),
-            "",
-        )
-        .with_ok(
-            &ssh_invocation(
-                &SYNC_IDENTITY_ENV,
-                "git",
-                &["-C", sync::GUEST_WORKSPACE_DIR, "commit", "--quiet", "-m", "habitat sync"],
-            ),
-            "",
-        )
-        .with_ok(
-            &ssh_invocation(&[], "git", &["-C", sync::GUEST_WORKSPACE_DIR, "diff", "HEAD~1", "HEAD"]),
-            new_file_patch,
-        );
+    let workspace_str = workspace.to_str().unwrap();
+    let clean_runner = HybridRunner {
+        fake: WsFakeCommandRunner::default()
+            .with_ok(&status_key(workspace_str), "?? from-guest.txt\n")
+            .with_ok(&add_key(workspace_str), "")
+            .with_ok(&commit_key(workspace_str), "")
+            .with_ok(&diff_key(workspace_str), new_file_patch),
+    };
     let clean_request = SandboxToHostRequest {
         project_root: &project,
-        mirror_dir: &mirror,
-        guest: guest_endpoint(),
+        workspace_dir: &workspace,
         patterns: &[],
         flagged_store: &store,
     };
-    let host_runner = SystemCommandRunner;
-    let outcome =
-        sync::sync_sandbox_to_host(&clean_request, &host_runner, &clean_runner, &audit).unwrap();
+    let outcome = sync::sync_sandbox_to_host(&clean_request, &clean_runner, &audit).unwrap();
     assert!(matches!(outcome, SyncOutcome::Applied { .. }));
 
-    // 5. A flagged/corrupted sync.
+    // 5. A flagged/corrupted sync -- `diff` hands back garbage, so the
+    // real `git apply --check` (via `HybridRunner`) genuinely rejects it.
     let corrupt_project = temp_dir("corrupt-project");
     std::fs::write(corrupt_project.join("real.txt"), "original\n").unwrap();
-    let corrupt_mirror = temp_dir("corrupt-mirror");
+    let corrupt_workspace = temp_dir("corrupt-workspace");
     let corrupt_flagged_dir = temp_dir("corrupt-flagged");
     let corrupt_store = FlaggedPatchStore::new(&corrupt_flagged_dir);
-    let corrupt_runner = WsFakeCommandRunner::default()
-        .with_ok(
-            &ssh_invocation(&[], "git", &["-C", sync::GUEST_WORKSPACE_DIR, "status", "--porcelain"]),
-            " M real.txt\n",
-        )
-        .with_ok(
-            &ssh_invocation(&SYNC_IDENTITY_ENV, "git", &["-C", sync::GUEST_WORKSPACE_DIR, "add", "-A"]),
-            "",
-        )
-        .with_ok(
-            &ssh_invocation(
-                &SYNC_IDENTITY_ENV,
-                "git",
-                &["-C", sync::GUEST_WORKSPACE_DIR, "commit", "--quiet", "-m", "habitat sync"],
+    let corrupt_workspace_str = corrupt_workspace.to_str().unwrap();
+    let corrupt_runner = HybridRunner {
+        fake: WsFakeCommandRunner::default()
+            .with_ok(&status_key(corrupt_workspace_str), " M real.txt\n")
+            .with_ok(&add_key(corrupt_workspace_str), "")
+            .with_ok(&commit_key(corrupt_workspace_str), "")
+            .with_ok(
+                &diff_key(corrupt_workspace_str),
+                "this is not a real unified diff -- just noise\n",
             ),
-            "",
-        )
-        .with_ok(
-            &ssh_invocation(&[], "git", &["-C", sync::GUEST_WORKSPACE_DIR, "diff", "HEAD~1", "HEAD"]),
-            "this is not a real unified diff -- just noise\n",
-        );
+    };
     let corrupt_request = SandboxToHostRequest {
         project_root: &corrupt_project,
-        mirror_dir: &corrupt_mirror,
-        guest: guest_endpoint(),
+        workspace_dir: &corrupt_workspace,
         patterns: &[],
         flagged_store: &corrupt_store,
     };
-    let outcome =
-        sync::sync_sandbox_to_host(&corrupt_request, &host_runner, &corrupt_runner, &audit)
-            .unwrap();
+    let outcome = sync::sync_sandbox_to_host(&corrupt_request, &corrupt_runner, &audit).unwrap();
     assert!(matches!(outcome, SyncOutcome::Flagged { .. }));
 
     // 6. Teardown.
     let session = LaunchedSession {
         session_id: launched.session_id.clone(),
-        workspace_disk_path: launched.workspace_disk_path.clone(),
+        workspace_host_dir: launched.workspace_host_dir.clone(),
         guest_ssh_host: launched.guest_ssh_host.clone(),
         guest_ssh_port: launched.guest_ssh_port,
         guest_ssh_private_key_path: launched.guest_ssh_private_key_path.clone(),
@@ -293,10 +271,10 @@ index 0000000..1111111\n\
     );
 
     std::fs::remove_dir_all(&project).unwrap();
-    let _ = std::fs::remove_dir_all(&mirror);
+    let _ = std::fs::remove_dir_all(&workspace);
     std::fs::remove_dir_all(&flagged_dir).unwrap();
     std::fs::remove_dir_all(&corrupt_project).unwrap();
-    let _ = std::fs::remove_dir_all(&corrupt_mirror);
+    let _ = std::fs::remove_dir_all(&corrupt_workspace);
     std::fs::remove_dir_all(&corrupt_flagged_dir).unwrap();
 }
 

@@ -44,8 +44,6 @@ fn catch_all_allowlist_ruleset_is_rejected_before_anything_is_staged() {
     let request = BuildRequest {
         project_root: &project,
         staging_dir: workdir.join("staging"),
-        image_path: workdir.join("session.img"),
-        image_size_mb: 16,
         project_config: ProjectConfig {
             secrets_scan: SecretsScanConfig {
                 content: Toggle::Enabled,
@@ -85,8 +83,6 @@ fn empty_project_ruleset_cannot_be_used_to_skip_the_baseline() {
     let request = BuildRequest {
         project_root: &project,
         staging_dir: workdir.join("staging"),
-        image_path: workdir.join("session.img"),
-        image_size_mb: 16,
         project_config: ProjectConfig {
             secrets_scan: SecretsScanConfig {
                 content: Toggle::Enabled,

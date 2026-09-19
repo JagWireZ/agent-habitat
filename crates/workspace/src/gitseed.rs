@@ -63,6 +63,16 @@ pub fn seed_synthetic<R: CommandRunner>(
         .ok_or_else(|| err("staging directory path is not valid UTF-8"))?;
 
     run_git(runner, dir, &["init", "--quiet"])?;
+    // Git's default `gc.autoDetach` forks a background `git gc` after a
+    // commit that crosses its loose-object threshold, which keeps
+    // mutating `.git/objects` well after the triggering command returns.
+    // `crate::sync`'s `git diff --no-index` walks this same directory as
+    // plain files on every host->sandbox round -- confirmed (at
+    // monorepo scale) to race that detached gc and fail with a spurious
+    // "No such file or directory" on a loose object mid-repack. This
+    // repo is disposable and re-seeded per session, so there is nothing
+    // gc would usefully reclaim -- just turn it off.
+    run_git(runner, dir, &["config", "gc.auto", "0"])?;
     run_git(runner, dir, &["add", "--all"])?;
     // --allow-empty: staging can legitimately end up empty (everything
     // filtered by the blocklist/content scanner) -- must not turn into a

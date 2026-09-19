@@ -13,7 +13,7 @@ use std::path::PathBuf;
 fn request_with_limits(cpus: f64, memory_mb: u64) -> LaunchRequest {
     LaunchRequest {
         session_id: SessionId::from_name("habitat-exit-gate-session").unwrap(),
-        workspace_disk_path: PathBuf::from("/tmp/habitat-exit-gate-session.img"),
+        workspace_host_dir: PathBuf::from("/tmp/habitat-exit-gate-session-workspace"),
         guest_image: "localhost/habitat-guest:alpine".to_string(),
         resource_limits: ResourceLimitsConfig { cpus, memory_mb },
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
@@ -47,11 +47,12 @@ fn resource_limits_from_config_reach_the_launch_command() {
     assert_eq!(args[mem_idx + 1], "6144m");
 }
 
-/// Teardown must destroy the virtual disk and VM state with no residual
-/// artifact reachable from a later session. Disk deletion runs for real;
-/// `podman rm` is mocked (container removal is KVM-dependent).
+/// Teardown must destroy the workspace staging directory and VM state
+/// with no residual artifact reachable from a later session. Directory
+/// deletion runs for real; `podman rm` is mocked (container removal is
+/// KVM-dependent).
 #[test]
-fn teardown_leaves_no_residual_disk_image_or_container() {
+fn teardown_leaves_no_residual_workspace_dir_or_container() {
     let dir = std::env::temp_dir().join(format!(
         "habitat-vm-exit-gate-{}-{}",
         std::process::id(),
@@ -61,12 +62,13 @@ fn teardown_leaves_no_residual_disk_image_or_container() {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let image_path = dir.join("session.img");
-    std::fs::write(&image_path, b"session disk contents").unwrap();
+    let workspace_dir = dir.join("workspace");
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+    std::fs::write(workspace_dir.join("staged-file.txt"), b"staged contents").unwrap();
 
     let session = LaunchedSession {
         session_id: SessionId::from_name("habitat-exit-gate-teardown").unwrap(),
-        workspace_disk_path: image_path.clone(),
+        workspace_host_dir: workspace_dir.clone(),
         guest_ssh_host: "127.0.0.1".to_string(),
         guest_ssh_port: 34567,
         guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-exit-gate-teardown-key"),
@@ -80,15 +82,17 @@ fn teardown_leaves_no_residual_disk_image_or_container() {
     launcher::teardown(&session, &runner, &audit).expect("teardown must succeed");
 
     assert!(
-        !image_path.exists(),
-        "disk image must not survive teardown -- a later session must not be able to read it"
+        !workspace_dir.exists(),
+        "workspace staging directory must not survive teardown -- a later session must not be \
+         able to read it"
     );
     let invocations = runner.invocations.borrow();
     assert!(
         invocations
             .iter()
             .any(|i| i.contains("rm") && i.contains("--force") && i.contains("--ignore")),
-        "teardown must actually force-remove the container, not just delete the disk"
+        "teardown must actually force-remove the container, not just delete the workspace \
+         directory"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();
@@ -99,7 +103,7 @@ fn teardown_leaves_no_residual_disk_image_or_container() {
 fn teardown_run_twice_makes_no_further_changes() {
     let session = LaunchedSession {
         session_id: SessionId::from_name("habitat-exit-gate-idempotent").unwrap(),
-        workspace_disk_path: PathBuf::from("/tmp/habitat-exit-gate-idempotent-gone.img"),
+        workspace_host_dir: PathBuf::from("/tmp/habitat-exit-gate-idempotent-gone-workspace"),
         guest_ssh_host: "127.0.0.1".to_string(),
         guest_ssh_port: 34567,
         guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-exit-gate-idempotent-gone-key"),

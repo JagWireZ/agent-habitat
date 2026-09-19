@@ -6,23 +6,12 @@
 use habitat_audit::{EventKind, MemoryAuditSink};
 use habitat_policy::blocklist;
 use habitat_workspace::command_runner::SystemCommandRunner;
-use habitat_workspace::guest_exec::GuestEndpoint;
 use habitat_workspace::sync::{
     self, FlagReason, FlaggedPatchStore, HostToSandboxRequest, SyncOutcome,
 };
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-
-/// Both tests below resolve as `NoOp`/`Flagged` before ever touching the
-/// guest, so this endpoint is never actually dialed -- values are placeholders.
-fn unused_guest_endpoint() -> GuestEndpoint<'static> {
-    GuestEndpoint {
-        host: "unused",
-        port: 0,
-        private_key_path: Path::new("/unused"),
-    }
-}
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -44,6 +33,10 @@ fn git_init_committed(dir: &std::path::Path) {
         .output()
         .unwrap();
     Command::new("git")
+        .args(["-C", d, "config", "gc.auto", "0"])
+        .output()
+        .unwrap();
+    Command::new("git")
         .args(["-C", d, "add", "-A"])
         .env("GIT_AUTHOR_NAME", "Agent Habitat")
         .env("GIT_AUTHOR_EMAIL", "sandbox@agent-habitat.invalid")
@@ -60,19 +53,19 @@ fn git_init_committed(dir: &std::path::Path) {
 }
 
 /// A newly added file matching the blocklist (e.g. a `.env` dropped in
-/// mid-session) must never reach the host-side mirror, appear in a patch,
-/// or trigger a guest interaction -- the blocklist filter is re-applied at
-/// snapshot-refresh time, before any diff is produced, so its bytes are
-/// never even diffed (`AGENTS.md` Section 2, invariant 2).
+/// mid-session) must never reach the shared workspace directory or appear
+/// in a patch -- the blocklist filter is re-applied at scratch-snapshot
+/// time, before any diff is produced, so its bytes are never even diffed
+/// (`AGENTS.md` Section 2, invariant 2).
 #[test]
-fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
+fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_workspace_dir() {
     let project = temp_dir("h2s-smuggle-project");
     fs::write(project.join("main.rs"), "fn main() {}").unwrap();
-    let mirror = temp_dir("h2s-smuggle-mirror");
-    fs::remove_dir_all(&mirror).unwrap();
-    fs::create_dir_all(&mirror).unwrap();
-    fs::write(mirror.join("main.rs"), "fn main() {}").unwrap();
-    git_init_committed(&mirror);
+    let workspace = temp_dir("h2s-smuggle-workspace");
+    fs::remove_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("main.rs"), "fn main() {}").unwrap();
+    git_init_committed(&workspace);
 
     fs::write(project.join(".env"), "SECRET=leaked").unwrap();
 
@@ -81,30 +74,27 @@ fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
     let patterns = blocklist::default_patterns();
     let request = HostToSandboxRequest {
         project_root: &project,
-        mirror_dir: &mirror,
-        guest: unused_guest_endpoint(),
+        workspace_dir: &workspace,
         patterns: &patterns,
         flagged_store: &store,
     };
-    // Real SystemCommandRunner: if sync ever tried to reach the guest, the
-    // real `ssh` call against this unreachable address would fail loudly.
     let runner = SystemCommandRunner;
     let audit = MemoryAuditSink::default();
 
-    let outcome = sync::sync_host_to_sandbox(&request, &runner, &runner, &audit).unwrap();
+    let outcome = sync::sync_host_to_sandbox(&request, &runner, &audit).unwrap();
     assert_eq!(
         outcome,
         SyncOutcome::NoOp,
         ".env must never even produce a patch to flag -- it's filtered out before the diff"
     );
     assert!(
-        !mirror.join(".env").exists(),
-        ".env must never even reach the host-side mirror of the guest's tree"
+        !workspace.join(".env").exists(),
+        ".env must never even reach the shared workspace directory the guest has bind-mounted"
     );
     assert!(audit.events.lock().unwrap().is_empty());
 
     fs::remove_dir_all(&project).unwrap();
-    fs::remove_dir_all(&mirror).unwrap();
+    fs::remove_dir_all(&workspace).unwrap();
     fs::remove_dir_all(&flagged_dir).unwrap();
 }
 
@@ -115,11 +105,11 @@ fn host_to_sandbox_never_lets_a_newly_added_blocklisted_file_reach_the_guest() {
 fn host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_event() {
     let project = temp_dir("h2s-ruleset-project");
     fs::write(project.join("betterleaks.toml"), "# original\n").unwrap();
-    let mirror = temp_dir("h2s-ruleset-mirror");
-    fs::remove_dir_all(&mirror).unwrap();
-    fs::create_dir_all(&mirror).unwrap();
-    fs::write(mirror.join("betterleaks.toml"), "# original\n").unwrap();
-    git_init_committed(&mirror);
+    let workspace = temp_dir("h2s-ruleset-workspace");
+    fs::remove_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("betterleaks.toml"), "# original\n").unwrap();
+    git_init_committed(&workspace);
 
     fs::write(project.join("betterleaks.toml"), "# widened allowlist\n").unwrap();
 
@@ -127,15 +117,14 @@ fn host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_ev
     let store = FlaggedPatchStore::new(&flagged_dir);
     let request = HostToSandboxRequest {
         project_root: &project,
-        mirror_dir: &mirror,
-        guest: unused_guest_endpoint(),
+        workspace_dir: &workspace,
         patterns: &[],
         flagged_store: &store,
     };
     let runner = SystemCommandRunner;
     let audit = MemoryAuditSink::default();
 
-    let outcome = sync::sync_host_to_sandbox(&request, &runner, &runner, &audit).unwrap();
+    let outcome = sync::sync_host_to_sandbox(&request, &runner, &audit).unwrap();
     match &outcome {
         SyncOutcome::Flagged { reason, .. } => {
             assert_eq!(reason, &FlagReason::ContentRulesetMidSessionEdit);
@@ -143,7 +132,7 @@ fn host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_ev
         other => panic!("expected Flagged, got {other:?}"),
     }
     assert_eq!(
-        fs::read_to_string(mirror.join("betterleaks.toml")).unwrap(),
+        fs::read_to_string(workspace.join("betterleaks.toml")).unwrap(),
         "# original\n",
         "the governing ruleset snapshot must never be updated as a side effect of a flagged patch"
     );
@@ -157,7 +146,7 @@ fn host_to_sandbox_flags_a_betterleaks_toml_edit_and_emits_the_distinct_audit_ev
     );
 
     fs::remove_dir_all(&project).unwrap();
-    fs::remove_dir_all(&mirror).unwrap();
+    fs::remove_dir_all(&workspace).unwrap();
     fs::remove_dir_all(&flagged_dir).unwrap();
 }
 

@@ -1,8 +1,8 @@
 //! Resource-limit config: CPU/memory caps enforced at VM launch
-//! (`crates/vm`). No separate "disk limit" field -- the disk cap is just
-//! the session disk image's fixed build-time size
-//! (`pipeline::BuildRequest::image_size_mb`), so a second knob for the same
-//! value would just be two places to keep in sync.
+//! (`crates/vm`). No separate "disk limit" field -- the workspace
+//! staging directory is bind-mounted, not a fixed-size built image, so
+//! its size is simply bounded by host disk space (per
+//! `docs/decisions/0005-storage-layer.md`'s Correction section).
 
 use std::fmt;
 

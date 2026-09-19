@@ -38,8 +38,6 @@ fn default_request<'a>(project: &'a Path, workdir: &Path, content: Toggle) -> Bu
     BuildRequest {
         project_root: project,
         staging_dir: workdir.join("staging"),
-        image_path: workdir.join("session.img"),
-        image_size_mb: 16,
         project_config: ProjectConfig {
             secrets_scan: SecretsScanConfig {
                 content,

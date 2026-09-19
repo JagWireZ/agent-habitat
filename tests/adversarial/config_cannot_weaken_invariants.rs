@@ -191,9 +191,16 @@ fn resource_limits_never_widen_launch_privileges() {
             "no resource_limits value may cause {forbidden} to appear: {args:?}"
         );
     }
+    // Exactly the one expected workspace bind mount -- no resource_limits
+    // value may cause a *second* one to appear.
+    assert_eq!(
+        args.iter().filter(|a| a.as_str() == "-v").count(),
+        1,
+        "no resource_limits value may cause an extra host bind mount: {args:?}"
+    );
     assert!(
-        !args.iter().any(|a| a == "-v" || a == "--volume"),
-        "no resource_limits value may cause a host bind mount: {args:?}"
+        !args.iter().any(|a| a == "--volume"),
+        "no resource_limits value may cause a host bind mount via --volume: {args:?}"
     );
 }
 

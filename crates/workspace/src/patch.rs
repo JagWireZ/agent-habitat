@@ -72,8 +72,8 @@ pub const GIT_CEILING_DIRECTORIES_VAR: &str = "GIT_CEILING_DIRECTORIES";
 /// upward, rather than that repo's own toplevel. `project_root` is never
 /// a repo of its own, so it's exposed to this whenever it happens to sit
 /// inside an unrelated enclosing repo (confirmed via
-/// `tests/manual/validate-sync.sh`). `mirror_dir` is unaffected -- it has
-/// its own `.git`.
+/// `tests/manual/validate-sync.sh`). The workspace directory is
+/// unaffected -- it has its own `.git`.
 ///
 /// Fix: point `GIT_CEILING_DIRECTORIES` at `target`'s own parent before
 /// invoking `git apply`, so git's upward search stops at the boundary.

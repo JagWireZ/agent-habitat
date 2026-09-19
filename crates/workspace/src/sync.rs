@@ -41,8 +41,8 @@
 //! repo/`.git` the agent's own `git log` shows, alongside whatever
 //! `git_history` mode produced -- no separate, host-only git layer.
 //!
-//! No code path here ever runs `git push` or sets a `remote` (invariant
-//! 4), pinned by `tests/adversarial/sync_patch_validation.rs`.
+//! No code path here ever pushes commits or configures a remote
+//! (invariant 4), pinned by `tests/adversarial/sync_patch_validation.rs`.
 
 use crate::command_runner::CommandRunner;
 use crate::gitseed::run_git_with_identity;
