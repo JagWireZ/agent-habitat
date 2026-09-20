@@ -77,13 +77,34 @@ fi
 # staging pipeline populated it with.
 #
 # The bind-mounted content is owned by the host operator's uid, not this
-# guest's non-root `habitat` user, so it needs a recursive chown before
-# `habitat` can write to it (decision E,
-# docs/decisions/0005-storage-layer.md). This is a boot-time cost
-# proportional to project size -- files the host's own sync code writes
-# mid-session should set correct ownership at write time rather than
-# relying on a second boot-time pass.
-chown -R habitat:habitat "$WORKSPACE_DIR"
+# guest's non-root `habitat` user, so it needs opening up before `habitat`
+# can write to it (decision E, docs/decisions/0005-storage-layer.md).
+# This must be `chmod`, not `chown`: /workspace is a *real* bind mount
+# over virtiofs, uids passed through unchanged (no guest/host user-
+# namespace remapping -- confirmed in 0005's "Correction" section), so a
+# `chown -R habitat:habitat` here doesn't just relabel a guest-local
+# copy, it rewrites ownership on the *host*'s files to the guest-side
+# `habitat` uid. The host operator's own uid essentially never matches
+# that guest uid, so a session that did that could no longer remove its
+# own staging directory on teardown (`std::fs::remove_dir_all` in
+# `habitat_vm::launcher::teardown`, running unprivileged on the host) --
+# "Permission denied" on every session, discovered via a real habitat run
+# exiting normally and teardown failing. `chmod -R a+rwX` gets `habitat`
+# read/write access via the "other" bits without touching ownership at
+# all, so the host operator stays the owner and teardown keeps working.
+chmod -R a+rwX "$WORKSPACE_DIR"
+
+# git refuses to operate on a repository it doesn't consider itself the
+# owner of ("detected dubious ownership") -- since the fix above
+# deliberately leaves /workspace owned by the host operator's uid, not
+# `habitat`'s, that check will *always* trip for `habitat`, not just on
+# a stray manual invocation. `habitat_workspace::sync` and `::gitseed`
+# already work around this per-invocation by passing
+# `-c safe.directory=...` on their own git calls, but an interactive
+# session (this project's real guest exec channel is SSH, see below)
+# would otherwise hit the same error running a bare `git status`. Mark
+# it safe globally for the `habitat` user so both paths agree.
+su -s /bin/sh habitat -c "git config --global --add safe.directory '$WORKSPACE_DIR'"
 
 mkdir -p "$SSH_DIR"
 if [ -n "${HABITAT_AUTHORIZED_KEY:-}" ]; then

@@ -43,6 +43,13 @@ RUN apk add --no-cache git openssh-server curl \
 COPY entrypoint.sh /usr/local/bin/habitat-entrypoint.sh
 RUN chmod +x /usr/local/bin/habitat-entrypoint.sh
 
+# Lets an operator (or the agent) inside the guest ask for an immediate
+# git merge-back mid-session instead of waiting for the session to end --
+# see guest/habitat-sync.sh's own doc comment for how it talks to the host
+# side with no guest-side access to the real host repo at all.
+COPY habitat-sync.sh /usr/local/bin/habitat-sync
+RUN chmod +x /usr/local/bin/habitat-sync
+
 # The per-session authorized key is injected at launch time via this env
 # var (habitat_vm::launcher, docs/decisions/0008-guest-exec-channel.md).
 # Declared here (empty default) purely for self-documentation -- the

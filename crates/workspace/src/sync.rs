@@ -471,6 +471,209 @@ pub fn sync_sandbox_to_host<R: CommandRunner, A: AuditSink>(
     })
 }
 
+/// Ref in the workspace repo marking the last commit already merged into
+/// the host's real repo via [`merge_workspace_commits_to_host`] -- lets
+/// repeated calls (a manual mid-session trigger, plus the automatic
+/// end-of-session call) each replay only what's new since the previous
+/// call, rather than re-merging or duplicating commits.
+pub const HOST_MERGE_MARKER_REF: &str = "refs/habitat/last-merged-host";
+
+/// What one [`merge_workspace_commits_to_host`] call did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// The workspace repo had nothing new since the last call (or since
+    /// its initial synthetic-seed commit, on the first call ever) -- no
+    /// branch was created.
+    NoOp,
+    /// A new branch was created off `project_root`'s `HEAD` at call time,
+    /// carrying these workspace commits (oldest first) replayed onto it
+    /// via cherry-pick.
+    Merged {
+        branch: String,
+        commits: Vec<String>,
+    },
+}
+
+/// Replays every workspace-repo commit since the last successful call (or
+/// since the workspace repo's initial synthetic-seed commit, on the very
+/// first call) onto a brand-new `habitat/<timestamp>` branch off
+/// `project_root`'s current `HEAD` -- via `git branch` + a throwaway `git
+/// worktree` + `git cherry-pick`, never a `checkout` inside `project_root`
+/// itself, so the operator's real working tree and index are left
+/// completely untouched (unlike [`sync_sandbox_to_host`], which
+/// deliberately does apply straight to the working tree every round --
+/// this is a separate, coarser-grained mechanism for surfacing the
+/// sandbox's actual commit history, not a replacement for that per-round
+/// sync).
+///
+/// Safe to call any time the session's workspace repo is still alive --
+/// a manual mid-session trigger and the automatic end-of-session call are
+/// the exact same function, both cheap no-ops when there's nothing new to
+/// bring in. Fails closed on any error partway through a non-empty merge:
+/// the throwaway branch and worktree are removed and the marker ref is
+/// left at its old value, so a failed attempt never leaves a half-built
+/// branch behind or silently loses track of what still needs merging.
+pub fn merge_workspace_commits_to_host<R: CommandRunner, A: AuditSink>(
+    project_root: &Path,
+    workspace_dir: &Path,
+    runner: &R,
+    audit: &A,
+) -> Result<MergeOutcome, SyncError> {
+    if !project_root.join(".git").exists() {
+        // Not every host project is itself a git repo (`crate::gitseed`'s
+        // `Synthetic` mode works either way) -- there's simply nowhere to
+        // put a branch, which is a no-op here, not a session-ending
+        // error.
+        return Ok(MergeOutcome::NoOp);
+    }
+    let workspace_str = workspace_dir
+        .to_str()
+        .ok_or_else(|| err("workspace directory path is not valid UTF-8"))?;
+    let project_str = project_root
+        .to_str()
+        .ok_or_else(|| err("project root path is not valid UTF-8"))?;
+
+    let head = capture_git(runner, workspace_str, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let baseline = match capture_git(
+        runner,
+        workspace_str,
+        &["rev-parse", "--verify", HOST_MERGE_MARKER_REF],
+    ) {
+        Ok(sha) => sha.trim().to_string(),
+        Err(_) => capture_git(runner, workspace_str, &["rev-list", "--max-parents=0", "HEAD"])?
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+    };
+
+    if baseline == head {
+        return Ok(MergeOutcome::NoOp);
+    }
+
+    let commits: Vec<String> = capture_git(
+        runner,
+        workspace_str,
+        &["rev-list", "--reverse", &format!("{baseline}..{head}")],
+    )?
+    .lines()
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(str::to_string)
+    .collect();
+
+    if commits.is_empty() {
+        // `baseline` is already the newest commit reachable in that
+        // range -- nothing to replay, but advance the marker to `head` so
+        // a future call doesn't keep re-walking the same empty range.
+        set_merge_marker(runner, workspace_str, &head)?;
+        return Ok(MergeOutcome::NoOp);
+    }
+
+    let host_head = capture_git(runner, project_str, &["rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    let branch = format!("habitat/{}", merge_branch_timestamp());
+
+    capture_git(runner, project_str, &["branch", &branch, &host_head])?;
+    capture_git(
+        runner,
+        project_str,
+        &["fetch", "--no-tags", "--quiet", workspace_str, "HEAD"],
+    )?;
+
+    let worktree = merge_worktree_path();
+    let worktree_str = worktree
+        .to_str()
+        .ok_or_else(|| err("merge worktree path is not valid UTF-8"))?;
+
+    let result = (|| -> Result<(), SyncError> {
+        capture_git(
+            runner,
+            project_str,
+            &["worktree", "add", "--quiet", worktree_str, &branch],
+        )?;
+        for commit in &commits {
+            if let Err(e) = run_git_with_identity(runner, worktree_str, &["cherry-pick", commit]) {
+                let _ = capture_git(runner, worktree_str, &["cherry-pick", "--abort"]);
+                return Err(err(format!(
+                    "`git cherry-pick {commit}` failed replaying workspace commits onto {branch}: \
+                     {e} -- aborted, {project_str}'s real branches left untouched"
+                )));
+            }
+        }
+        Ok(())
+    })();
+
+    let _ = capture_git(
+        runner,
+        project_str,
+        &["worktree", "remove", "--force", worktree_str],
+    );
+
+    if let Err(e) = result {
+        let _ = capture_git(runner, project_str, &["branch", "-D", &branch]);
+        emit_merge_failed(audit, &e);
+        return Err(e);
+    }
+
+    set_merge_marker(runner, workspace_str, &head)?;
+    emit_merge_applied(audit, &branch, &commits);
+
+    Ok(MergeOutcome::Merged { branch, commits })
+}
+
+fn set_merge_marker<R: CommandRunner>(
+    runner: &R,
+    workspace_str: &str,
+    sha: &str,
+) -> Result<(), SyncError> {
+    capture_git(
+        runner,
+        workspace_str,
+        &["update-ref", HOST_MERGE_MARKER_REF, sha],
+    )
+    .map(|_| ())
+}
+
+fn merge_branch_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string()
+}
+
+fn merge_worktree_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "habitat-merge-worktree-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ))
+}
+
+fn emit_merge_applied<A: AuditSink>(audit: &A, branch: &str, commits: &[String]) {
+    let _ = audit.record(&AuditEvent::now(
+        EventKind::GitMergeApplied,
+        None,
+        format!("branch {branch}: {} commit(s)", commits.len()),
+    ));
+}
+
+fn emit_merge_failed<A: AuditSink>(audit: &A, error: &SyncError) {
+    let _ = audit.record(&AuditEvent::now(
+        EventKind::GitMergeFailed,
+        None,
+        error.to_string(),
+    ));
+}
+
 fn capture_git<R: CommandRunner>(
     runner: &R,
     dir: &str,

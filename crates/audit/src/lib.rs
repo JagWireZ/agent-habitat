@@ -79,6 +79,19 @@ pub enum EventKind {
     /// event pair with identical timing would just be a second name for
     /// the same fact.
     SessionStop,
+    /// `habitat_workspace::sync::merge_workspace_commits_to_host` replayed
+    /// one or more workspace-repo commits onto a brand-new `habitat/<ts>`
+    /// branch in the project's real repo. Distinct from `SyncApplied`:
+    /// that's a per-round working-tree patch, this is a deliberate,
+    /// on-demand (or end-of-session) commit-granular merge that never
+    /// touches the operator's checked-out branch.
+    GitMergeApplied,
+    /// A `merge_workspace_commits_to_host` call found new commits to bring
+    /// in but failed partway through (e.g. a cherry-pick conflict) --
+    /// always logged, and always left the project's real branches
+    /// untouched (the throwaway branch/worktree are cleaned up, never
+    /// left half-built).
+    GitMergeFailed,
 }
 
 impl EventKind {
@@ -96,6 +109,8 @@ impl EventKind {
             EventKind::InstallPass => "install-pass",
             EventKind::SessionStart => "session-start",
             EventKind::SessionStop => "session-stop",
+            EventKind::GitMergeApplied => "git-merge-applied",
+            EventKind::GitMergeFailed => "git-merge-failed",
         }
     }
 
@@ -123,7 +138,9 @@ impl EventKind {
             | EventKind::SyncFlagged
             | EventKind::EgressDenied
             | EventKind::SessionStart
-            | EventKind::SessionStop => false,
+            | EventKind::SessionStop
+            | EventKind::GitMergeApplied
+            | EventKind::GitMergeFailed => false,
         }
     }
 
@@ -143,6 +160,8 @@ impl EventKind {
         EventKind::InstallPass,
         EventKind::SessionStart,
         EventKind::SessionStop,
+        EventKind::GitMergeApplied,
+        EventKind::GitMergeFailed,
     ];
 }
 

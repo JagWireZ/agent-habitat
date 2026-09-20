@@ -32,7 +32,7 @@ use habitat_workspace::command_runner::CommandRunner as WsCommandRunner;
 use habitat_workspace::guest_exec::{self, GuestEndpoint, GuestExecRunner};
 use habitat_workspace::pipeline::{self, BuildRequest};
 use habitat_workspace::sync::{
-    self, FlaggedPatchStore, HostToSandboxRequest, SandboxToHostRequest, SyncOutcome,
+    self, FlaggedPatchStore, HostToSandboxRequest, MergeOutcome, SandboxToHostRequest, SyncOutcome,
 };
 use std::fmt;
 use std::net::SocketAddr;
@@ -359,6 +359,18 @@ where
 /// git/ssh round-trip on an idle shell.
 pub const SHELL_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Name of the sentinel file the guest can drop inside
+/// [`sync::GUEST_WORKSPACE_DIR`] (visible host-side under the session's
+/// staging directory, since it's the one bind-mounted directory both
+/// sides share) to ask for a manual `git` merge-back of the workspace
+/// repo's commits into the host's real repo, without waiting for the
+/// session to end. A tiny `habitat-sync` script on the guest's `PATH`
+/// just touches this file; the host-side background poll loop below
+/// checks for it on every tick and removes it once handled -- no other
+/// IPC channel needed, since `/workspace` is already the one thing both
+/// sides can see.
+pub const MANUAL_MERGE_REQUEST_FILE: &str = ".habitat-sync-request";
+
 /// What an interactive shell session did, for the caller to report.
 #[derive(Debug, Clone, Copy)]
 pub struct ShellSessionOutcome {
@@ -418,6 +430,16 @@ where
         Ok(())
     };
 
+    // Replays the workspace repo's commits onto a new host branch, if any
+    // are new since the last such call -- the same function whether
+    // triggered by the guest's manual sentinel file or by session end.
+    let merge_now = || -> Result<MergeOutcome, RunError> {
+        sync::merge_workspace_commits_to_host(project_root, &workspace_dir, host_runner, audit)
+            .map_err(|e| run_err(format!("git merge-back failed: {e}")))
+    };
+
+    let manual_merge_request_path = workspace_dir.join(MANUAL_MERGE_REQUEST_FILE);
+
     // Initial sync before the shell opens, so the guest starts from the
     // operator's current working tree.
     sync_round()?;
@@ -435,6 +457,17 @@ where
                 // after the shell exits still runs, and per-round failures
                 // are already visible via `audit`.
                 let _ = sync_round();
+
+                // The guest's `habitat-sync` helper just touches this
+                // file inside the shared workspace directory to ask for a
+                // manual merge-back mid-session -- remove it first so a
+                // failed attempt doesn't get silently retried forever,
+                // same best-effort treatment as the periodic sync above
+                // (the failure is still visible via `audit`).
+                if manual_merge_request_path.exists() {
+                    let _ = std::fs::remove_file(&manual_merge_request_path);
+                    let _ = merge_now();
+                }
             }
         });
 
@@ -444,8 +477,11 @@ where
     });
 
     // Final sync once the shell exits, to catch anything the last
-    // periodic tick missed.
+    // periodic tick missed, then a final merge-back so the session's
+    // real commit history always makes it into the host repo before
+    // teardown reclaims the workspace directory.
     sync_round()?;
+    merge_now()?;
 
     Ok(ShellSessionOutcome {
         shell_exit_success: shell_result?,
@@ -564,6 +600,17 @@ where
         on_round,
     );
 
+    // Same reasoning as teardown below: attempt the git merge-back
+    // regardless of how the prompt loop finished, and always before
+    // teardown reclaims the workspace directory the merge reads from.
+    let merge_result = sync::merge_workspace_commits_to_host(
+        project_root,
+        &paths.staging_dir(),
+        deps.host_runner,
+        deps.audit,
+    )
+    .map_err(|e| run_err(format!("git merge-back failed: {e}")));
+
     // Teardown always runs once launch succeeded, regardless of how the
     // prompt loop finished -- a mid-session failure must never leak a
     // running VM (AGENTS.md invariant: containment resources are always
@@ -572,6 +619,7 @@ where
         .map_err(|e| run_err(format!("teardown failed: {e}")));
 
     let summary = loop_result?;
+    merge_result?;
     teardown_result?;
     Ok(summary)
 }
