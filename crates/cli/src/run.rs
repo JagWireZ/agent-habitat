@@ -378,22 +378,28 @@ pub struct ShellSessionOutcome {
 }
 
 /// Runs an interactive shell session for one launched sandbox
-/// (`habitat run` with no agent named): syncs host->sandbox once, opens a
-/// real PTY-attached `ssh` session with the operator's own terminal
-/// attached (not a captured `CommandRunner` invocation) so they get a
-/// normal interactive shell inside `sync::GUEST_WORKSPACE_DIR`, keeps
+/// (`habitat run` with no agent named): syncs once, opens a real
+/// PTY-attached `ssh` session with the operator's own terminal attached
+/// (not a captured `CommandRunner` invocation) so they get a normal
+/// interactive shell inside `sync::GUEST_WORKSPACE_DIR`, keeps
 /// host<->sandbox sync running in the background on [`SHELL_SYNC_INTERVAL`]
-/// for the life of that shell, then runs one final sandbox->host sync
-/// once the shell exits.
+/// for the life of that shell, then runs one final sync round once the
+/// shell exits.
 ///
 /// Unlike [`run_prompt_loop`] (one discrete sync round per agent turn),
 /// there is no prompt boundary for a raw shell to sync around, so this
 /// bookends the whole session with sync at start/end and fills the gap
 /// with a periodic background sync instead of a live, continuously-
-/// mounted share (AGENTS.md invariant 1 still holds: each tick is its
-/// own discrete host->sandbox + sandbox->host round through the same
-/// `sync` API the prompt loop uses, not a persistent channel -- the PTY
-/// itself carries only terminal I/O, never a file share).
+/// mounted share (AGENTS.md invariant 1 still holds: each tick is its own
+/// discrete host->sandbox + sandbox->host round through the same `sync`
+/// API the prompt loop uses, not a persistent channel -- the PTY itself
+/// carries only terminal I/O, never a file share). Each tick runs
+/// sandbox->host *before* host->sandbox, the reverse of the prompt loop's
+/// order: with no tool-call boundary to pin sync to, a file the guest
+/// creates between ticks must be captured out to the host first, or the
+/// next host->sandbox diff (built from a host snapshot that doesn't know
+/// about it yet) would see it as deleted and remove it from the shared
+/// workspace dir.
 pub fn run_shell_session<WH, A>(
     project_root: &Path,
     paths: &SessionPaths,
@@ -410,15 +416,16 @@ where
     let workspace_dir = paths.staging_dir();
 
     let sync_round = || -> Result<(), RunError> {
-        let host_request = HostToSandboxRequest {
-            project_root,
-            workspace_dir: &workspace_dir,
-            patterns,
-            flagged_store: &flagged_store,
-        };
-        sync::sync_host_to_sandbox(&host_request, host_runner, audit)
-            .map_err(|e| run_err(format!("host->sandbox sync failed: {e}")))?;
-
+        // Sandbox->host runs first: with no prompt/tool-call boundary to
+        // pin sync to, a raw shell can create a file in the bind-mounted
+        // workspace dir at any moment, including right before a tick. If
+        // host->sandbox ran first, it would diff a host snapshot that
+        // doesn't know about that file yet against the workspace dir that
+        // does, produce a delete hunk for it, and apply that delete --
+        // making a just-created guest file vanish on the next tick.
+        // Capturing sandbox->host first ensures the host snapshot used by
+        // host->sandbox already reflects anything the guest created before
+        // this tick began.
         let sandbox_request = SandboxToHostRequest {
             project_root,
             workspace_dir: &workspace_dir,
@@ -427,6 +434,15 @@ where
         };
         sync::sync_sandbox_to_host(&sandbox_request, host_runner, audit)
             .map_err(|e| run_err(format!("sandbox->host sync failed: {e}")))?;
+
+        let host_request = HostToSandboxRequest {
+            project_root,
+            workspace_dir: &workspace_dir,
+            patterns,
+            flagged_store: &flagged_store,
+        };
+        sync::sync_host_to_sandbox(&host_request, host_runner, audit)
+            .map_err(|e| run_err(format!("host->sandbox sync failed: {e}")))?;
         Ok(())
     };
 
