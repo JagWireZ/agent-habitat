@@ -13,12 +13,15 @@
 # binary the two-point sync mechanism actually invokes), `openssh` --
 # because `podman exec` does not work against the `krun` runtime at all
 # (`docs/decisions/0008-guest-exec-channel.md`), so SSH is this project's
-# real guest exec channel, not an optional extra -- and `curl`, which
+# real guest exec channel, not an optional extra -- `curl`, which
 # `tests/manual/validate-egress.sh`'s connection-trace exit gate actually
 # runs from inside the guest (a concrete, already-existing need, not
-# speculative tooling). `rm`/`sh`/`nslookup` are already provided by
-# Alpine's built-in BusyBox. Add a package here only when a concrete
-# phase or runbook actually needs it; this is not a place for
+# speculative tooling) -- and `nodejs`/`npm`, needed to install the three
+# named agents `habitat run`'s own shorthand table
+# (`crates/cli/src/run.rs::known_agent_binary`) resolves to guest-side
+# binaries: `claude`/`codex`/`opencode`. `rm`/`sh`/`nslookup` are already
+# provided by Alpine's built-in BusyBox. Add a package here only when a
+# concrete phase or runbook actually needs it; this is not a place for
 # speculative "might be useful later" tooling (AGENTS.md Section 4 --
 # deferred items are noted, not built ahead).
 #
@@ -28,7 +31,7 @@
 ARG ALPINE_VERSION=3.20
 FROM alpine:${ALPINE_VERSION}
 
-RUN apk add --no-cache git openssh-server curl \
+RUN apk add --no-cache git openssh-server curl nodejs npm \
     && adduser -D -s /bin/sh habitat \
     # adduser -D leaves the account password-locked ("!" in /etc/shadow);
     # OpenSSH's own allowed_user() check refuses a locked account
@@ -39,6 +42,23 @@ RUN apk add --no-cache git openssh-server curl \
     # No UsePAM here: Alpine's openssh-server isn't built with PAM
     # support, so that directive just logs "Unsupported option" noise.
     && printf 'PasswordAuthentication no\nChallengeResponseAuthentication no\nPermitRootLogin no\nAllowUsers habitat\n' >> /etc/ssh/sshd_config
+
+# The three agents `habitat run`'s shorthand table knows how to invoke
+# (`claude`/`codex`/`opencode` -> `crates/cli/src/run.rs::known_agent_binary`),
+# installed as global npm packages -- `registry.npmjs.org` is already on
+# the default egress allowlist (`policy/egress_allowlist.txt`) for this
+# exact purpose. Installed as root at build time (unlike the devcontainer's
+# own `npm install -g` under a non-root user): this is a one-time image
+# build step, not an interactive session doing its own installs, so none
+# of the "don't sudo npm install -g" advice about a live user's npm
+# permissions/cache applies here.
+RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai \
+    # `known_agent_binary` maps the `claude` shorthand to the guest-side
+    # binary name `claude-code`, but `@anthropic-ai/claude-code` actually
+    # installs its CLI as `claude` -- symlink so the name the launcher
+    # execs actually resolves. `codex` and `opencode` need no such shim:
+    # their packages already install binaries under those exact names.
+    && ln -s "$(command -v claude)" /usr/local/bin/claude-code
 
 COPY entrypoint.sh /usr/local/bin/habitat-entrypoint.sh
 RUN chmod +x /usr/local/bin/habitat-entrypoint.sh

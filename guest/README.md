@@ -14,8 +14,13 @@ and every `tests/manual/` runbook expects to find already present.
   [containers/crun#2090](https://github.com/containers/crun/issues/2090)),
   so SSH is the real guest exec channel
   (`docs/decisions/0008-guest-exec-channel.md`), not an optional extra --
-  and `curl`, which `tests/manual/validate-egress.sh`'s connection-trace
-  exit gate runs from inside the guest.
+  `curl`, which `tests/manual/validate-egress.sh`'s connection-trace
+  exit gate runs from inside the guest -- and `nodejs`/`npm`, used to
+  install the three named agents `habitat run`'s shorthand table
+  (`crates/cli/src/run.rs::known_agent_binary`) knows about: `claude`
+  (via `@anthropic-ai/claude-code`, symlinked to `claude-code` since
+  that's the guest-side binary name the launcher execs), `codex` (via
+  `@openai/codex`), and `opencode` (via `opencode-ai`).
 - `entrypoint.sh` -- installs this session's authorized SSH key (passed
   in via the `HABITAT_AUTHORIZED_KEY` environment variable -- a public
   key, never a secret) and starts `sshd` in the foreground.
