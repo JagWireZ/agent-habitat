@@ -32,6 +32,12 @@ pub const KRUN_RUNTIME: &str = "krun";
 /// Guest-side path the workspace staging directory is bind-mounted at.
 pub const GUEST_WORKSPACE_MOUNT: &str = "/workspace";
 
+/// The guest's non-root user's home directory, matching `guest/
+/// Containerfile`'s `adduser -D -s /bin/sh habitat` (which leaves the
+/// default `/home/habitat`). Used to build [`crate::session::AuthMount`]
+/// guest-side paths.
+pub const GUEST_HOME_DIR: &str = "/home/habitat";
+
 /// Env var carrying the guest's per-session authorized SSH public key
 /// (`guest/entrypoint.sh` installs it into `~/.ssh/authorized_keys`).
 /// Not a secret, so a plaintext env var is fine here.
@@ -71,15 +77,19 @@ fn err(message: impl Into<String>) -> LaunchError {
 /// Builds the argv for `podman run ...` from a [`LaunchRequest`] -- pure,
 /// no side effects, fully testable without Podman/krun/KVM present.
 ///
-/// Exactly one bind mount is ever included: `request.workspace_host_dir`
-/// (the disposable, git-seeded staging copy) at [`GUEST_WORKSPACE_MOUNT`].
-/// `project_root` itself, or any other arbitrary host path, is never
-/// passed to `podman run` as a bind-mount source -- the two sync moments
-/// (`habitat_workspace::sync`) remain the only path for changes to reach
-/// or leave the real project directory. No host-privilege-widening flag
-/// (`--privileged`, `--cap-add`, `--pid=host`, `--network=host`) is ever
-/// included either -- the containment boundary is the VM itself.
-/// `tests/adversarial/containment_escape.rs` pins both properties.
+/// The workspace bind mount, `request.workspace_host_dir` (the
+/// disposable, git-seeded staging copy) at [`GUEST_WORKSPACE_MOUNT`], is
+/// always first. `request.auth_mounts` (persistent, operator-owned agent
+/// auth state -- see [`crate::session::AuthMount`]) follow it, one `-v`
+/// flag each, in the order given. `project_root` itself, or any other
+/// arbitrary host path outside those two sources, is never passed to
+/// `podman run` as a bind-mount source -- the two sync moments
+/// (`habitat_workspace::sync`) remain the only path for project changes
+/// to reach or leave the real project directory. No host-privilege-
+/// widening flag (`--privileged`, `--cap-add`, `--pid=host`,
+/// `--network=host`) is ever included either -- the containment boundary
+/// is the VM itself. `tests/adversarial/containment_escape.rs` pins both
+/// properties.
 ///
 /// Networking: `habitat_egress::network_setup::build_network_flags`
 /// supplies `--network`/`--dns`, a real `passt`-backed interface pinned
@@ -108,6 +118,16 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
             "{}:{GUEST_WORKSPACE_MOUNT}",
             request.workspace_host_dir.display()
         ),
+    ]);
+    for mount in &request.auth_mounts {
+        args.push("-v".to_string());
+        args.push(format!(
+            "{}:{}",
+            mount.host_path.display(),
+            mount.guest_path
+        ));
+    }
+    args.extend([
         "--env".to_string(),
         format!("{AUTHORIZED_KEY_ENV}={}", request.guest_ssh_public_key),
         // Host port left unspecified (`::2222`) -- Podman assigns one,
@@ -266,6 +286,7 @@ mod tests {
             egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
             guest_ssh_public_key: "ssh-ed25519 AAAAtest habitat-session".to_string(),
             guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-test-session-key"),
+            auth_mounts: Vec::new(),
         }
     }
 
@@ -345,13 +366,45 @@ mod tests {
     }
 
     #[test]
-    fn build_run_args_bind_mounts_only_the_workspace_host_dir() {
+    fn build_run_args_bind_mounts_only_the_workspace_host_dir_when_no_auth_mounts_are_given() {
         let args = build_run_args(&sample_request());
         let v_flags: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "-v").map(|(i, _)| i).collect();
         assert_eq!(v_flags.len(), 1, "exactly one -v flag must be present, got {args:?}");
         assert!(!args
             .iter()
             .any(|a| a.starts_with("--mount") || a.contains("type=bind")));
+    }
+
+    #[test]
+    fn build_run_args_bind_mounts_each_auth_mount_after_the_workspace_mount() {
+        use crate::session::AuthMount;
+        let mut request = sample_request();
+        request.auth_mounts = vec![
+            AuthMount {
+                host_path: PathBuf::from("/home/op/.habitat/claude"),
+                guest_path: "/home/habitat/.claude".to_string(),
+            },
+            AuthMount {
+                host_path: PathBuf::from("/home/op/.habitat/claude.json"),
+                guest_path: "/home/habitat/.claude.json".to_string(),
+            },
+        ];
+        let args = build_run_args(&request);
+
+        let v_flags: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "-v").map(|(i, _)| i).collect();
+        assert_eq!(v_flags.len(), 3, "workspace mount plus two auth mounts, got {args:?}");
+        assert!(!args
+            .iter()
+            .any(|a| a.starts_with("--mount") || a.contains("type=bind")));
+
+        assert_eq!(
+            args[v_flags[1] + 1],
+            "/home/op/.habitat/claude:/home/habitat/.claude"
+        );
+        assert_eq!(
+            args[v_flags[2] + 1],
+            "/home/op/.habitat/claude.json:/home/habitat/.claude.json"
+        );
     }
 
     #[test]

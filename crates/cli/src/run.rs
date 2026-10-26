@@ -91,6 +91,133 @@ fn known_agent_binary(name: &str) -> Option<&'static str> {
 /// The named agent shorthands `habitat run` accepts, for error messages.
 const KNOWN_AGENT_NAMES: &[&str] = &["claude", "codex", "opencode"];
 
+/// Where an operator's persistent agent auth/config lives on the host --
+/// kept separate from any arbitrary project path, never derived from
+/// `project_root` or user input. Fixed, not configurable per project
+/// (same posture as [`known_agent_binary`]'s own fixed table): a new
+/// agent's path is added here, not invented per `sandbox.yaml`.
+///
+/// Each agent gets its own top-level entry directly under `~/.habitat/`
+/// (`~/.habitat/claude`, not `~/.habitat/auth/claude`) rather than being
+/// nested under an "auth" subdirectory -- what's mirrored here is each
+/// agent's whole config/state directory (history, caches, etc.), not
+/// just credentials, so a name implying "auth only" would be misleading.
+const AGENT_HOME_SUBDIR: &str = ".habitat";
+
+/// Maps each known agent's on-host config path (directly under
+/// `~/.habitat/`) to where it needs to land in the guest, mirroring
+/// `known_agent_binary`'s fixed table. Returns only the entries whose
+/// host path actually exists -- an operator who hasn't set up a given
+/// agent's auth yet sees no behavior change, not an error; the agent
+/// then runs unauthenticated inside the guest exactly as it does today.
+///
+/// `home_dir` is the operator's real host home directory (`$HOME`),
+/// passed in rather than read here so this stays pure and testable
+/// against a fake directory tree.
+pub fn known_auth_mounts(home_dir: &Path) -> Vec<habitat_vm::session::AuthMount> {
+    let agent_root = home_dir.join(AGENT_HOME_SUBDIR);
+    let guest_home = habitat_vm::launcher::GUEST_HOME_DIR;
+    let candidates: &[(&str, String)] = &[
+        ("claude", format!("{guest_home}/.claude")),
+        ("claude.json", format!("{guest_home}/.claude.json")),
+        ("codex", format!("{guest_home}/.codex")),
+        ("opencode", format!("{guest_home}/.config/opencode")),
+    ];
+    candidates
+        .iter()
+        .map(|(name, guest_path)| (agent_root.join(name), guest_path.clone()))
+        .filter(|(host_path, _)| host_path.exists())
+        .map(|(host_path, guest_path)| habitat_vm::session::AuthMount {
+            host_path,
+            guest_path,
+        })
+        .collect()
+}
+
+/// Which `~/.habitat/` entries a given guest-side agent binary
+/// (`known_agent_binary`'s output, e.g. `"claude-code"`) needs present on
+/// the host for [`known_auth_mounts`] to pick it up. A custom `--
+/// <program>` agent has no entry here and gets nothing created -- only
+/// the three named shorthands are "known" enough to auto-provision.
+fn auth_entries_for_program(program: &str) -> &'static [&'static str] {
+    match program {
+        "claude-code" => &["claude", "claude.json"],
+        "codex" => &["codex"],
+        "opencode" => &["opencode"],
+        _ => &[],
+    }
+}
+
+/// Creates whichever of `program`'s `~/.habitat/` entries don't already
+/// exist, *before* [`known_auth_mounts`] resolves this session's bind
+/// mounts. Without this, a brand-new installation's first `habitat run
+/// claude` would find nothing at `~/.habitat/claude` yet,
+/// `known_auth_mounts`'s `exists()` filter would skip it, and the first
+/// login inside the guest would have nowhere durable to persist to --
+/// gone the moment the guest exits.
+///
+/// `claude.json` is created as an empty JSON object (a bind mount's host
+/// side must already exist, and an empty object is valid JSON a first
+/// run can safely overwrite); every other entry is a directory. Never
+/// touches an entry that already exists, so an operator's own copied-in
+/// agent state is never clobbered.
+pub fn ensure_auth_entries_exist(home_dir: &Path, program: &str) -> std::io::Result<()> {
+    let agent_root = home_dir.join(AGENT_HOME_SUBDIR);
+    for entry in auth_entries_for_program(program) {
+        let path = agent_root.join(entry);
+        if path.exists() {
+            continue;
+        }
+        if *entry == "claude.json" {
+            std::fs::create_dir_all(&agent_root)?;
+            std::fs::write(&path, "{}\n")?;
+        } else {
+            std::fs::create_dir_all(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Subdirectory, under the operator's home, that [`log_habitat_event`]
+/// appends to -- separate from `habitat-audit`'s own boundary audit log
+/// (`habitat_policy::default_audit_log_path`, under XDG state), which is
+/// a JSON-escaped security record kept elsewhere on purpose. This one is
+/// a plain, human-readable breadcrumb trail colocated with `~/.habitat/`
+/// itself, so an operator poking around that folder (e.g. to see why it
+/// exists, or what last touched it) finds an explanation right there
+/// instead of needing to know the audit log exists at all.
+const LOG_HOME_SUBDIR: &str = ".habitat/logs";
+
+/// Appends one timestamped line to `~/.habitat/logs/habitat.log`,
+/// creating `~/.habitat/logs` (and so, on a brand-new installation,
+/// `~/.habitat` itself) on first use. This is the only thing that
+/// creates `~/.habitat` when an operator has never set up any agent
+/// auth -- every other path under it ([`ensure_auth_entries_exist`]) is
+/// created lazily, per agent, only when that agent is actually run.
+///
+/// Best-effort and silent on failure: a read-only `$HOME` or a full disk
+/// must never block a session over a convenience log.
+pub fn log_habitat_event(home_dir: &Path, message: &str) {
+    use std::io::Write;
+
+    let dir = home_dir.join(LOG_HOME_SUBDIR);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let unix_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("{unix_secs} {message}\n");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("habitat.log"))
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// Parses `habitat run`'s own arguments: an optional `--config <path>`,
 /// then either nothing (interactive shell), a named agent shorthand
 /// (`claude`/`codex`/`opencode`) plus its own args, or `--
@@ -225,6 +352,7 @@ pub fn launch_request(
     egress_proxy_addr: SocketAddr,
     guest_ssh_public_key: String,
     guest_ssh_private_key_path: PathBuf,
+    auth_mounts: Vec<habitat_vm::session::AuthMount>,
 ) -> LaunchRequest {
     LaunchRequest {
         session_id,
@@ -234,6 +362,7 @@ pub fn launch_request(
         egress_proxy_addr,
         guest_ssh_public_key,
         guest_ssh_private_key_path,
+        auth_mounts,
     }
 }
 
@@ -504,6 +633,76 @@ where
     })
 }
 
+/// Upper bound on how long [`wait_for_guest_ssh`] polls before giving up.
+/// Real-hardware boot path (`guest/entrypoint.sh`): DHCP alone can take
+/// up to 10s before it gives up and continues anyway, then the workspace
+/// and any auth-mount `chmod -R` run, all *before* `exec sshd` -- so the
+/// guest's published SSH port can be seen as "up" (the TCP forward
+/// itself is live the moment the container starts) well before anything
+/// inside the guest is actually listening on it. 30s leaves comfortable
+/// headroom over that worst case.
+const GUEST_SSH_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long to wait between [`wait_for_guest_ssh`] polling attempts.
+const GUEST_SSH_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Blocks until the guest's `sshd` is actually ready to serve a real
+/// session, by retrying a trivial `true` over SSH rather than firing the
+/// operator's real shell/agent invocation at a guest that might still
+/// reset the connection mid-handshake.
+///
+/// Without this, connecting immediately after `podman run` returns is a
+/// real, observed race, not a hypothetical: the published port accepts
+/// the TCP handshake right away (the forward itself is live as soon as
+/// the container starts), but `guest/entrypoint.sh` doesn't `exec sshd`
+/// until after DHCP (up to 10s) and a `chmod -R` over the bind-mounted
+/// workspace (and any auth mounts) have both finished -- an SSH attempt
+/// in that window gets the connection reset mid-handshake
+/// (`kex_exchange_identification: read: Connection reset by peer`)
+/// instead of a clean "not up yet" signal to retry on.
+///
+/// Fails closed with the last error seen once [`GUEST_SSH_READY_TIMEOUT`]
+/// elapses -- the caller is expected to tear the session down on error,
+/// same as any other launch-time failure.
+pub fn wait_for_guest_ssh<R: WsCommandRunner>(
+    guest: GuestEndpoint<'_>,
+    runner: &R,
+) -> Result<(), RunError> {
+    wait_for_guest_ssh_with(
+        guest,
+        runner,
+        GUEST_SSH_READY_TIMEOUT,
+        GUEST_SSH_READY_POLL_INTERVAL,
+    )
+}
+
+/// [`wait_for_guest_ssh`] with an injectable timeout/poll interval, so
+/// tests can exercise the retry-then-give-up path without actually
+/// waiting [`GUEST_SSH_READY_TIMEOUT`] out.
+fn wait_for_guest_ssh_with<R: WsCommandRunner>(
+    guest: GuestEndpoint<'_>,
+    runner: &R,
+    timeout: std::time::Duration,
+    poll_interval: std::time::Duration,
+) -> Result<(), RunError> {
+    let exec_runner = GuestExecRunner::new(runner, guest);
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_err: String;
+    loop {
+        last_err = match exec_runner.exec("true", &[]) {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            Err(e) => e.to_string(),
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(run_err(format!(
+                "guest SSH never became ready within {timeout:?}: {last_err}"
+            )));
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
 /// Opens a real interactive `ssh` session against the guest, with the
 /// operator's own terminal (stdin/stdout/stderr) attached via `-tt`
 /// (force PTY allocation) -- not the captured-`Output` `CommandRunner`
@@ -556,6 +755,7 @@ pub fn run_full_session<E, VR, WH, WG, A>(
     config: &ProjectConfig,
     guest_image: &str,
     egress_proxy_addr: SocketAddr,
+    auth_mounts: Vec<habitat_vm::session::AuthMount>,
     agent: &AgentInvocation,
     prompts: impl IntoIterator<Item = String>,
     on_round: impl FnMut(&PromptRoundOutcome),
@@ -586,6 +786,7 @@ where
         egress_proxy_addr,
         keypair.public_key,
         keypair.private_key_path.clone(),
+        auth_mounts,
     );
 
     let launched = launcher::launch(&launch_req, deps.vm_runner, deps.audit)
@@ -865,6 +1066,81 @@ mod tests {
     use habitat_policy::resource_limits::ResourceLimitsConfig;
     use habitat_vm::command_runner::testing::FakeCommandRunner as VmFakeCommandRunner;
 
+    /// Stands in for the guest's `sshd` coming up partway through
+    /// [`wait_for_guest_ssh_with`]'s polling: every `ssh` invocation
+    /// before the `succeed_after`th fails as if the guest reset the
+    /// connection mid-handshake (`guest/entrypoint.sh` hasn't `exec
+    /// sshd`'d yet); from then on it succeeds, same as a real `true`.
+    struct FlakyGuestRunner {
+        succeed_after: u32,
+        calls: std::cell::Cell<u32>,
+    }
+
+    impl WsCommandRunner for FlakyGuestRunner {
+        fn run_with_env(
+            &self,
+            _env: &[(&str, &str)],
+            _program: &str,
+            _args: &[&str],
+        ) -> std::io::Result<std::process::Output> {
+            use std::os::unix::process::ExitStatusExt;
+            let n = self.calls.get() + 1;
+            self.calls.set(n);
+            let success = n > self.succeed_after;
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+                stdout: Vec::new(),
+                stderr: if success {
+                    Vec::new()
+                } else {
+                    b"kex_exchange_identification: read: Connection reset by peer".to_vec()
+                },
+            })
+        }
+    }
+
+    fn fake_guest<'a>(key_path: &'a Path) -> GuestEndpoint<'a> {
+        GuestEndpoint {
+            host: "127.0.0.1",
+            port: 2222,
+            private_key_path: key_path,
+        }
+    }
+
+    #[test]
+    fn wait_for_guest_ssh_with_succeeds_once_the_guest_stops_resetting_the_connection() {
+        let key_path = PathBuf::from("/tmp/habitat-test-guest-ssh-key");
+        let runner = FlakyGuestRunner {
+            succeed_after: 2,
+            calls: std::cell::Cell::new(0),
+        };
+        let result = wait_for_guest_ssh_with(
+            fake_guest(&key_path),
+            &runner,
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(1),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(runner.calls.get(), 3);
+    }
+
+    #[test]
+    fn wait_for_guest_ssh_with_fails_closed_once_the_timeout_elapses() {
+        let key_path = PathBuf::from("/tmp/habitat-test-guest-ssh-key");
+        let runner = FlakyGuestRunner {
+            succeed_after: u32::MAX,
+            calls: std::cell::Cell::new(0),
+        };
+        let result = wait_for_guest_ssh_with(
+            fake_guest(&key_path),
+            &runner,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(5),
+        );
+        let err = result.expect_err("guest never becomes ready in this test");
+        assert!(err.message.contains("Connection reset by peer"), "{err:?}");
+    }
+
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -1032,10 +1308,134 @@ mod tests {
             "127.0.0.1:8443".parse().unwrap(),
             "ssh-ed25519 AAAA".to_string(),
             PathBuf::from("/tmp/habitat-test-session-2/guest-ssh-key"),
+            Vec::new(),
         );
         assert_eq!(req.resource_limits.cpus, 4.0);
         assert_eq!(req.resource_limits.memory_mb, 8192);
         assert_eq!(req.workspace_host_dir, paths.staging_dir());
+        assert!(req.auth_mounts.is_empty());
+    }
+
+    #[test]
+    fn launch_request_carries_through_whatever_auth_mounts_it_is_given() {
+        let config = ProjectConfig::default();
+        let paths = SessionPaths::new("/tmp/habitat-test-session-3");
+        let mounts = vec![habitat_vm::session::AuthMount {
+            host_path: PathBuf::from("/home/op/.habitat/claude"),
+            guest_path: "/home/habitat/.claude".to_string(),
+        }];
+        let req = launch_request(
+            SessionId::from_name("habitat-test-launch-request-2").unwrap(),
+            &paths,
+            &config,
+            "localhost/habitat-guest:alpine".to_string(),
+            "127.0.0.1:8443".parse().unwrap(),
+            "ssh-ed25519 AAAA".to_string(),
+            PathBuf::from("/tmp/habitat-test-session-3/guest-ssh-key"),
+            mounts.clone(),
+        );
+        assert_eq!(req.auth_mounts, mounts);
+    }
+
+    /// Fresh, uniquely-named directory under the system temp dir, same
+    /// pattern used throughout this crate's own tests (e.g.
+    /// `run_nft_in_netns`) rather than pulling in a `tempfile` dev-
+    /// dependency the rest of the workspace doesn't use.
+    fn fresh_fake_home(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "habitat-test-home-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn known_auth_mounts_is_empty_when_nothing_is_set_up_on_the_host() {
+        let home = fresh_fake_home("empty");
+        assert!(known_auth_mounts(&home).is_empty());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn known_auth_mounts_only_includes_paths_that_actually_exist() {
+        let home = fresh_fake_home("partial");
+        let auth_root = home.join(".habitat");
+        std::fs::create_dir_all(auth_root.join("claude")).unwrap();
+        std::fs::write(auth_root.join("claude.json"), "{}").unwrap();
+        // codex/opencode left absent on purpose.
+
+        let mounts = known_auth_mounts(&home);
+        assert_eq!(mounts.len(), 2);
+        assert!(mounts
+            .iter()
+            .any(|m| m.host_path == auth_root.join("claude") && m.guest_path == "/home/habitat/.claude"));
+        assert!(mounts.iter().any(|m| m.host_path == auth_root.join("claude.json")
+            && m.guest_path == "/home/habitat/.claude.json"));
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn ensure_auth_entries_exist_creates_claude_dir_and_an_empty_claude_json() {
+        let home = fresh_fake_home("ensure-claude");
+        ensure_auth_entries_exist(&home, "claude-code").unwrap();
+
+        let auth_root = home.join(".habitat");
+        assert!(auth_root.join("claude").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(auth_root.join("claude.json")).unwrap(),
+            "{}\n"
+        );
+        // codex/opencode are a different agent's entries, untouched.
+        assert!(!auth_root.join("codex").exists());
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn ensure_auth_entries_exist_never_overwrites_an_existing_entry() {
+        let home = fresh_fake_home("ensure-preexisting");
+        let auth_root = home.join(".habitat");
+        std::fs::create_dir_all(&auth_root).unwrap();
+        std::fs::write(auth_root.join("claude.json"), "{\"existing\":true}").unwrap();
+
+        ensure_auth_entries_exist(&home, "claude-code").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(auth_root.join("claude.json")).unwrap(),
+            "{\"existing\":true}"
+        );
+
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn ensure_auth_entries_exist_is_a_noop_for_an_unknown_custom_agent() {
+        let home = fresh_fake_home("ensure-custom");
+        ensure_auth_entries_exist(&home, "my-custom-agent").unwrap();
+        assert!(!home.join(".habitat").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn log_habitat_event_creates_habitat_dir_and_appends_a_line() {
+        let home = fresh_fake_home("log-event");
+        log_habitat_event(&home, "ran habitat run -- claude-code");
+
+        let log_path = home.join(".habitat/logs/habitat.log");
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.ends_with("ran habitat run -- claude-code\n"));
+
+        log_habitat_event(&home, "ran habitat run (shell)");
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert_eq!(contents.lines().count(), 2, "second call should append, not overwrite");
+
+        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]

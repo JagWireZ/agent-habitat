@@ -156,6 +156,7 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
         guest_ssh_public_key: "ssh-ed25519 AAAAtestFakeKey habitat-session".to_string(),
         guest_ssh_private_key_path: paths.guest_ssh_key_path(),
+        auth_mounts: Vec::new(),
     };
     let run_args_argv = build_run_args(&launch_req);
     let run_invocation = format!(
@@ -226,6 +227,7 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
         &config,
         "localhost/habitat-guest:alpine",
         "127.0.0.1:8443".parse().unwrap(),
+        Vec::new(),
         &AgentInvocation {
             program: "fake-agent".to_string(),
             args: vec![],

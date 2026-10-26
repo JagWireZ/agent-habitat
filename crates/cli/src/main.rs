@@ -586,6 +586,31 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
             }
         };
     let session_id = habitat_vm::session::SessionId::generate();
+    // Persistent, operator-owned agent auth (`~/.habitat/...`), not
+    // this session's disposable workspace copy -- see
+    // `run::known_auth_mounts`'s own doc comment. Empty, not an error,
+    // when `$HOME` can't be read or nothing's been set up there yet.
+    //
+    // Before resolving the mounts, make sure this invocation's own
+    // `~/.habitat/...` entries exist (`run::ensure_auth_entries_exist`)
+    // -- otherwise a brand-new installation's very first login would have
+    // nowhere to persist to, since `known_auth_mounts` only mounts paths
+    // that already exist. Also drop a breadcrumb in `~/.habitat/logs/`
+    // (`run::log_habitat_event`) so the folder explains its own presence.
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    if let Some(home) = &home {
+        let invocation = match &run_args.mode {
+            run::RunMode::Shell => "ran habitat run (shell)".to_string(),
+            run::RunMode::Agent(agent) => format!("ran habitat run -- {}", agent.program),
+        };
+        run::log_habitat_event(home, &invocation);
+        if let run::RunMode::Agent(agent) = &run_args.mode {
+            let _ = run::ensure_auth_entries_exist(home, &agent.program);
+        }
+    }
+    let auth_mounts = home
+        .map(|home| run::known_auth_mounts(&home))
+        .unwrap_or_default();
     let launch_req = run::launch_request(
         session_id.clone(),
         &paths,
@@ -594,6 +619,7 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
         proxy_addr,
         keypair.public_key,
         keypair.private_key_path.clone(),
+        auth_mounts,
     );
 
     let launched = match habitat_vm::launcher::launch(&launch_req, &vm_runner, &audit) {
@@ -625,6 +651,17 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
         port: launched.guest_ssh_port,
         private_key_path: &launched.guest_ssh_private_key_path,
     };
+
+    // The guest's sshd isn't necessarily up yet just because `podman
+    // run` returned and its port got published -- see
+    // `run::wait_for_guest_ssh`'s own doc comment for why connecting any
+    // earlier is a real race, not a hypothetical.
+    if let Err(e) = run::wait_for_guest_ssh(guest, &ws_runner) {
+        eprintln!("habitat run: {e}");
+        let _ = run::remove_egress_firewall_in_container(&vm_runner, session_id.as_str());
+        let _ = habitat_vm::launcher::teardown(&launched, &vm_runner, &audit);
+        return ExitCode::FAILURE;
+    }
 
     let session_result: Result<(), run::RunError> = match &run_args.mode {
         run::RunMode::Shell => {

@@ -13,9 +13,10 @@
 //! - Resource-limit enforcement (CPU/memory caps) is read from
 //!   `habitat_policy::resource_limits` and applied in
 //!   [`launcher::build_run_args`].
-//! - The only bind mount ever passed to `podman run` is the disposable
-//!   staging directory at `/workspace` -- never `project_root` itself,
-//!   or any other arbitrary host path.
+//! - The disposable staging directory is always bind-mounted at
+//!   `/workspace`, alongside any persistent agent-auth bind mounts
+//!   ([`session::AuthMount`], resolved from `~/.habitat/`) -- never
+//!   `project_root` itself, or any other arbitrary host path.
 //!
 //! **Not covered here:** actually booting against real KVM --
 //! `tests/manual/validate-vm-launch.sh` does that, since this dev

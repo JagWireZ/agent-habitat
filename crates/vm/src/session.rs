@@ -57,6 +57,27 @@ impl fmt::Display for SessionId {
     }
 }
 
+/// One persistent, host-owned credential/config path bind-mounted into
+/// the guest alongside the disposable workspace mount. Unlike
+/// `workspace_host_dir`, an `AuthMount` is never copied, blocklist-
+/// filtered, staged, or deleted at teardown -- it's the operator's own
+/// long-lived agent config/auth state (e.g. `~/.habitat/claude` ->
+/// `~/.claude` in the guest), bind-mounted directly so the agent doesn't
+/// need to re-authenticate every session. This is the "actual secret-
+/// injection mechanism for the chosen VM stack" AGENTS.md invariant 5
+/// calls for, as opposed to the plaintext-env-var route that invariant
+/// explicitly forbids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthMount {
+    /// Host-side source path. Always directly under the operator's own
+    /// `~/.habitat/` directory (`crates/cli/src/run.rs::
+    /// known_auth_mounts`) -- never `project_root` or another arbitrary
+    /// host path.
+    pub host_path: PathBuf,
+    /// Absolute guest-side destination path, e.g. `/home/habitat/.claude`.
+    pub guest_path: String,
+}
+
 /// Everything needed to launch one session's microVM.
 #[derive(Debug, Clone)]
 pub struct LaunchRequest {
@@ -82,6 +103,12 @@ pub struct LaunchRequest {
     /// on the host, carried through so `launch` can copy it onto the
     /// returned `LaunchedSession` for `teardown` to clean up.
     pub guest_ssh_private_key_path: PathBuf,
+    /// Persistent agent-auth bind mounts (see [`AuthMount`]), resolved by
+    /// `crates/cli/src/run.rs::known_auth_mounts` to whichever of
+    /// `~/.habitat/{claude,claude.json,codex,opencode}` actually
+    /// exist on the host. Empty if the operator hasn't set any of these
+    /// up -- never an error on its own.
+    pub auth_mounts: Vec<AuthMount>,
 }
 
 /// What a successful launch hands back -- enough to tear the session

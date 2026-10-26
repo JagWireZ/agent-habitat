@@ -183,6 +183,7 @@ fn resource_limits_never_widen_launch_privileges() {
         "127.0.0.1:8443".parse().unwrap(),
         "ssh-ed25519 AAAAtest".to_string(),
         PathBuf::from("/tmp/habitat-config-invariants-key"),
+        Vec::new(),
     );
     let args = build_run_args(&request);
     for forbidden in ["--privileged", "--cap-add", "--pid=host", "--network=host"] {
@@ -261,6 +262,7 @@ fn no_config_value_can_select_host_networking_or_an_unset_network_mode() {
             "127.0.0.1:8443".parse().unwrap(),
             "ssh-ed25519 AAAAtest".to_string(),
             PathBuf::from("/tmp/habitat-config-invariants-network-key"),
+            Vec::new(),
         );
         let args = build_run_args(&request);
         let idx = args.iter().position(|a| a == "--network").expect("--network must always be present");

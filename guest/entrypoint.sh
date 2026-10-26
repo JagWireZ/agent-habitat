@@ -94,6 +94,22 @@ fi
 # all, so the host operator stays the owner and teardown keeps working.
 chmod -R a+rwX "$WORKSPACE_DIR"
 
+# Persistent agent-auth bind mounts (habitat_vm::session::AuthMount,
+# resolved host-side from ~/.habitat/ by
+# crates/cli/src/run.rs::known_auth_mounts) land here too, each one
+# optional -- only whichever of these the operator has actually set up
+# on the host arrive as real mounts; anything absent is just a path that
+# doesn't exist, not an error. Same ownership problem as /workspace
+# above and the same fix: these are real bind mounts over virtiofs with
+# host uids passed through unchanged, so `habitat` needs `chmod`, not
+# `chown`, to read/write them (and, for `claude.json` and `.claude`,
+# write back a refreshed OAuth token).
+for auth_path in "$HOME_DIR/.claude" "$HOME_DIR/.claude.json" "$HOME_DIR/.codex" "$HOME_DIR/.config/opencode"; do
+    if [ -e "$auth_path" ]; then
+        chmod -R a+rwX "$auth_path"
+    fi
+done
+
 # git refuses to operate on a repository it doesn't consider itself the
 # owner of ("detected dubious ownership") -- since the fix above
 # deliberately leaves /workspace owned by the host operator's uid, not

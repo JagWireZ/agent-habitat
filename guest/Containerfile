@@ -56,9 +56,29 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai \
     # `known_agent_binary` maps the `claude` shorthand to the guest-side
     # binary name `claude-code`, but `@anthropic-ai/claude-code` actually
     # installs its CLI as `claude` -- symlink so the name the launcher
-    # execs actually resolves. `codex` and `opencode` need no such shim:
-    # their packages already install binaries under those exact names.
-    && ln -s "$(command -v claude)" /usr/local/bin/claude-code
+    # execs actually resolves. `opencode` needs no such shim: its package
+    # already installs a binary under that exact name.
+    && ln -s "$(command -v claude)" /usr/local/bin/claude-code \
+    # `codex`'s default "shared background app-server daemon" mode
+    # double-forks a long-lived daemon process and then verifies it came
+    # up by re-reading that pid's `/proc/<pid>/stat` start time -- that
+    # read reliably fails in this guest ("failed to read start time for
+    # pid-managed app server <pid>"), confirmed by hand against real KVM:
+    # this microVM's PID 1 is `/init.krun` (`guest/entrypoint.sh`'s own
+    # doc comment), not a normal init, so there's nothing here to reap or
+    # otherwise account for a detached double-forked process the way a
+    # real init would. Codex's own error message names the fix
+    # (`--no-daemon`), and manual testing (a real interactive session,
+    # repeated) confirms it works reliably with no other side effects --
+    # so shim it in globally here rather than relying on every operator
+    # remembering to type it. Move the npm-installed entry point aside
+    # and make `codex` a wrapper that always prepends the flag; `--no-
+    # daemon` is one of `codex`'s own top-level options, so it's valid in
+    # front of any subcommand (`codex --no-daemon exec ...`) the same way
+    # typing it by hand would be.
+    && mv /usr/local/bin/codex /usr/local/bin/codex-real \
+    && printf '#!/bin/sh\nexec /usr/local/bin/codex-real --no-daemon "$@"\n' > /usr/local/bin/codex \
+    && chmod +x /usr/local/bin/codex
 
 COPY entrypoint.sh /usr/local/bin/habitat-entrypoint.sh
 RUN chmod +x /usr/local/bin/habitat-entrypoint.sh

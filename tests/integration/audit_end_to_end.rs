@@ -109,6 +109,7 @@ fn launch_request() -> LaunchRequest {
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
         guest_ssh_public_key: "ssh-ed25519 AAAAtest habitat-audit-e2e".to_string(),
         guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-audit-e2e-session-key"),
+        auth_mounts: Vec::new(),
     }
 }
 

@@ -62,6 +62,22 @@ resource_limits:
 egress_allowlist_additions:
   - internal.registry.example
   - "*.corp.example"
+  # Claude Code CLI talks to platform.claude.com (in addition to
+  # api.anthropic.com, which is already in the built-in defaults) for
+  # auth/session traffic -- without this it can't connect from inside
+  # the guest.
+  - platform.claude.com
+  # Codex CLI's login/device-auth flow talks to auth.openai.com (a
+  # separate host from api.openai.com, which is already in the built-in
+  # defaults) -- without this, `codex login --device-auth` fails with a
+  # generic "error sending request" from inside the guest.
+  - auth.openai.com
+  # Codex CLI also fetches its "cloud config" bundle and does its actual
+  # ChatGPT-backed API traffic against chatgpt.com
+  # (chatgpt_base_url = "https://chatgpt.com/backend-api/"), not
+  # api.openai.com -- without this, codex fails post-login with "failed
+  # to load workspace requirements: cloud config: request failed".
+  - chatgpt.com
 
 # Audit log verbosity. Default: enabled. This only controls a handful of
 # suppressible, non-invariant-critical log entries -- it never disables the
