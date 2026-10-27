@@ -55,6 +55,7 @@ fn flipping_git_history_on_without_approval_hard_fails_the_whole_build_before_st
             resource_limits: Default::default(),
             egress_allowlist_additions: vec![],
             audit: Default::default(),
+            agent_host_files: Default::default(),
         },
         content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };
@@ -130,6 +131,7 @@ fn approved_git_history_toggle_shares_real_history() {
             resource_limits: Default::default(),
             egress_allowlist_additions: vec![],
             audit: Default::default(),
+            agent_host_files: Default::default(),
         },
         content_ruleset_path: workdir.join("effective-betterleaks.toml"),
     };

@@ -136,6 +136,23 @@ pub fn open_agent_state(
     AgentStateSession::open(home, &id_refs, launcher::GUEST_HOME_DIR).map(Some)
 }
 
+/// Seeds any missing staging file (`auth` and `config` alike) under
+/// `~/.habitat/agents/` from the operator's real dotfiles on this host
+/// (`.claude.json`, `.codex/auth.json`, etc.), gated entirely by the
+/// project config's `agent_host_files` toggle -- disabled does nothing at
+/// all, not even for `auth`. A no-op once a staging file exists. Nothing
+/// to do (and an empty report) when `agent_state` is `None`.
+pub fn agent_state_seed_missing_from_host<A: AuditSink>(
+    agent_state: Option<&AgentStateSession>,
+    enabled: bool,
+    audit: &A,
+) -> CopyReport {
+    match agent_state {
+        Some(state) => state.seed_missing_from_host(enabled, audit),
+        None => CopyReport::default(),
+    }
+}
+
 /// Copies this session's agent auth and config files into the guest.
 /// Nothing to do (and an empty report) when `agent_state` is `None`.
 pub fn agent_state_copy_in<R: WsCommandRunner, A: AuditSink>(
@@ -398,7 +415,10 @@ pub struct SessionSummary {
 /// `prompts`, host->sandbox sync, one discrete agent exec, then
 /// sandbox->host sync (`docs/decisions/0009-run-driver-prompt-loop.md`).
 /// Stops at the first prompt equal to [`EXIT_COMMANDS`] or when `prompts`
-/// is exhausted.
+/// is exhausted. A blank (whitespace-only) line is skipped entirely --
+/// no sync, no agent exec, no round in the summary -- rather than being
+/// handed to the agent: most one-shot `--print`-style invocations treat
+/// an empty prompt as a hard error, not a no-op turn.
 ///
 /// Generic over the host-side runner (real `git`, run locally against the
 /// bind-mounted workspace directory -- `sync::sync_host_to_sandbox`/
@@ -432,6 +452,9 @@ where
     for prompt in prompts {
         if EXIT_COMMANDS.contains(&prompt.trim()) {
             break;
+        }
+        if prompt.trim().is_empty() {
+            continue;
         }
 
         let host_request = HostToSandboxRequest {
@@ -480,17 +503,19 @@ where
     Ok(summary)
 }
 
-/// How often the background sync loop runs while an interactive shell
-/// session ([`run_shell_session`]) is open. A raw shell has no "prompt"
-/// boundary to sync around, so a fixed interval stands in for it --
-/// chosen to keep changes visible on both sides without spamming a
-/// git/ssh round-trip on an idle shell.
+/// How often the background sync loop runs while an interactive session
+/// ([`run_interactive_session`]) is open -- a raw shell or a named agent
+/// run as a live, PTY-attached console. Neither has a "prompt" boundary
+/// to sync around, so a fixed interval stands in for it -- chosen to keep
+/// changes visible on both sides without spamming a git/ssh round-trip on
+/// an idle session.
 pub const SHELL_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Agent auth files are re-checked for refreshed tokens every this many
-/// shell sync ticks (so every 30s at the default interval). Each check is
-/// one `ssh` per auth file, which is cheap but not worth doing every 5s;
-/// the caller's final copy-out after the shell exits catches the rest.
+/// interactive-session sync ticks (so every 30s at the default interval).
+/// Each check is one `ssh` per auth file, which is cheap but not worth
+/// doing every 5s; the caller's final copy-out after the session exits
+/// catches the rest.
 pub const SHELL_AGENT_STATE_TICKS_PER_COPY_OUT: u32 = 6;
 
 /// Name of the sentinel file the guest can drop inside
@@ -505,25 +530,25 @@ pub const SHELL_AGENT_STATE_TICKS_PER_COPY_OUT: u32 = 6;
 /// sides can see.
 pub const MANUAL_MERGE_REQUEST_FILE: &str = ".habitat-sync-request";
 
-/// What an interactive shell session did, for the caller to report.
+/// What an interactive session did, for the caller to report.
 #[derive(Debug, Clone, Copy)]
-pub struct ShellSessionOutcome {
-    pub shell_exit_success: bool,
+pub struct InteractiveSessionOutcome {
+    pub exit_success: bool,
 }
 
-/// Runs an interactive shell session for one launched sandbox
-/// (`habitat run` with no agent named): syncs once, opens a real
-/// PTY-attached `ssh` session with the operator's own terminal attached
-/// (not a captured `CommandRunner` invocation) so they get a normal
-/// interactive shell inside `sync::GUEST_WORKSPACE_DIR`, keeps
-/// host<->sandbox sync running in the background on [`SHELL_SYNC_INTERVAL`]
-/// for the life of that shell, then runs one final sync round once the
-/// shell exits.
+/// Runs an interactive session for one launched sandbox: syncs once,
+/// opens a real PTY-attached `ssh` session running `remote_command` with
+/// the operator's own terminal attached (not a captured `CommandRunner`
+/// invocation) -- `"$SHELL -l"` for `habitat run` with no agent named, or
+/// a named agent's own program/args (built by [`agent_remote_command`])
+/// run directly as a live console -- keeps host<->sandbox sync running
+/// in the background on [`SHELL_SYNC_INTERVAL`] for the life of that
+/// session, then runs one final sync round once it exits.
 ///
 /// Unlike [`run_prompt_loop`] (one discrete sync round per agent turn),
-/// there is no prompt boundary for a raw shell to sync around, so this
-/// bookends the whole session with sync at start/end and fills the gap
-/// with a periodic background sync instead of a live, continuously-
+/// there is no prompt boundary for a live PTY session to sync around, so
+/// this bookends the whole session with sync at start/end and fills the
+/// gap with a periodic background sync instead of a live, continuously-
 /// mounted share (AGENTS.md invariant 1 still holds: each tick is its own
 /// discrete host->sandbox + sandbox->host round through the same `sync`
 /// API the prompt loop uses, not a persistent channel -- the PTY itself
@@ -534,7 +559,8 @@ pub struct ShellSessionOutcome {
 /// next host->sandbox diff (built from a host snapshot that doesn't know
 /// about it yet) would see it as deleted and remove it from the shared
 /// workspace dir.
-pub fn run_shell_session<WH, A>(
+pub fn run_interactive_session<WH, A>(
+    remote_command: &str,
     project_root: &Path,
     paths: &SessionPaths,
     guest: GuestEndpoint<'_>,
@@ -542,7 +568,7 @@ pub fn run_shell_session<WH, A>(
     agent_state: Option<&AgentStateSession>,
     host_runner: &WH,
     audit: &A,
-) -> Result<ShellSessionOutcome, RunError>
+) -> Result<InteractiveSessionOutcome, RunError>
 where
     WH: WsCommandRunner + Sync,
     A: AuditSink + Sync,
@@ -591,12 +617,12 @@ where
 
     let manual_merge_request_path = workspace_dir.join(MANUAL_MERGE_REQUEST_FILE);
 
-    // Initial sync before the shell opens, so the guest starts from the
+    // Initial sync before the session opens, so the guest starts from the
     // operator's current working tree.
     sync_round()?;
 
     let stop = std::sync::atomic::AtomicBool::new(false);
-    let shell_result = std::thread::scope(|scope| {
+    let session_result = std::thread::scope(|scope| {
         scope.spawn(|| {
             let mut ticks: u32 = 0;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -628,20 +654,20 @@ where
             }
         });
 
-        let result = spawn_interactive_shell(&guest);
+        let result = spawn_interactive_command(&guest, remote_command);
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         result
     });
 
-    // Final sync once the shell exits, to catch anything the last
+    // Final sync once the session exits, to catch anything the last
     // periodic tick missed, then a final merge-back so the session's
     // real commit history always makes it into the host repo before
     // teardown reclaims the workspace directory.
     sync_round()?;
     merge_now()?;
 
-    Ok(ShellSessionOutcome {
-        shell_exit_success: shell_result?,
+    Ok(InteractiveSessionOutcome {
+        exit_success: session_result?,
     })
 }
 
@@ -715,12 +741,27 @@ fn wait_for_guest_ssh_with<R: WsCommandRunner>(
     }
 }
 
-/// Opens a real interactive `ssh` session against the guest, with the
-/// operator's own terminal (stdin/stdout/stderr) attached via `-tt`
-/// (force PTY allocation) -- not the captured-`Output` `CommandRunner`
-/// seam every other guest interaction uses, since that seam has no way to
-/// stream a live terminal. Blocks until the operator exits the shell.
-fn spawn_interactive_shell(guest: &GuestEndpoint<'_>) -> Result<bool, RunError> {
+/// Builds the shell-quoted remote command for running a named agent as a
+/// live, PTY-attached console (`run_interactive_session`'s
+/// `remote_command`) -- the agent's own program and args, exactly as it
+/// would be typed locally, with no trailing prompt argument. Reuses
+/// `guest_exec::build_remote_command`, the same quoting
+/// `GuestExecRunner`'s one-shot invocations already rely on, so a space,
+/// quote, or other shell metacharacter in an agent arg is neutralized
+/// identically in both paths.
+pub fn agent_remote_command(agent: &AgentInvocation) -> String {
+    let arg_refs: Vec<&str> = agent.args.iter().map(String::as_str).collect();
+    guest_exec::build_remote_command(&[], &agent.program, &arg_refs)
+}
+
+/// Opens a real interactive `ssh` session against the guest running
+/// `remote_command` (already shell-quoted, e.g. `"$SHELL -l"` or
+/// [`agent_remote_command`]'s output), with the operator's own terminal
+/// (stdin/stdout/stderr) attached via `-tt` (force PTY allocation) -- not
+/// the captured-`Output` `CommandRunner` seam every other guest
+/// interaction uses, since that seam has no way to stream a live
+/// terminal. Blocks until the operator exits.
+fn spawn_interactive_command(guest: &GuestEndpoint<'_>, remote_command: &str) -> Result<bool, RunError> {
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new("ssh");
@@ -728,7 +769,7 @@ fn spawn_interactive_shell(guest: &GuestEndpoint<'_>) -> Result<bool, RunError> 
     cmd.arg("-tt");
     cmd.arg(format!("{}@{}", guest_exec::GUEST_SSH_USER, guest.host));
     cmd.arg(format!(
-        "cd {} && exec $SHELL -l",
+        "cd {} && exec {remote_command}",
         guest_exec::shell_quote(sync::GUEST_WORKSPACE_DIR)
     ));
     cmd.stdin(Stdio::inherit());
@@ -1165,6 +1206,27 @@ mod tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn agent_remote_command_quotes_a_bare_program_with_no_args() {
+        let agent = AgentInvocation {
+            program: "claude-code".to_string(),
+            args: vec![],
+        };
+        assert_eq!(agent_remote_command(&agent), "'claude-code'");
+    }
+
+    #[test]
+    fn agent_remote_command_quotes_args_including_metacharacters() {
+        let agent = AgentInvocation {
+            program: "claude-code".to_string(),
+            args: vec!["--resume".to_string(), "it's a test".to_string()],
+        };
+        assert_eq!(
+            agent_remote_command(&agent),
+            "'claude-code' '--resume' 'it'\\''s a test'"
+        );
     }
 
     #[test]

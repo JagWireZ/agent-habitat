@@ -74,3 +74,30 @@ egress_allowlist_additions:
 # suppressible, non-invariant-critical log entries -- it never disables the
 # boundary audit trail itself.
 audit: enabled
+
+# Whether `habitat run` may seed a missing agent auth/config file under
+# ~/.habitat/agents/<agent>/ (the staging area actually copied into the
+# guest -- see docs/decisions/0011-agent-state-copy-in-out.md) from your
+# real dotfiles already on this host: ~/.claude.json,
+# ~/.claude/.credentials.json, ~/.claude/settings.json,
+# ~/.codex/auth.json, etc.
+#
+# Default: disabled. With this off, habitat never reads your real
+# dotfiles at all -- only ~/.habitat/agents/<agent>/ is ever used. A
+# staging file that doesn't exist yet is simply left missing; the agent
+# creates it fresh in the guest's home directory the first time it needs
+# it (a first login, a first-run settings file), exactly as it would on a
+# brand-new machine. At the end of the session, auth files (OAuth
+# tokens, etc.) are copied back out to ~/.habitat/agents/<agent>/, so the
+# *next* run already has them staged even with this still disabled.
+#
+# Set to enabled to seed any staging file missing on first use from the
+# matching real dotfile instead of leaving the agent to create its own --
+# useful the first time you adopt habitat, so an agent you already use
+# directly on this machine doesn't need to log in or reconfigure again
+# inside the guest. This also seeds config entries (settings.json,
+# CLAUDE.md, custom commands/skills, etc.), which can carry host-specific
+# hooks, MCP servers, or apiKeyHelper scripts into every future guest
+# session -- an explicit, informed trade-off, which is why it defaults to
+# off.
+agent_host_files: disabled

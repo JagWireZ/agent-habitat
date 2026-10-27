@@ -21,7 +21,12 @@ use std::path::Path;
 ///
 /// No `Eq` derive: `resource_limits` holds an `f64`, and `PartialEq` is
 /// enough for every test/caller that compares configs.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// No `Default` derive: `agent_host_files` must default to `Disabled`,
+/// unlike every other `Toggle` field here, so `Default` is implemented by
+/// hand below instead of letting `#[derive]` reach for `Toggle::default()`
+/// (`Enabled`) for it too.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectConfig {
     pub blocklist_additions: Vec<String>,
     pub git_history: GitHistoryConfig,
@@ -35,6 +40,34 @@ pub struct ProjectConfig {
     /// boundary audit trail itself; a handful of invariant-critical event
     /// kinds are always recorded regardless of this toggle.
     pub audit: Toggle,
+    /// Whether `habitat run` may seed a missing
+    /// `~/.habitat/agents/<agent>/...` staging file -- `auth` or `config`
+    /// -- from the operator's real dotfile already on this host
+    /// (`~/.claude.json`, `~/.claude/settings.json`, `~/.codex/auth.json`,
+    /// etc.). Default **disabled**: with this off, `habitat run` only
+    /// ever reads/writes `~/.habitat/agents/<agent>/`, and a missing
+    /// staged file is simply left for the agent to create fresh in the
+    /// guest, as it would on a brand-new machine. Enabling this also
+    /// seeds `config` entries from the host, which can carry
+    /// host-specific hooks, MCP servers, or `apiKeyHelper` scripts into
+    /// every future guest session -- an explicit, informed opt-in
+    /// (`docs/decisions/0011-agent-state-copy-in-out.md`'s deferred
+    /// `import`).
+    pub agent_host_files: Toggle,
+}
+
+impl Default for ProjectConfig {
+    fn default() -> Self {
+        ProjectConfig {
+            blocklist_additions: Vec::new(),
+            git_history: GitHistoryConfig::default(),
+            secrets_scan: SecretsScanConfig::default(),
+            resource_limits: ResourceLimitsConfig::default(),
+            egress_allowlist_additions: Vec::new(),
+            audit: Toggle::default(),
+            agent_host_files: Toggle::Disabled,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +175,12 @@ pub fn parse(contents: &str) -> Result<ProjectConfig, ConfigError> {
             "audit" => {
                 let value = unquote(rest);
                 config.audit = Toggle::parse(&value).map_err(|e| err(format!("audit: {e}")))?;
+                i += 1;
+            }
+            "agent_host_files" => {
+                let value = unquote(rest);
+                config.agent_host_files = Toggle::parse(&value)
+                    .map_err(|e| err(format!("agent_host_files: {e}")))?;
                 i += 1;
             }
             other => {
@@ -516,5 +555,24 @@ mod tests {
     fn audit_rejects_a_non_enabled_disabled_value() {
         let err = parse("audit: sometimes\n").unwrap_err();
         assert!(err.message.contains("audit"));
+    }
+
+    #[test]
+    fn agent_host_files_defaults_to_disabled() {
+        let config = parse("").unwrap();
+        assert!(!config.agent_host_files.is_enabled());
+        assert_eq!(ProjectConfig::default().agent_host_files, Toggle::Disabled);
+    }
+
+    #[test]
+    fn parses_agent_host_files_enabled() {
+        let config = parse("agent_host_files: enabled\n").unwrap();
+        assert!(config.agent_host_files.is_enabled());
+    }
+
+    #[test]
+    fn agent_host_files_rejects_a_non_enabled_disabled_value() {
+        let err = parse("agent_host_files: sometimes\n").unwrap_err();
+        assert!(err.message.contains("agent_host_files"));
     }
 }

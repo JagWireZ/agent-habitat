@@ -15,6 +15,7 @@
 /// install cannot change what ships.
 const MANIFEST_SRC: &str = include_str!("../../../policy/agent_state.txt");
 
+
 /// Which way a file is allowed to move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {

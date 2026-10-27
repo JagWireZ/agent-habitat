@@ -109,6 +109,12 @@ struct State {
 /// their host-side copies live, and the per-agent locks.
 pub struct AgentStateSession {
     agents_root: PathBuf,
+    /// The operator's real `$HOME`, kept only so a missing staging file
+    /// can be seeded from the real dotfile already on this host (see
+    /// [`AgentStateSession::seed_missing_from_host`]). `config` entries
+    /// are only ever read from here when the project config's
+    /// `agent_host_files` toggle is enabled.
+    real_home: PathBuf,
     guest_home: String,
     entries: Vec<Entry>,
     locks: Vec<AgentLock>,
@@ -226,6 +232,27 @@ fn write_private_atomic(dest: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Err(e) = written.and_then(|_| fs::rename(&tmp, dest)) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
+    }
+    Ok(())
+}
+
+/// Recursively copies `src` to `dst` (which must not yet exist) as `0700`
+/// directories and `0600` files, for seeding a brand-new staging `config`
+/// directory from the operator's real host dotfiles. Caller has already
+/// walked `src` with [`validate_tree`], so only directories and regular
+/// files remain -- this never follows a symlink or touches a special
+/// file.
+fn copy_dir_private(src: &Path, dst: &Path) -> io::Result<()> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_private(&from, &to)?;
+        } else {
+            write_private_atomic(&to, &fs::read(&from)?)?;
+        }
     }
     Ok(())
 }
@@ -369,6 +396,7 @@ impl AgentStateSession {
         }
         Ok(AgentStateSession {
             agents_root,
+            real_home: home.to_path_buf(),
             guest_home: guest_home.to_string(),
             entries,
             locks,
@@ -418,6 +446,179 @@ impl AgentStateSession {
             ),
         );
         report.rejected.push((label, reason));
+    }
+
+    /// One-time bootstrap, entirely gated by the project's
+    /// `agent_host_files` config toggle (`enabled`; off by default -- see
+    /// `habitat_policy::config::ProjectConfig::agent_host_files`): when
+    /// `enabled` is false this does nothing at all -- not even for
+    /// `auth` -- so `habitat run` reads nothing outside
+    /// `~/.habitat/agents/` for agent state. When `enabled` is true, for
+    /// every entry (`auth` and `config` alike) this session's lock
+    /// covers, if the staging copy under `~/.habitat/agents/<agent>/`
+    /// does not exist yet, it is seeded from the operator's real dotfile
+    /// at `real_home/<rel_path>` (the same relative path -- `.claude.json`,
+    /// `.claude/settings.json`, `.codex/auth.json`, etc. already live
+    /// there identically on the host). This is the deferred `import`
+    /// from `docs/decisions/0011-agent-state-copy-in-out.md`.
+    ///
+    /// Never overwrites an existing staging file -- once `~/.habitat/
+    /// agents/<agent>/...` has its own copy, that copy (not the operator's
+    /// real dotfile, which may now differ) is the source of truth, same
+    /// as every other `copy_in`. Safe to call every launch: a no-op once
+    /// seeded.
+    pub fn seed_missing_from_host<A: AuditSink>(&self, enabled: bool, audit: &A) -> CopyReport {
+        let mut report = CopyReport::default();
+        if !enabled {
+            return report;
+        }
+        let _guard = self.op_lock.lock().unwrap_or_else(|p| p.into_inner());
+        for entry in &self.entries {
+            if !self.holds_lock(&entry.agent) {
+                continue;
+            }
+            let staged = self.host_path(entry);
+            match fs::symlink_metadata(&staged) {
+                Ok(_) => continue,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    Self::reject(
+                        audit,
+                        &mut report,
+                        "seed",
+                        entry,
+                        format!("cannot inspect staging path: {e}"),
+                    );
+                    continue;
+                }
+            }
+            let real = self.real_home.join(&entry.rel_path);
+            let meta = match fs::symlink_metadata(&real) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    Self::reject(
+                        audit,
+                        &mut report,
+                        "seed",
+                        entry,
+                        format!("cannot inspect real path: {e}"),
+                    );
+                    continue;
+                }
+            };
+            if meta.file_type().is_symlink() {
+                Self::reject(
+                    audit,
+                    &mut report,
+                    "seed",
+                    entry,
+                    "real path is a symlink; refused".to_string(),
+                );
+                continue;
+            }
+            match entry.kind {
+                Kind::File => {
+                    if !meta.is_file() {
+                        Self::reject(
+                            audit,
+                            &mut report,
+                            "seed",
+                            entry,
+                            "real path is not a regular file".to_string(),
+                        );
+                        continue;
+                    }
+                    let limit = match entry.role {
+                        Role::Auth => MAX_AUTH_FILE_BYTES as u64,
+                        Role::Config => MAX_CONFIG_FILE_BYTES,
+                    };
+                    if meta.len() > limit {
+                        Self::reject(
+                            audit,
+                            &mut report,
+                            "seed",
+                            entry,
+                            format!("real file is larger than {limit} bytes"),
+                        );
+                        continue;
+                    }
+                    let bytes = match fs::read(&real) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            Self::reject(
+                                audit,
+                                &mut report,
+                                "seed",
+                                entry,
+                                format!("cannot read real file: {e}"),
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(why) = validate_content(&entry.rel_path, &bytes) {
+                        Self::reject(audit, &mut report, "seed", entry, why);
+                        continue;
+                    }
+                    if let Err(e) = write_private_atomic(&staged, &bytes) {
+                        Self::reject(
+                            audit,
+                            &mut report,
+                            "seed",
+                            entry,
+                            format!("cannot write staging file: {e}"),
+                        );
+                        continue;
+                    }
+                    if entry.role == Role::Auth {
+                        let fp = fingerprint(&bytes);
+                        self.state
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .fingerprints
+                            .insert(Self::label(entry), fp);
+                    }
+                }
+                Kind::Dir => {
+                    if !meta.is_dir() {
+                        Self::reject(
+                            audit,
+                            &mut report,
+                            "seed",
+                            entry,
+                            "real path is not a directory".to_string(),
+                        );
+                        continue;
+                    }
+                    let (mut n, mut total) = (0usize, 0u64);
+                    if let Err(why) = validate_tree(&real, 0, &mut n, &mut total) {
+                        Self::reject(audit, &mut report, "seed", entry, why);
+                        continue;
+                    }
+                    if let Err(e) = copy_dir_private(&real, &staged) {
+                        Self::reject(
+                            audit,
+                            &mut report,
+                            "seed",
+                            entry,
+                            format!("cannot copy directory: {e}"),
+                        );
+                        continue;
+                    }
+                }
+            }
+            audit_event(
+                audit,
+                EventKind::AgentStateCopiedIn,
+                "seed",
+                format!(
+                    "agent={} path={} (seeded staging from real home)",
+                    entry.agent, entry.rel_path
+                ),
+            );
+            report.copied.push(Self::label(entry));
+        }
+        report
     }
 
     /// Copies every entry whose host-side file exists into the guest. A

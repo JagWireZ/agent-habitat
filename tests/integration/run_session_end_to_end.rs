@@ -305,6 +305,113 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
     std::fs::remove_dir_all(&state_dir).unwrap();
 }
 
+#[test]
+fn blank_prompt_lines_are_skipped_without_reaching_the_agent() {
+    let env = passing_install_env();
+    let project_root = temp_dir("project-blank");
+    let state_dir = temp_dir("state-blank");
+    let paths = SessionPaths::new(&state_dir);
+
+    let mut config = ProjectConfig::default();
+    config.secrets_scan.content = Toggle::Disabled;
+
+    write_fake_ssh_keypair(&paths.guest_ssh_key_path());
+
+    let session_id = SessionId::from_name("habitat-run-e2e-session-blank").unwrap();
+    let launch_req = LaunchRequest {
+        session_id: session_id.clone(),
+        workspace_host_dir: paths.staging_dir(),
+        guest_image: "localhost/habitat-guest:alpine".to_string(),
+        resource_limits: config.resource_limits.clone(),
+        egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
+        guest_ssh_public_key: "ssh-ed25519 AAAAtestFakeKey habitat-session".to_string(),
+        guest_ssh_private_key_path: paths.guest_ssh_key_path(),
+    };
+    let run_args_argv = build_run_args(&launch_req);
+    let run_invocation = format!(
+        "podman {}",
+        run_args_argv.iter().map(String::as_str).collect::<Vec<_>>().join(" ")
+    );
+    let key_path_str = paths.guest_ssh_key_path();
+    let keygen_args = [
+        "-t",
+        "ed25519",
+        "-N",
+        "",
+        "-f",
+        key_path_str.to_str().unwrap(),
+        "-C",
+        "habitat-session",
+        "-q",
+    ];
+    let keygen_invocation = format!("ssh-keygen {}", keygen_args.join(" "));
+
+    let vm_runner = VmFakeCommandRunner::default()
+        .with_ok(&keygen_invocation, "")
+        .with_ok(&run_invocation, "containerid123\n")
+        .with_ok(&format!("podman port {session_id} 2222/tcp"), "127.0.0.1:34567\n")
+        .with_ok(&format!("podman rm --force --ignore {session_id}"), "");
+
+    let host_runner = SystemCommandRunner;
+    // Only two of the four lines are real prompts; a real `claude
+    // --print`-style agent would error on an empty argument, so the
+    // blank ones must never reach the guest at all.
+    let guest_runner = ScriptedGuestRunner::new(paths.staging_dir(), 2);
+    let audit = MemoryAuditSink::default();
+
+    let deps = SessionDeps {
+        install_env: &env,
+        vm_runner: &vm_runner,
+        host_runner: &host_runner,
+        guest_runner: &guest_runner,
+        audit: &audit,
+    };
+
+    let prompts = vec![
+        "".to_string(),
+        "what does this project do?".to_string(),
+        "   ".to_string(),
+        "add a test for the new behavior".to_string(),
+    ];
+
+    let summary = run::run_full_session(
+        &deps,
+        session_id,
+        &project_root,
+        &paths,
+        &config,
+        "localhost/habitat-guest:alpine",
+        "127.0.0.1:8443".parse().unwrap(),
+        None,
+        &AgentInvocation {
+            program: "fake-agent".to_string(),
+            args: vec![],
+        },
+        prompts,
+        |_| {},
+    )
+    .expect("blank lines must not fail the session");
+
+    assert_eq!(
+        summary.rounds.len(),
+        2,
+        "the two blank/whitespace-only lines must not produce a round at all"
+    );
+    let agent_calls = guest_runner
+        .invocations
+        .borrow()
+        .iter()
+        .filter(|inv| inv.contains("'fake-agent'"))
+        .count();
+    assert_eq!(
+        agent_calls, 2,
+        "the agent must only run for the two real prompts, never for a blank line"
+    );
+
+    std::fs::remove_dir_all(&project_root).unwrap();
+    std::fs::remove_dir_all(&state_dir).unwrap();
+}
+
 /// Plays the guest for the agent-state wiring test: the agent's own `ssh`
 /// invocation "refreshes the Codex token" inside the fake guest's
 /// filesystem (as a real agent would mid-run), and every other invocation

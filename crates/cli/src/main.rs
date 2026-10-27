@@ -26,6 +26,7 @@ use habitat_install::{
     run_preflight, CheckId, CheckStatus, InstallAttempt, PackageFamily, SystemEnvironment,
 };
 use output::style;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -129,18 +130,22 @@ Runs preflight checks, builds a disposable copy of the current project onto a \
 sandbox disk, and launches it in an isolated VM. With no agent named, drops you into \
 an interactive shell inside the sandbox -- your changes sync in before the shell \
 opens, periodically while it's open, and once more when you exit it. With an agent \
-named, reads prompts from stdin one at a time instead: each prompt is synced into the \
-sandbox, run through the named agent once, and its results synced back out to your \
-real project as a patch. Type 'exit' or 'quit' (or send EOF) to end a prompt session, \
-or exit the shell to end a shell session -- the sandbox, its egress firewall, and the \
-VM are torn down automatically either way.\n\
+named and a real terminal attached, opens that agent as a live, interactive console \
+inside the sandbox instead -- the same periodic sync as the shell case, just running \
+the agent itself rather than a shell. With an agent named and stdin piped in instead \
+(e.g. from a script), reads prompts from stdin one at a time: each prompt is synced \
+into the sandbox, run through the named agent once, and its results synced back out \
+to your real project as a patch. Type 'exit' or 'quit' (or send EOF) to end a piped \
+prompt session, or exit the shell/agent console to end an interactive session -- the \
+sandbox, its egress firewall, and the VM are torn down automatically either way.\n\
 \n\
 USAGE:\n\
     habitat run [--config <path>] [-v|--verbose] [<agent> [agent-args...]]\n\
 \n\
 <agent> is one of: claude, codex, opencode -- or `-- <command> [args...]` to run any \
-other agent binary that supports a one-shot, single-prompt invocation mode. Omit it \
-entirely for an interactive shell.\n\
+other agent binary. With a real terminal attached it's run directly as a live \
+console; with stdin piped in it must support a one-shot, single-prompt invocation \
+mode instead. Omit <agent> entirely for an interactive shell.\n\
 \n\
 OPTIONS:\n\
     --config <path>   Path to the project's config file (default: sandbox.yaml)\n\
@@ -610,6 +615,12 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
             None
         }
     };
+    let seed_report = run::agent_state_seed_missing_from_host(
+        agent_state.as_ref(),
+        config.agent_host_files.is_enabled(),
+        &audit,
+    );
+    print_agent_state_rejections("seed", &seed_report);
     let launch_req = run::launch_request(
         session_id.clone(),
         &paths,
@@ -670,7 +681,28 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
                 "{}",
                 s.green_bold("Session ready. Opening a shell in your sandbox -- exit it to end the session.")
             );
-            run::run_shell_session(
+            run::run_interactive_session(
+                "$SHELL -l",
+                &project_root,
+                &paths,
+                guest,
+                &patterns,
+                agent_state.as_ref(),
+                &ws_runner,
+                &audit,
+            )
+            .map(|_| ())
+        }
+        run::RunMode::Agent(agent) if std::io::stdin().is_terminal() => {
+            println!(
+                "{}",
+                s.green_bold(&format!(
+                    "Session ready. Opening {} in your sandbox -- exit it to end the session.",
+                    agent.program
+                ))
+            );
+            run::run_interactive_session(
+                &run::agent_remote_command(agent),
                 &project_root,
                 &paths,
                 guest,

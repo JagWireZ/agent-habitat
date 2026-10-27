@@ -128,3 +128,47 @@ driver.
   audit log (`EgressDenied`, already emitted per-connection since Phase
   5), same as any other boundary event -- there is no additional
   operator-facing pop-up wired into the prompt loop for this.
+
+## Addendum (2026-10-27) -- a live console for the interactive-terminal case
+
+The decision above is unchanged and still governs every piped/scripted
+invocation (`echo "prompt" | habitat run claude`, CI, any non-interactive
+caller). What changed: a named agent run directly at a real terminal, with
+no prompt piped in, no longer goes through this discrete per-line loop at
+all -- it gets a genuinely interactive console instead, because an
+operator sitting at the terminal expects the same live, streaming REPL
+they'd get running `claude`/`codex`/`opencode` locally, not a silent pause
+per turn with no live output (one of this ADR's own recorded limitations,
+above).
+
+This does not revisit the PTY-attached-passthrough option rejected above,
+and does not require solving the "detect an opaque CLI's turn boundary"
+problem this ADR correctly identified as intractable: `habitat run` with
+no agent named already has an accepted, working precedent for exactly
+this shape of interactivity -- the interactive shell session (originally
+`run_shell_session`, generalized to `run_interactive_session` in
+`crates/cli/src/run.rs`). It opens a real `ssh -tt` session with the
+operator's terminal attached and fills the gap between the one sync
+before it opens and the one sync after it exits with a periodic
+*discrete* sync round (`SHELL_SYNC_INTERVAL`), never a persistent file
+channel -- the PTY carries only terminal I/O, exactly the "accepted,
+deliberate narrowing" AGENTS.md invariant 1 already describes for that
+case. Running a named agent's own program (built by
+`run::agent_remote_command`, reusing `guest_exec::build_remote_command`'s
+existing quoting) through that same mechanism, instead of `$SHELL -l`,
+introduces no new channel and no new invariant-1 exposure -- it is the
+identical mechanism, just given a different remote command to run.
+
+**Mode selection:** `std::io::stdin().is_terminal()` at the moment
+`habitat run <agent>` starts its session. A real terminal -> the
+interactive console above. Piped/redirected stdin -> this ADR's discrete
+per-line loop, unchanged. No new flag: this matches how `claude` itself
+already decides interactive-vs-`--print` locally, so a script that wants
+the old scripted behavior keeps piping input exactly as it does today.
+
+**Consequence:** the "no live streaming" and "must support a one-shot,
+single-prompt invocation mode" limitations recorded above now apply only
+to the piped/scripted path. An agent that only offers a persistent
+interactive REPL -- called out above as unsupported -- is fully supported
+in the interactive-terminal case, since that is now exactly what gets
+run.
