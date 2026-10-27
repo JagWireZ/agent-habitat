@@ -19,8 +19,10 @@ implements, and `docs/plan.md` for what each domain is responsible for.
 |   |-- audit/              # habitat-audit -- unified boundary audit log
 |   `-- policy/             # habitat-policy -- shared config/policy schema types + loader (code)
 |-- policy/                 # shared policy DATA: default blocklist, default egress allowlist,
-|                            # resource-limit defaults. Read by both crates/workspace and
-|                            # crates/egress via crates/policy -- never duplicated per-domain.
+|                            # agent state manifest (agent_state.txt: which agent auth/config
+|                            # files may cross the boundary, and which way), resource-limit
+|                            # defaults. Read by crates/workspace, crates/egress, and others via
+|                            # crates/policy -- never duplicated per-domain.
 |-- guest/                  # the guest image: Containerfile + build.sh, producing
 |                            # localhost/habitat-guest:alpine (docs/decisions/
 |                            # 0002-guest-os-layer.md). Not owned by any one crate --

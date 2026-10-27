@@ -9,6 +9,10 @@ description = "Secrets blocklist, disk-build pipeline, and two-point host/sandbo
 habitat-policy = { path = "../policy" }
 habitat-vm = { path = "../vm" }
 habitat-audit = { path = "../audit" }
+# Used only to validate JSON auth files coming back from the guest during
+# agent-state copy-out (src/agent_state.rs). The audit crate deliberately
+# stays dependency-free and still hand-escapes its own log output.
+serde_json = "1"
 
 # `habitat-install` and `habitat-egress` only as dev-dependencies, for
 # tests/integration/audit_end_to_end.rs below, which drives all four
@@ -57,3 +61,11 @@ path = "../../tests/adversarial/sync_patch_validation.rs"
 [[test]]
 name = "audit_end_to_end"
 path = "../../tests/integration/audit_end_to_end.rs"
+
+[[test]]
+name = "agent_state_exit_gate"
+path = "../../tests/unit/workspace/agent_state_exit_gate.rs"
+
+[[test]]
+name = "agent_state_copy_out"
+path = "../../tests/adversarial/agent_state_copy_out.rs"

@@ -19,7 +19,15 @@
 //! flagged-for-review path in [`sync`]'s validation gate rather than
 //! silently updating the governing snapshot -- see
 //! `docs/decisions/0007-content-secrets-scan-snapshot.md`.
+//!
+//! [`agent_state`] copies each agent's auth and config files into the
+//! guest at launch and its auth files back out during and after the
+//! session, over the same per-session SSH channel [`guest_exec`] provides
+//! -- never a bind mount. What may move, and in which direction, is the
+//! manifest in `habitat_policy::agent_state`; see
+//! `docs/decisions/0011-agent-state-copy-in-out.md`.
 
+pub mod agent_state;
 pub mod command_runner;
 pub mod content_scan;
 pub mod gitseed;

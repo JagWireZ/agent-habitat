@@ -13,10 +13,11 @@
 //! - Resource-limit enforcement (CPU/memory caps) is read from
 //!   `habitat_policy::resource_limits` and applied in
 //!   [`launcher::build_run_args`].
-//! - The disposable staging directory is always bind-mounted at
-//!   `/workspace`, alongside any persistent agent-auth bind mounts
-//!   ([`session::AuthMount`], resolved from `~/.habitat/`) -- never
-//!   `project_root` itself, or any other arbitrary host path.
+//! - The disposable staging directory is the one and only bind mount,
+//!   at `/workspace` -- never `project_root` itself, or any other
+//!   arbitrary host path. Agent auth/config state is not mounted: it is
+//!   copied in and out over the per-session SSH channel
+//!   (`habitat_workspace::agent_state`).
 //!
 //! **Not covered here:** actually booting against real KVM --
 //! `tests/manual/validate-vm-launch.sh` does that, since this dev

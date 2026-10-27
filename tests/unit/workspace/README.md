@@ -23,3 +23,16 @@ project's own `betterleaks.toml`, and a real (stub) `betterleaks` on
 `PATH` blocks exactly the file carrying a finding. A project ruleset
 attempting to weaken or disable detection is covered adversarially
 instead, in `tests/adversarial/content_scan_ruleset_tamper.rs`.
+
+`agent_state_exit_gate.rs` holds the contract tests for agent auth/config
+copying (`habitat_workspace::agent_state`, `docs/decisions/
+0011-agent-state-copy-in-out.md`): auth files go in and come back out,
+config files go in only, a named-agent session only ever receives that
+agent's files, an unchanged file is not rewritten or re-logged, a missing
+guest file never deletes the host copy, a second concurrent session never
+copies out, host directories are created `0700`, and audit records carry
+paths and fingerprints but never contents. The guest is a `FakeGuest`
+backed by a real temporary directory, so the filesystem logic runs for
+real; the real `ssh`/`scp` round trip is `tests/manual/
+validate-agent-state.md`. Hostile-guest cases live in
+`tests/adversarial/agent_state_copy_out.rs`.

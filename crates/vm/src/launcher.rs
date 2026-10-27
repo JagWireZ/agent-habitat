@@ -20,11 +20,9 @@
 //! launch via [`guest_ssh_port`].
 
 use crate::command_runner::CommandRunner;
-use crate::session::{AuthMount, LaunchRequest, LaunchedSession};
+use crate::session::{LaunchRequest, LaunchedSession};
 use habitat_audit::{AuditEvent, AuditSink, EventKind};
 use std::fmt;
-use std::io;
-use std::path::Path;
 
 /// Path to the `krun` binary invoked as podman's `--runtime`. Not
 /// `crun-krun` -- see `crates/install/src/checks.rs::krun_runtime` for
@@ -36,8 +34,9 @@ pub const GUEST_WORKSPACE_MOUNT: &str = "/workspace";
 
 /// The guest's non-root user's home directory, matching `guest/
 /// Containerfile`'s `adduser -D -s /bin/sh habitat` (which leaves the
-/// default `/home/habitat`). Used to build [`crate::session::AuthMount`]
-/// guest-side paths.
+/// default `/home/habitat`). Used to build the guest-side destination
+/// paths for agent auth/config state copied in over SSH
+/// (`habitat_workspace::agent_state`).
 pub const GUEST_HOME_DIR: &str = "/home/habitat";
 
 /// Env var carrying the guest's per-session authorized SSH public key
@@ -61,10 +60,6 @@ pub const GUEST_SSH_HOST: &str = "127.0.0.1";
 /// (Z), since exactly one container mounts it. No-op where SELinux is off.
 const WORKSPACE_MOUNT_OPTS: &str = "Z";
 
-/// SELinux relabel option for persistent auth mounts: shared (z), since they
-/// outlive a session and concurrent sessions may mount the same host path.
-const AUTH_MOUNT_OPTS: &str = "z";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchError {
     pub message: String,
@@ -87,15 +82,15 @@ fn err(message: impl Into<String>) -> LaunchError {
 /// Builds the argv for `podman run ...` from a [`LaunchRequest`] -- pure,
 /// no side effects, fully testable without Podman/krun/KVM present.
 ///
-/// The workspace bind mount, `request.workspace_host_dir` (the
-/// disposable, git-seeded staging copy) at [`GUEST_WORKSPACE_MOUNT`], is
-/// always first. `request.auth_mounts` (persistent, operator-owned agent
-/// auth state -- see [`crate::session::AuthMount`]) follow it, one `-v`
-/// flag each, in the order given. `project_root` itself, or any other
-/// arbitrary host path outside those two sources, is never passed to
-/// `podman run` as a bind-mount source -- the two sync moments
+/// Exactly one bind mount is ever emitted: `request.workspace_host_dir`
+/// (the disposable, git-seeded staging copy) at [`GUEST_WORKSPACE_MOUNT`].
+/// `project_root` itself, or any other arbitrary host path, is never
+/// passed to `podman run` as a bind-mount source -- the two sync moments
 /// (`habitat_workspace::sync`) remain the only path for project changes
-/// to reach or leave the real project directory. No host-privilege-
+/// to reach or leave the real project directory. Agent auth/config state
+/// is deliberately *not* a bind mount either: it is copied file by file
+/// over the per-session SSH channel (`habitat_workspace::agent_state`,
+/// `docs/decisions/0011-agent-state-copy-in-out.md`). No host-privilege-
 /// widening flag (`--privileged`, `--cap-add`, `--pid=host`,
 /// `--network=host`) is ever included either -- the containment boundary
 /// is the VM itself. `tests/adversarial/containment_escape.rs` pins both
@@ -129,14 +124,6 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
             request.workspace_host_dir.display()
         ),
     ]);
-    for mount in &request.auth_mounts {
-        args.push("-v".to_string());
-        args.push(format!(
-            "{}:{}:{AUTH_MOUNT_OPTS}",
-            mount.host_path.display(),
-            mount.guest_path
-        ));
-    }
     args.extend([
         "--env".to_string(),
         format!("{AUTHORIZED_KEY_ENV}={}", request.guest_ssh_public_key),
@@ -147,79 +134,6 @@ pub fn build_run_args(request: &LaunchRequest) -> Vec<String> {
         request.guest_image.clone(),
     ]);
     args
-}
-
-/// Ensures every auth mount's host-side source exists before `podman run`,
-/// so first-time users (and agents with no prior login: claude, codex,
-/// opencode) don't get podman's default of creating a missing source as a
-/// root-owned directory. A guest path ending in `.json` is treated as a
-/// file (created as `{}`, mode 0600); anything else is a directory (mode
-/// 0700). Existing paths are never modified. Fails closed on a wrong
-/// type, a symlink, a relative path, or any I/O error.
-fn ensure_auth_mount_sources(mounts: &[AuthMount]) -> Result<(), LaunchError> {
-    for mount in mounts {
-        let path = &mount.host_path;
-        if !path.is_absolute() {
-            return Err(err(format!(
-                "auth mount host path {} is not absolute",
-                path.display()
-            )));
-        }
-        let is_file = Path::new(&mount.guest_path)
-            .extension()
-            .is_some_and(|ext| ext == "json");
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) => {
-                let ok = if is_file { meta.is_file() } else { meta.is_dir() };
-                if !ok {
-                    return Err(err(format!(
-                        "auth mount source {} exists but is not a regular {} (symlinks are refused)",
-                        path.display(),
-                        if is_file { "file" } else { "directory" }
-                    )));
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                create_auth_source(path, is_file).map_err(|ce| {
-                    err(format!(
-                        "could not create auth mount source {}: {ce}",
-                        path.display()
-                    ))
-                })?;
-            }
-            Err(e) => {
-                return Err(err(format!(
-                    "could not inspect auth mount source {}: {e}",
-                    path.display()
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-fn create_auth_source(path: &Path, is_file: bool) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    if is_file {
-        if let Some(parent) = path.parent() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)?;
-        }
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(b"{}\n")
-    } else {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)
-    }
 }
 
 /// Launches one session: runs `podman run` (detached), resolves the
@@ -242,8 +156,6 @@ pub fn launch<R: CommandRunner>(
             request.session_id, request.guest_image
         ),
     ));
-
-    ensure_auth_mount_sources(&request.auth_mounts)?;
 
     let args = build_run_args(request);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -371,7 +283,6 @@ mod tests {
             egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
             guest_ssh_public_key: "ssh-ed25519 AAAAtest habitat-session".to_string(),
             guest_ssh_private_key_path: PathBuf::from("/tmp/habitat-test-session-key"),
-            auth_mounts: Vec::new(),
         }
     }
 
@@ -451,45 +362,13 @@ mod tests {
     }
 
     #[test]
-    fn build_run_args_bind_mounts_only_the_workspace_host_dir_when_no_auth_mounts_are_given() {
+    fn build_run_args_bind_mounts_only_the_workspace_host_dir() {
         let args = build_run_args(&sample_request());
         let v_flags: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "-v").map(|(i, _)| i).collect();
         assert_eq!(v_flags.len(), 1, "exactly one -v flag must be present, got {args:?}");
         assert!(!args
             .iter()
             .any(|a| a.starts_with("--mount") || a.contains("type=bind")));
-    }
-
-    #[test]
-    fn build_run_args_bind_mounts_each_auth_mount_after_the_workspace_mount() {
-        use crate::session::AuthMount;
-        let mut request = sample_request();
-        request.auth_mounts = vec![
-            AuthMount {
-                host_path: PathBuf::from("/home/op/.habitat/claude"),
-                guest_path: "/home/habitat/.claude".to_string(),
-            },
-            AuthMount {
-                host_path: PathBuf::from("/home/op/.habitat/claude.json"),
-                guest_path: "/home/habitat/.claude.json".to_string(),
-            },
-        ];
-        let args = build_run_args(&request);
-
-        let v_flags: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "-v").map(|(i, _)| i).collect();
-        assert_eq!(v_flags.len(), 3, "workspace mount plus two auth mounts, got {args:?}");
-        assert!(!args
-            .iter()
-            .any(|a| a.starts_with("--mount") || a.contains("type=bind")));
-
-        assert_eq!(
-            args[v_flags[1] + 1],
-            "/home/op/.habitat/claude:/home/habitat/.claude:z"
-        );
-        assert_eq!(
-            args[v_flags[2] + 1],
-            "/home/op/.habitat/claude.json:/home/habitat/.claude.json:z"
-        );
     }
 
     #[test]
@@ -659,67 +538,5 @@ mod tests {
         let audit = MemoryAuditSink::default();
         let err = teardown(&session, &runner, &audit).unwrap_err();
         assert!(err.message.contains("non-zero"));
-    }
-
-    fn unique_tmp(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "habitat-vm-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ))
-    }
-
-    #[test]
-    fn ensure_auth_mount_sources_creates_missing_dirs_and_json_files_privately() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = unique_tmp("auth-create");
-        let mounts = vec![
-            AuthMount {
-                host_path: root.join("claude"),
-                guest_path: "/home/habitat/.claude".to_string(),
-            },
-            AuthMount {
-                host_path: root.join("claude.json"),
-                guest_path: "/home/habitat/.claude.json".to_string(),
-            },
-            AuthMount {
-                host_path: root.join("codex"),
-                guest_path: "/home/habitat/.codex".to_string(),
-            },
-        ];
-        ensure_auth_mount_sources(&mounts).unwrap();
-        let mode = |p: PathBuf| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert!(root.join("claude").is_dir());
-        assert_eq!(mode(root.join("claude")), 0o700);
-        assert!(root.join("codex").is_dir());
-        assert!(root.join("claude.json").is_file());
-        assert_eq!(mode(root.join("claude.json")), 0o600);
-        assert_eq!(std::fs::read_to_string(root.join("claude.json")).unwrap(), "{}\n");
-
-        // Idempotent, and never clobbers existing content.
-        std::fs::write(root.join("claude.json"), b"{\"token\":1}").unwrap();
-        ensure_auth_mount_sources(&mounts).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("claude.json")).unwrap(), "{\"token\":1}");
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn ensure_auth_mount_sources_refuses_wrong_type_and_relative_paths() {
-        let root = unique_tmp("auth-refuse");
-        std::fs::create_dir_all(root.join("claude.json")).unwrap(); // dir where file expected
-        let wrong_type = vec![AuthMount {
-            host_path: root.join("claude.json"),
-            guest_path: "/home/habitat/.claude.json".to_string(),
-        }];
-        assert!(ensure_auth_mount_sources(&wrong_type).is_err());
-        let relative = vec![AuthMount {
-            host_path: PathBuf::from("relative/dir"),
-            guest_path: "/home/habitat/.codex".to_string(),
-        }];
-        assert!(ensure_auth_mount_sources(&relative).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 }

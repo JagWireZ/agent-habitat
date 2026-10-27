@@ -40,7 +40,8 @@ Date: YYYY-MM-DD
 - [ ] Podman version in use, and whether a newer stable release exists
 - [ ] crun-krun / libkrun version in use
 - [ ] passt version in use
-- [ ] Rust toolchain / crate dependency audit (e.g. `cargo audit` output)
+- [ ] Rust toolchain / crate dependency audit (e.g. `cargo audit` output),
+      including `serde_json` (added for agent-state copy-out validation)
 - [ ] Any dependency with a known CVE since the last pass, and its status
 
 #### 2. Allowlist / blocklist change log
@@ -49,6 +50,9 @@ Date: YYYY-MM-DD
       justification
 - [ ] Every secrets-blocklist change merged since the last pass, with
       justification
+- [ ] Every change to `policy/agent_state.txt` merged since the last pass
+      (new paths, any `config` entry turned `auth`, any new agent), with
+      justification (`docs/decisions/0011-agent-state-copy-in-out.md`)
 - [ ] Every git-history-toggle flip (default-off -> on) approved for a
       project since the last pass, with its logged approval entry linked
       (AGENTS.md Section 8 requires this to be logged *before* it takes
@@ -60,7 +64,11 @@ Date: YYYY-MM-DD
 - [ ] Resource-limit defaults (CPU/memory/disk caps) still reflect intended
       limits, no drift from ad-hoc per-session overrides
 - [ ] No new live/continuous file-share or bridging mechanism has crept in
-      (Section 2 invariant #1)
+      (Section 2 invariant #1), and `build_run_args` still emits exactly one
+      `-v` (the workspace staging directory) -- agent auth/config is copied,
+      never mounted
+- [ ] Every `config` entry in `policy/agent_state.txt` is still copy-in only
+      and no `auth` entry names a directory
 - [ ] No config path has been added that can disable containment,
       blocklist enforcement, or patch validation (Section 2 invariant /
       Phase 7 exit gate)

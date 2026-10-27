@@ -586,17 +586,13 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
             }
         };
     let session_id = habitat_vm::session::SessionId::generate();
-    // Persistent, operator-owned agent auth (`~/.habitat/...`), not
-    // this session's disposable workspace copy -- see
-    // `run::known_auth_mounts`'s own doc comment. Empty, not an error,
-    // when `$HOME` can't be read or nothing's been set up there yet.
-    //
-    // Before resolving the mounts, make sure this invocation's own
-    // `~/.habitat/...` entries exist (`run::ensure_auth_entries_exist`)
-    // -- otherwise a brand-new installation's very first login would have
-    // nowhere to persist to, since `known_auth_mounts` only mounts paths
-    // that already exist. Also drop a breadcrumb in `~/.habitat/logs/`
-    // (`run::log_habitat_event`) so the folder explains its own presence.
+    // Agent auth/config state (`~/.habitat/agents/<agent>/...`) is copied
+    // into the guest after boot and its auth files copied back out
+    // before teardown -- never bind-mounted
+    // (`docs/decisions/0011-agent-state-copy-in-out.md`). Opening it here
+    // takes this session's per-agent locks and creates the private host
+    // directories. A failure is reported but never fatal: the agent just
+    // runs unauthenticated, as it would on a brand-new installation.
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     if let Some(home) = &home {
         let invocation = match &run_args.mode {
@@ -604,13 +600,16 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
             run::RunMode::Agent(agent) => format!("ran habitat run -- {}", agent.program),
         };
         run::log_habitat_event(home, &invocation);
-        if let run::RunMode::Agent(agent) = &run_args.mode {
-            let _ = run::ensure_auth_entries_exist(home, &agent.program);
-        }
     }
-    let auth_mounts = home
-        .map(|home| run::known_auth_mounts(&home))
-        .unwrap_or_default();
+    let agent_state = match run::open_agent_state(home.as_deref(), &run_args.mode) {
+        Ok(state) => state,
+        Err(e) => {
+            eprintln!(
+                "habitat run: could not set up agent auth/config state, continuing without it: {e}"
+            );
+            None
+        }
+    };
     let launch_req = run::launch_request(
         session_id.clone(),
         &paths,
@@ -619,7 +618,6 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
         proxy_addr,
         keypair.public_key,
         keypair.private_key_path.clone(),
-        auth_mounts,
     );
 
     let launched = match habitat_vm::launcher::launch(&launch_req, &vm_runner, &audit) {
@@ -663,6 +661,9 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let copy_in_report = run::agent_state_copy_in(agent_state.as_ref(), guest, &ws_runner, &audit);
+    print_agent_state_rejections("copy in", &copy_in_report);
+
     let session_result: Result<(), run::RunError> = match &run_args.mode {
         run::RunMode::Shell => {
             println!(
@@ -674,6 +675,7 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
                 &paths,
                 guest,
                 &patterns,
+                agent_state.as_ref(),
                 &ws_runner,
                 &audit,
             )
@@ -691,6 +693,7 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
                 guest,
                 &patterns,
                 agent,
+                agent_state.as_ref(),
                 &ws_runner,
                 &ws_runner,
                 &audit,
@@ -706,6 +709,15 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
         }
     };
 
+    // Final auth copy-out while the guest is still up, however the session
+    // ended -- a token refreshed in the last moments, or a first login
+    // done inside this session, must not be lost to a failed sync or an
+    // agent that exited non-zero.
+    let copy_out_report =
+        run::agent_state_copy_out(agent_state.as_ref(), guest, &ws_runner, &audit);
+    print_agent_state_rejections("copy out", &copy_out_report);
+    drop(agent_state);
+
     let _ = run::remove_egress_firewall_in_container(&vm_runner, session_id.as_str());
     let teardown_result = habitat_vm::launcher::teardown(&launched, &vm_runner, &audit);
 
@@ -720,6 +732,16 @@ fn cmd_run(verbose: bool, rest: &[String]) -> ExitCode {
     }
     println!("{}", s.green_bold("Session ended."));
     ExitCode::SUCCESS
+}
+
+/// Tells the operator when agent auth/config files were refused or failed
+/// to copy, in one line per file. Silent when everything went through. The
+/// same events are already in the audit log; this only makes a missing
+/// login visible at the moment it happens.
+fn print_agent_state_rejections(phase: &str, report: &habitat_workspace::agent_state::CopyReport) {
+    for (label, reason) in &report.rejected {
+        eprintln!("habitat run: agent state {phase}: {label}: {reason}");
+    }
 }
 
 /// Points at the audit log for full technical detail; nudges towards

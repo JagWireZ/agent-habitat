@@ -35,3 +35,7 @@ current, standalone decision for its layer.
   real hardware, and by upstream); the guest exec channel is per-session
   SSH over the same `passt` network Phase 5 already requires, not a
   custom protocol and not a revisit of `0003`'s runtime choice.
+- [`0011-agent-state-copy-in-out.md`](0011-agent-state-copy-in-out.md) --
+  agent auth and config files persist across sessions by being copied into
+  the guest at launch and (auth files only) back out over the per-session
+  SSH channel, from a fixed manifest, scoped per agent -- not bind-mounted.

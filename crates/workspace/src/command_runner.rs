@@ -27,8 +27,12 @@ pub trait CommandRunner {
     /// implementation must decide explicitly whether it honors `env`
     /// (e.g. `GIT_CEILING_DIRECTORIES`, see `crate::patch::git_apply_ceiling`)
     /// rather than silently ignoring it.
-    fn run_with_env(&self, env: &[(&str, &str)], program: &str, args: &[&str])
-        -> io::Result<Output>;
+    fn run_with_env(
+        &self,
+        env: &[(&str, &str)],
+        program: &str,
+        args: &[&str],
+    ) -> io::Result<Output>;
 }
 
 /// The real, unmocked runner.
@@ -146,6 +150,248 @@ pub mod testing {
                     io::ErrorKind::NotFound,
                     format!("fake: command not configured: {key}"),
                 )),
+            }
+        }
+    }
+
+    /// A `CommandRunner` that plays the part of one booted guest, backed
+    /// by a real temporary directory standing in for the guest's
+    /// filesystem root (guest path `/home/habitat/x` is
+    /// `<root>/home/habitat/x`). It understands exactly the `ssh`/`scp`
+    /// invocations `GuestExecRunner` builds for agent-state copying:
+    /// `mkdir -p`, `chmod`, `head -c N -- <path>`, `scp <file>`, and
+    /// `scp -r <dir>`. Anything else is an error, so a test fails loudly
+    /// if the code starts issuing a command nobody modelled. `Sync`, so it
+    /// also serves the threaded shell-session path.
+    pub struct FakeGuest {
+        root: std::path::PathBuf,
+        pub invocations: std::sync::Mutex<Vec<String>>,
+        /// When set, every call exits 255 -- the exit code `ssh` itself
+        /// uses for a transport failure.
+        pub transport_down: std::sync::atomic::AtomicBool,
+    }
+
+    impl FakeGuest {
+        pub fn new(root: impl Into<std::path::PathBuf>) -> Self {
+            let root = root.into();
+            std::fs::create_dir_all(&root).expect("fake guest root");
+            FakeGuest {
+                root,
+                invocations: std::sync::Mutex::new(Vec::new()),
+                transport_down: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// Where a guest-absolute path really lives on the test host.
+        pub fn path(&self, guest_path: &str) -> std::path::PathBuf {
+            self.root.join(guest_path.trim_start_matches('/'))
+        }
+
+        pub fn write(&self, guest_path: &str, contents: &[u8]) {
+            let p = self.path(guest_path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, contents).unwrap();
+        }
+
+        pub fn read(&self, guest_path: &str) -> Option<Vec<u8>> {
+            std::fs::read(self.path(guest_path)).ok()
+        }
+
+        pub fn exists(&self, guest_path: &str) -> bool {
+            self.path(guest_path).exists()
+        }
+
+        fn out(code: i32, stdout: Vec<u8>, stderr: &str) -> Output {
+            Output {
+                status: ExitStatus::from_raw(code << 8),
+                stdout,
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        }
+
+        /// Splits a remote command string the way the guest's shell
+        /// would for the single-quote style `shell_quote` emits.
+        fn unquote(cmd: &str) -> Vec<String> {
+            let mut tokens = Vec::new();
+            let mut cur = String::new();
+            let mut in_token = false;
+            let mut in_quote = false;
+            let mut chars = cmd.chars().peekable();
+            while let Some(c) = chars.next() {
+                if in_quote {
+                    if c == '\'' {
+                        in_quote = false;
+                    } else {
+                        cur.push(c);
+                    }
+                } else if c == '\'' {
+                    in_quote = true;
+                    in_token = true;
+                } else if c == '\\' {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                        in_token = true;
+                    }
+                } else if c == ' ' {
+                    if in_token {
+                        tokens.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                } else {
+                    cur.push(c);
+                    in_token = true;
+                }
+            }
+            if in_token {
+                tokens.push(cur);
+            }
+            tokens
+        }
+
+        fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> io::Result<()> {
+            if src.is_dir() {
+                std::fs::create_dir_all(dst)?;
+                for e in std::fs::read_dir(src)? {
+                    let e = e?;
+                    Self::copy_tree(&e.path(), &dst.join(e.file_name()))?;
+                }
+                Ok(())
+            } else {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(src, dst).map(|_| ())
+            }
+        }
+
+        fn run_ssh(&self, args: &[&str]) -> io::Result<Output> {
+            let Some(idx) = args.iter().position(|a| a.starts_with("habitat@")) else {
+                return Err(io::Error::other(
+                    "fake guest: ssh without a habitat@ target",
+                ));
+            };
+            let remote = args.get(idx + 1).copied().unwrap_or("");
+            let argv = Self::unquote(remote);
+            let Some((prog, rest)) = argv.split_first() else {
+                return Ok(Self::out(0, Vec::new(), ""));
+            };
+            match prog.as_str() {
+                "true" => Ok(Self::out(0, Vec::new(), "")),
+                "mkdir" => {
+                    for a in rest.iter().filter(|a| !a.starts_with('-')) {
+                        std::fs::create_dir_all(self.path(a))?;
+                    }
+                    Ok(Self::out(0, Vec::new(), ""))
+                }
+                "chmod" => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let Some((mode, files)) = rest.split_first() else {
+                        return Ok(Self::out(1, Vec::new(), "chmod: missing operand"));
+                    };
+                    let mode = u32::from_str_radix(mode, 8).unwrap_or(0o600);
+                    for f in files {
+                        let p = self.path(f);
+                        if p.exists() {
+                            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))?;
+                        }
+                    }
+                    Ok(Self::out(0, Vec::new(), ""))
+                }
+                "head" => {
+                    // head -c N -- <path>
+                    let n: usize = rest
+                        .iter()
+                        .position(|a| a == "-c")
+                        .and_then(|i| rest.get(i + 1))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(usize::MAX);
+                    let Some(path) = rest.last() else {
+                        return Ok(Self::out(1, Vec::new(), "head: missing file"));
+                    };
+                    match std::fs::read(self.path(path)) {
+                        Ok(mut bytes) => {
+                            bytes.truncate(n);
+                            Ok(Self::out(0, bytes, ""))
+                        }
+                        Err(_) => Ok(Self::out(
+                            1,
+                            Vec::new(),
+                            "head: can't open: No such file or directory",
+                        )),
+                    }
+                }
+                other => Err(io::Error::other(format!(
+                    "fake guest: unmodelled remote command {other:?}"
+                ))),
+            }
+        }
+
+        fn run_scp(&self, args: &[&str]) -> io::Result<Output> {
+            let recursive = args.contains(&"-r");
+            let n = args.len();
+            if n < 2 {
+                return Err(io::Error::other(
+                    "fake guest: scp needs a source and target",
+                ));
+            }
+            let (src, target) = (args[n - 2], args[n - 1]);
+            let Some((_, guest_path)) = target.split_once(':') else {
+                return Err(io::Error::other("fake guest: scp target has no host:path"));
+            };
+            let src = std::path::Path::new(src);
+            let mut dst = self.path(guest_path);
+            if recursive {
+                if !src.is_dir() {
+                    return Ok(Self::out(1, Vec::new(), "scp: not a directory"));
+                }
+                if !dst.is_dir() {
+                    return Ok(Self::out(1, Vec::new(), "scp: no such directory"));
+                }
+                dst = dst.join(src.file_name().unwrap());
+            } else {
+                if src.is_dir() {
+                    return Ok(Self::out(1, Vec::new(), "scp: not a regular file"));
+                }
+                if !dst.parent().is_some_and(|p| p.is_dir()) {
+                    return Ok(Self::out(1, Vec::new(), "scp: no such directory"));
+                }
+            }
+            match Self::copy_tree(src, &dst) {
+                Ok(()) => Ok(Self::out(0, Vec::new(), "")),
+                Err(e) => Ok(Self::out(1, Vec::new(), &e.to_string())),
+            }
+        }
+    }
+
+    impl CommandRunner for FakeGuest {
+        fn run_with_env(
+            &self,
+            _env: &[(&str, &str)],
+            program: &str,
+            args: &[&str],
+        ) -> io::Result<Output> {
+            let mut line = program.to_string();
+            for a in args {
+                line.push(' ');
+                line.push_str(a);
+            }
+            self.invocations.lock().unwrap().push(line);
+            if self
+                .transport_down
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(Self::out(
+                    255,
+                    Vec::new(),
+                    "ssh: connect to host: Connection refused",
+                ));
+            }
+            match program {
+                "ssh" => self.run_ssh(args),
+                "scp" => self.run_scp(args),
+                other => Err(io::Error::other(format!(
+                    "fake guest: unmodelled program {other:?}"
+                ))),
             }
         }
     }

@@ -92,6 +92,23 @@ pub enum EventKind {
     /// untouched (the throwaway branch/worktree are cleaned up, never
     /// left half-built).
     GitMergeFailed,
+    /// One agent auth/config file was copied host -> guest at session
+    /// launch (`habitat_workspace::agent_state`). Credentials crossing the
+    /// boundary are security-relevant on every occurrence, so this is
+    /// never suppressible. The message carries the agent id and the
+    /// manifest path only -- never file contents.
+    AgentStateCopiedIn,
+    /// One agent auth file was copied guest -> host (a refreshed token, or
+    /// a first login performed inside the guest). Same logging rules as
+    /// `AgentStateCopiedIn`.
+    AgentStateCopiedOut,
+    /// An agent-state copy was refused or failed: a symlink or wrong-type
+    /// host path, an oversized or malformed file coming back from the
+    /// guest, a lock held by another session, or a transport error. The
+    /// guest controls the bytes on the way back out, so every rejection
+    /// must be visible rather than silently dropped (AGENTS.md invariant
+    /// 10).
+    AgentStateRejected,
 }
 
 impl EventKind {
@@ -111,6 +128,9 @@ impl EventKind {
             EventKind::SessionStop => "session-stop",
             EventKind::GitMergeApplied => "git-merge-applied",
             EventKind::GitMergeFailed => "git-merge-failed",
+            EventKind::AgentStateCopiedIn => "agent-state-copied-in",
+            EventKind::AgentStateCopiedOut => "agent-state-copied-out",
+            EventKind::AgentStateRejected => "agent-state-rejected",
         }
     }
 
@@ -140,7 +160,10 @@ impl EventKind {
             | EventKind::SessionStart
             | EventKind::SessionStop
             | EventKind::GitMergeApplied
-            | EventKind::GitMergeFailed => false,
+            | EventKind::GitMergeFailed
+            | EventKind::AgentStateCopiedIn
+            | EventKind::AgentStateCopiedOut
+            | EventKind::AgentStateRejected => false,
         }
     }
 
@@ -162,6 +185,9 @@ impl EventKind {
         EventKind::SessionStop,
         EventKind::GitMergeApplied,
         EventKind::GitMergeFailed,
+        EventKind::AgentStateCopiedIn,
+        EventKind::AgentStateCopiedOut,
+        EventKind::AgentStateRejected,
     ];
 }
 

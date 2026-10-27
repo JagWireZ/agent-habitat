@@ -77,7 +77,7 @@ fn preflight_failure_stops_before_disk_build_or_launch() {
         &config,
         "localhost/habitat-guest:alpine",
         "127.0.0.1:8443".parse().unwrap(),
-        Vec::new(),
+        None,
         &run::AgentInvocation {
             program: "fake-agent".to_string(),
             args: vec![],
@@ -135,7 +135,6 @@ fn happy_path_builds_a_real_disk_launches_and_tears_down_with_an_immediate_exit(
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
         guest_ssh_public_key: "ssh-ed25519 AAAAtestFakeKey habitat-session".to_string(),
         guest_ssh_private_key_path: paths.guest_ssh_key_path(),
-        auth_mounts: Vec::new(),
     };
     let run_args = build_run_args(&launch_req);
     let run_invocation = format!(
@@ -183,7 +182,7 @@ fn happy_path_builds_a_real_disk_launches_and_tears_down_with_an_immediate_exit(
         &config,
         "localhost/habitat-guest:alpine",
         "127.0.0.1:8443".parse().unwrap(),
-        Vec::new(),
+        None,
         &run::AgentInvocation {
             program: "fake-agent".to_string(),
             args: vec![],

@@ -10,6 +10,7 @@
 //! allowlist/blocklist entries or adjust resource limits/toggles -- never
 //! disable containment, blocklist enforcement, or patch validation.
 
+pub mod agent_state;
 pub mod blocklist;
 pub mod config;
 pub mod egress_allowlist;

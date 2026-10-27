@@ -45,3 +45,16 @@ hardening nice-to-haves.
 
 Phase 5 (egress-bypass) still needs real KVM and is not yet populated;
 see `tests/manual/` for why it lands there instead once built.
+
+- `agent_state_copy_out.rs` (agent auth/config copying): the guest is
+  hostile on the way back out and the host filesystem may contain things
+  the code must not follow. Confirms an oversized, empty, malformed,
+  non-object-JSON, or non-UTF-8 file never replaces a good host token; a
+  persistently bad file is logged once, not per tick; a dead transport
+  changes nothing; copy-out never writes through a symlink at the
+  destination; copy-in refuses a symlinked source and rejects a whole config
+  directory containing a symlink (since `scp -r` would follow it) without
+  affecting other entries; over-limit config directories are rejected; and a
+  symlinked `~/.habitat/agents` is refused outright. Runs entirely
+  against a `FakeGuest` backed by a temporary directory, so it needs no real
+  hardware.

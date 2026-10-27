@@ -1,0 +1,75 @@
+# Agent state manifest -- Agent Habitat.
+#
+# The complete, fixed list of agent auth/config files that may cross the
+# host/sandbox boundary, and in which direction. Anything not listed here
+# is never copied, in either direction (docs/decisions/
+# 0011-agent-state-copy-in-out.md).
+#
+# One entry per line, four whitespace-separated fields:
+#
+#   <agent> <role> <kind> <home-relative-path>
+#
+#   agent  claude | codex | opencode. Matches `habitat run <agent>`'s
+#          shorthand table (crates/cli/src/run.rs). A named-agent session
+#          only ever receives that one agent's entries; an interactive
+#          shell session receives every agent's.
+#   role   auth   -- copied host -> guest at launch, and guest -> host
+#                    during and at the end of the session, because OAuth
+#                    refresh tokens change while an agent runs.
+#          config -- copied host -> guest at launch ONLY. Never copied back:
+#                    a compromised session must not be able to plant a
+#                    hook, MCP server, or instruction file that loads in
+#                    every future session.
+#   kind   file | dir. `auth` entries must be `file` (copy-out never walks
+#          a directory tree); `dir` is only valid for `config`.
+#   path   Relative to the guest's $HOME (/home/habitat), written
+#          identically under ~/.habitat/agents/<agent>/ on the host. ASCII
+#          only, no leading "/", no "..", no empty components.
+#
+# Deliberately NOT listed (never copy these): session transcripts and
+# history (claude `.claude/projects/`, codex `sessions/` and
+# `history.jsonl`, opencode `opencode.db*` and `storage/`), logs, caches,
+# SQLite state databases, and installed plugin trees. Transcripts can hold
+# project content and secrets and would bypass the workspace blocklist.
+#
+# Like policy/blocklist.txt this file is baked into the binary at compile
+# time (crates/policy/src/agent_state.rs) -- an on-disk edit after install
+# cannot change what ships, and a project's sandbox.yaml cannot add to it.
+# Every change here is reviewed on the quarterly pass
+# (reviews/CHECKLIST.md, allowlist/blocklist change log).
+
+# --- Claude Code -----------------------------------------------------
+# OAuth tokens (Linux file backend).
+claude auth   file .claude/.credentials.json
+# Account identity, onboarding state, MCP server list (mixed file).
+claude auth   file .claude.json
+claude config file .claude/settings.json
+claude config file .claude/CLAUDE.md
+claude config dir  .claude/commands
+claude config dir  .claude/agents
+claude config dir  .claude/skills
+
+# --- Codex -----------------------------------------------------------
+# File-backed credential store (cli_auth_credentials_store = "file").
+codex auth   file .codex/auth.json
+codex config file .codex/config.toml
+codex config file .codex/AGENTS.md
+codex config dir  .codex/rules
+codex config dir  .codex/prompts
+codex config dir  .codex/skills
+
+# --- opencode --------------------------------------------------------
+# Credentials live under the XDG *data* dir, not the config dir.
+opencode auth   file .local/share/opencode/auth.json
+opencode auth   file .local/share/opencode/mcp-auth.json
+opencode config file .config/opencode/opencode.json
+opencode config file .config/opencode/opencode.jsonc
+opencode config file .config/opencode/tui.json
+opencode config file .config/opencode/tui.jsonc
+opencode config file .config/opencode/AGENTS.md
+opencode config dir  .config/opencode/agents
+opencode config dir  .config/opencode/commands
+opencode config dir  .config/opencode/modes
+opencode config dir  .config/opencode/plugins
+opencode config dir  .config/opencode/themes
+opencode config dir  .config/opencode/tools

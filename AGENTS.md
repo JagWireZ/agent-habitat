@@ -100,7 +100,13 @@ proceeding.
    plaintext environment variable.** Use the actual secret-injection
    mechanism for the chosen VM stack, not env vars, not baked into the
    guest image, not passed as a CLI argument -- no exceptions, not even in
-   test scripts or "just for debugging" code.
+   test scripts or "just for debugging" code. For the three named agents'
+   own logins that mechanism is per-file copy over the per-session SSH
+   channel, limited to the fixed manifest in `policy/agent_state.txt`:
+   `auth` files go in at launch and come back out, `config` files go in
+   only, and a named-agent session receives only that agent's entries
+   (`docs/decisions/0011-agent-state-copy-in-out.md`). A host credential
+   path is never bind-mounted.
 6. **Egress enforcement happens at the local proxy that actually carries
    guest traffic** -- never only inside the guest, and never assumed to
    hold for a network path that hasn't actually been shown to be the one
@@ -291,7 +297,9 @@ depends on" is done.
 - Any change that expands what a session can reach or see -- including
   flipping the git-history toggle on for a project -- requires a logged,
   reviewed entry *before* it takes effect. This applies even to changes
-  that look small.
+  that look small. Adding or loosening an entry in `policy/agent_state.txt`
+  (a new file crossing the boundary, or a `config` entry becoming `auth`)
+  is such a change.
 
 ## 9. When instructions are ambiguous or seem to require a shortcut
 

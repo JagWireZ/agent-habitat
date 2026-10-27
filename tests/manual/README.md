@@ -94,3 +94,11 @@ manager, a real `sudo` prompt).
   run against real hardware in this session -- do not treat Phase 7 as
   fully real-hardware-validated until this runbook's checkboxes are
   filled in from an actual run.
+
+- `validate-agent-state.md` -- agent auth/config copying's real-hardware
+  exit gate (`docs/decisions/0011-agent-state-copy-in-out.md`): the part
+  `tests/unit/workspace/agent_state_exit_gate.rs` cannot cover, because it
+  needs a real booted guest and the real agents -- the actual `ssh`/`scp`
+  round trip, the copied files' ownership and modes inside the guest, and
+  each agent actually starting authenticated from the copied files. A
+  checklist to run by hand and record, not a script.

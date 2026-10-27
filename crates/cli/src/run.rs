@@ -28,6 +28,7 @@ use habitat_vm::command_runner::CommandRunner as VmCommandRunner;
 use habitat_vm::guest_ssh;
 use habitat_vm::launcher;
 use habitat_vm::session::{LaunchRequest, SessionId};
+use habitat_workspace::agent_state::{AgentStateSession, CopyReport};
 use habitat_workspace::command_runner::CommandRunner as WsCommandRunner;
 use habitat_workspace::guest_exec::{self, GuestEndpoint, GuestExecRunner};
 use habitat_workspace::pipeline::{self, BuildRequest};
@@ -91,91 +92,77 @@ fn known_agent_binary(name: &str) -> Option<&'static str> {
 /// The named agent shorthands `habitat run` accepts, for error messages.
 const KNOWN_AGENT_NAMES: &[&str] = &["claude", "codex", "opencode"];
 
-/// Where an operator's persistent agent auth/config lives on the host --
-/// kept separate from any arbitrary project path, never derived from
-/// `project_root` or user input. Fixed, not configurable per project
-/// (same posture as [`known_agent_binary`]'s own fixed table): a new
-/// agent's path is added here, not invented per `sandbox.yaml`.
-///
-/// Each agent gets its own top-level entry directly under `~/.habitat/`
-/// (`~/.habitat/claude`, not `~/.habitat/auth/claude`) rather than being
-/// nested under an "auth" subdirectory -- what's mirrored here is each
-/// agent's whole config/state directory (history, caches, etc.), not
-/// just credentials, so a name implying "auth only" would be misleading.
-const AGENT_HOME_SUBDIR: &str = ".habitat";
-
-/// Maps each known agent's on-host config path (directly under
-/// `~/.habitat/`) to where it needs to land in the guest, mirroring
-/// `known_agent_binary`'s fixed table. Returns only the entries whose
-/// host path actually exists -- an operator who hasn't set up a given
-/// agent's auth yet sees no behavior change, not an error; the agent
-/// then runs unauthenticated inside the guest exactly as it does today.
-///
-/// `home_dir` is the operator's real host home directory (`$HOME`),
-/// passed in rather than read here so this stays pure and testable
-/// against a fake directory tree.
-pub fn known_auth_mounts(home_dir: &Path) -> Vec<habitat_vm::session::AuthMount> {
-    let agent_root = home_dir.join(AGENT_HOME_SUBDIR);
-    let guest_home = habitat_vm::launcher::GUEST_HOME_DIR;
-    let candidates: &[(&str, String)] = &[
-        ("claude", format!("{guest_home}/.claude")),
-        ("claude.json", format!("{guest_home}/.claude.json")),
-        ("codex", format!("{guest_home}/.codex")),
-        ("opencode", format!("{guest_home}/.config/opencode")),
-    ];
-    candidates
-        .iter()
-        .map(|(name, guest_path)| (agent_root.join(name), guest_path.clone()))
-        .filter(|(host_path, _)| host_path.exists())
-        .map(|(host_path, guest_path)| habitat_vm::session::AuthMount {
-            host_path,
-            guest_path,
-        })
-        .collect()
-}
-
-/// Which `~/.habitat/` entries a given guest-side agent binary
-/// (`known_agent_binary`'s output, e.g. `"claude-code"`) needs present on
-/// the host for [`known_auth_mounts`] to pick it up. A custom `--
-/// <program>` agent has no entry here and gets nothing created -- only
-/// the three named shorthands are "known" enough to auto-provision.
-fn auth_entries_for_program(program: &str) -> &'static [&'static str] {
+/// Maps a guest-side agent binary (`known_agent_binary`'s output) to its
+/// id in the agent state manifest (`habitat_policy::agent_state`). A custom
+/// `-- <program>` agent has no entry and so gets no agent state at all --
+/// only the three named shorthands are "known" enough to be handed
+/// credentials.
+pub fn agent_state_id_for_program(program: &str) -> Option<&'static str> {
     match program {
-        "claude-code" => &["claude", "claude.json"],
-        "codex" => &["codex"],
-        "opencode" => &["opencode"],
-        _ => &[],
+        "claude-code" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        _ => None,
     }
 }
 
-/// Creates whichever of `program`'s `~/.habitat/` entries don't already
-/// exist, *before* [`known_auth_mounts`] resolves this session's bind
-/// mounts. Without this, a brand-new installation's first `habitat run
-/// claude` would find nothing at `~/.habitat/claude` yet,
-/// `known_auth_mounts`'s `exists()` filter would skip it, and the first
-/// login inside the guest would have nowhere durable to persist to --
-/// gone the moment the guest exits.
-///
-/// `claude.json` is created as an empty JSON object (a bind mount's host
-/// side must already exist, and an empty object is valid JSON a first
-/// run can safely overwrite); every other entry is a directory. Never
-/// touches an entry that already exists, so an operator's own copied-in
-/// agent state is never clobbered.
-pub fn ensure_auth_entries_exist(home_dir: &Path, program: &str) -> std::io::Result<()> {
-    let agent_root = home_dir.join(AGENT_HOME_SUBDIR);
-    for entry in auth_entries_for_program(program) {
-        let path = agent_root.join(entry);
-        if path.exists() {
-            continue;
-        }
-        if *entry == "claude.json" {
-            std::fs::create_dir_all(&agent_root)?;
-            std::fs::write(&path, "{}\n")?;
-        } else {
-            std::fs::create_dir_all(&path)?;
-        }
+/// Which manifest agents a session may receive state for -- least
+/// privilege by mode. A named agent gets only its own files (a `claude`
+/// session never sees the Codex token); a custom `-- <program>` gets none;
+/// an interactive shell, where the operator may run any agent, gets all.
+pub fn agent_state_ids_for_mode(mode: &RunMode) -> Vec<String> {
+    match mode {
+        RunMode::Shell => habitat_policy::agent_state::known_agents(),
+        RunMode::Agent(agent) => agent_state_id_for_program(&agent.program)
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default(),
     }
-    Ok(())
+}
+
+/// Opens this session's agent state under `~/.habitat/agents/`
+/// (`habitat_workspace::agent_state`). `Ok(None)` when there is nothing to
+/// do: no readable `$HOME`, or a custom agent with no manifest entries. An
+/// `Err` is not fatal to the session -- the caller reports it and carries
+/// on with the agent unauthenticated -- but it is never swallowed.
+pub fn open_agent_state(
+    home: Option<&Path>,
+    mode: &RunMode,
+) -> std::io::Result<Option<AgentStateSession>> {
+    let ids = agent_state_ids_for_mode(mode);
+    let (Some(home), false) = (home, ids.is_empty()) else {
+        return Ok(None);
+    };
+    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    AgentStateSession::open(home, &id_refs, launcher::GUEST_HOME_DIR).map(Some)
+}
+
+/// Copies this session's agent auth and config files into the guest.
+/// Nothing to do (and an empty report) when `agent_state` is `None`.
+pub fn agent_state_copy_in<R: WsCommandRunner, A: AuditSink>(
+    agent_state: Option<&AgentStateSession>,
+    guest: GuestEndpoint<'_>,
+    runner: &R,
+    audit: &A,
+) -> CopyReport {
+    match agent_state {
+        Some(state) => state.copy_in(&GuestExecRunner::new(runner, guest), audit),
+        None => CopyReport::default(),
+    }
+}
+
+/// Copies changed agent auth files back out of the guest. Best-effort by
+/// design: every rejection is already in the audit log, and a failure here
+/// must never block the sync, the merge-back, or teardown.
+pub fn agent_state_copy_out<R: WsCommandRunner, A: AuditSink>(
+    agent_state: Option<&AgentStateSession>,
+    guest: GuestEndpoint<'_>,
+    runner: &R,
+    audit: &A,
+) -> CopyReport {
+    match agent_state {
+        Some(state) => state.copy_out(&GuestExecRunner::new(runner, guest), audit),
+        None => CopyReport::default(),
+    }
 }
 
 /// Subdirectory, under the operator's home, that [`log_habitat_event`]
@@ -190,18 +177,25 @@ const LOG_HOME_SUBDIR: &str = ".habitat/logs";
 
 /// Appends one timestamped line to `~/.habitat/logs/habitat.log`,
 /// creating `~/.habitat/logs` (and so, on a brand-new installation,
-/// `~/.habitat` itself) on first use. This is the only thing that
-/// creates `~/.habitat` when an operator has never set up any agent
-/// auth -- every other path under it ([`ensure_auth_entries_exist`]) is
-/// created lazily, per agent, only when that agent is actually run.
+/// `~/.habitat` itself) on first use, as `0700` like everything else
+/// under `~/.habitat`. Agent state under `~/.habitat/agents/` is created
+/// separately, per agent, only when that agent is actually run
+/// ([`open_agent_state`]).
 ///
 /// Best-effort and silent on failure: a read-only `$HOME` or a full disk
 /// must never block a session over a convenience log.
 pub fn log_habitat_event(home_dir: &Path, message: &str) {
     use std::io::Write;
 
+    use std::os::unix::fs::DirBuilderExt;
+
     let dir = home_dir.join(LOG_HOME_SUBDIR);
-    if std::fs::create_dir_all(&dir).is_err() {
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .is_err()
+    {
         return;
     }
     let unix_secs = std::time::SystemTime::now()
@@ -352,7 +346,6 @@ pub fn launch_request(
     egress_proxy_addr: SocketAddr,
     guest_ssh_public_key: String,
     guest_ssh_private_key_path: PathBuf,
-    auth_mounts: Vec<habitat_vm::session::AuthMount>,
 ) -> LaunchRequest {
     LaunchRequest {
         session_id,
@@ -362,7 +355,6 @@ pub fn launch_request(
         egress_proxy_addr,
         guest_ssh_public_key,
         guest_ssh_private_key_path,
-        auth_mounts,
     }
 }
 
@@ -421,6 +413,7 @@ pub fn run_prompt_loop<WH, WG, A>(
     guest: GuestEndpoint<'_>,
     patterns: &[String],
     agent: &AgentInvocation,
+    agent_state: Option<&AgentStateSession>,
     host_runner: &WH,
     guest_runner: &WG,
     audit: &A,
@@ -457,6 +450,12 @@ where
             .exec(&agent.program, &arg_refs)
             .map_err(|e| run_err(format!("could not run agent '{}': {e}", agent.program)))?;
 
+        // The agent may have just refreshed a rotating OAuth token; pull it
+        // back now rather than only at session end, so a crash between
+        // rounds cannot leave the host holding a revoked refresh token.
+        // Unchanged files cost one ssh and write nothing.
+        agent_state_copy_out(agent_state, guest, guest_runner, audit);
+
         let sandbox_request = SandboxToHostRequest {
             project_root,
             workspace_dir: &workspace_dir,
@@ -487,6 +486,12 @@ where
 /// chosen to keep changes visible on both sides without spamming a
 /// git/ssh round-trip on an idle shell.
 pub const SHELL_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Agent auth files are re-checked for refreshed tokens every this many
+/// shell sync ticks (so every 30s at the default interval). Each check is
+/// one `ssh` per auth file, which is cheap but not worth doing every 5s;
+/// the caller's final copy-out after the shell exits catches the rest.
+pub const SHELL_AGENT_STATE_TICKS_PER_COPY_OUT: u32 = 6;
 
 /// Name of the sentinel file the guest can drop inside
 /// [`sync::GUEST_WORKSPACE_DIR`] (visible host-side under the session's
@@ -534,6 +539,7 @@ pub fn run_shell_session<WH, A>(
     paths: &SessionPaths,
     guest: GuestEndpoint<'_>,
     patterns: &[String],
+    agent_state: Option<&AgentStateSession>,
     host_runner: &WH,
     audit: &A,
 ) -> Result<ShellSessionOutcome, RunError>
@@ -592,10 +598,16 @@ where
     let stop = std::sync::atomic::AtomicBool::new(false);
     let shell_result = std::thread::scope(|scope| {
         scope.spawn(|| {
+            let mut ticks: u32 = 0;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(SHELL_SYNC_INTERVAL);
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
+                }
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(SHELL_AGENT_STATE_TICKS_PER_COPY_OUT) {
+                    // Best-effort; rejections are in the audit log.
+                    agent_state_copy_out(agent_state, guest, host_runner, audit);
                 }
                 // Best-effort: a flagged/failed periodic tick is not fatal
                 // to the still-open interactive shell -- the final sync
@@ -636,7 +648,7 @@ where
 /// Upper bound on how long [`wait_for_guest_ssh`] polls before giving up.
 /// Real-hardware boot path (`guest/entrypoint.sh`): DHCP alone can take
 /// up to 10s before it gives up and continues anyway, then the workspace
-/// and any auth-mount `chmod -R` run, all *before* `exec sshd` -- so the
+/// and the workspace `chmod -R` run, all *before* `exec sshd` -- so the
 /// guest's published SSH port can be seen as "up" (the TCP forward
 /// itself is live the moment the container starts) well before anything
 /// inside the guest is actually listening on it. 30s leaves comfortable
@@ -656,7 +668,7 @@ const GUEST_SSH_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::
 /// the TCP handshake right away (the forward itself is live as soon as
 /// the container starts), but `guest/entrypoint.sh` doesn't `exec sshd`
 /// until after DHCP (up to 10s) and a `chmod -R` over the bind-mounted
-/// workspace (and any auth mounts) have both finished -- an SSH attempt
+/// workspace have both finished -- an SSH attempt
 /// in that window gets the connection reset mid-handshake
 /// (`kex_exchange_identification: read: Connection reset by peer`)
 /// instead of a clean "not up yet" signal to retry on.
@@ -755,7 +767,7 @@ pub fn run_full_session<E, VR, WH, WG, A>(
     config: &ProjectConfig,
     guest_image: &str,
     egress_proxy_addr: SocketAddr,
-    auth_mounts: Vec<habitat_vm::session::AuthMount>,
+    agent_state: Option<&AgentStateSession>,
     agent: &AgentInvocation,
     prompts: impl IntoIterator<Item = String>,
     on_round: impl FnMut(&PromptRoundOutcome),
@@ -786,7 +798,6 @@ where
         egress_proxy_addr,
         keypair.public_key,
         keypair.private_key_path.clone(),
-        auth_mounts,
     );
 
     let launched = launcher::launch(&launch_req, deps.vm_runner, deps.audit)
@@ -804,18 +815,29 @@ where
         private_key_path: &launched.guest_ssh_private_key_path,
     };
 
+    // Agent auth/config into the guest before the first prompt. A failure
+    // here is reported in the audit log and leaves the agent
+    // unauthenticated; it never fails the session.
+    agent_state_copy_in(agent_state, guest, deps.guest_runner, deps.audit);
+
     let loop_result = run_prompt_loop(
         project_root,
         paths,
         guest,
         &patterns,
         agent,
+        agent_state,
         deps.host_runner,
         deps.guest_runner,
         deps.audit,
         prompts,
         on_round,
     );
+
+    // Same reasoning as the merge-back and teardown below: always attempt
+    // the final auth copy-out, however the prompt loop finished, and while
+    // the guest is still running.
+    agent_state_copy_out(agent_state, guest, deps.guest_runner, deps.audit);
 
     // Same reasoning as teardown below: attempt the git merge-back
     // regardless of how the prompt loop finished, and always before
@@ -1308,33 +1330,10 @@ mod tests {
             "127.0.0.1:8443".parse().unwrap(),
             "ssh-ed25519 AAAA".to_string(),
             PathBuf::from("/tmp/habitat-test-session-2/guest-ssh-key"),
-            Vec::new(),
         );
         assert_eq!(req.resource_limits.cpus, 4.0);
         assert_eq!(req.resource_limits.memory_mb, 8192);
         assert_eq!(req.workspace_host_dir, paths.staging_dir());
-        assert!(req.auth_mounts.is_empty());
-    }
-
-    #[test]
-    fn launch_request_carries_through_whatever_auth_mounts_it_is_given() {
-        let config = ProjectConfig::default();
-        let paths = SessionPaths::new("/tmp/habitat-test-session-3");
-        let mounts = vec![habitat_vm::session::AuthMount {
-            host_path: PathBuf::from("/home/op/.habitat/claude"),
-            guest_path: "/home/habitat/.claude".to_string(),
-        }];
-        let req = launch_request(
-            SessionId::from_name("habitat-test-launch-request-2").unwrap(),
-            &paths,
-            &config,
-            "localhost/habitat-guest:alpine".to_string(),
-            "127.0.0.1:8443".parse().unwrap(),
-            "ssh-ed25519 AAAA".to_string(),
-            PathBuf::from("/tmp/habitat-test-session-3/guest-ssh-key"),
-            mounts.clone(),
-        );
-        assert_eq!(req.auth_mounts, mounts);
     }
 
     /// Fresh, uniquely-named directory under the system temp dir, same
@@ -1354,71 +1353,77 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn known_auth_mounts_is_empty_when_nothing_is_set_up_on_the_host() {
-        let home = fresh_fake_home("empty");
-        assert!(known_auth_mounts(&home).is_empty());
-        std::fs::remove_dir_all(&home).unwrap();
+    fn agent_invocation(program: &str) -> AgentInvocation {
+        AgentInvocation {
+            program: program.to_string(),
+            args: Vec::new(),
+        }
     }
 
     #[test]
-    fn known_auth_mounts_only_includes_paths_that_actually_exist() {
-        let home = fresh_fake_home("partial");
-        let auth_root = home.join(".habitat");
-        std::fs::create_dir_all(auth_root.join("claude")).unwrap();
-        std::fs::write(auth_root.join("claude.json"), "{}").unwrap();
-        // codex/opencode left absent on purpose.
-
-        let mounts = known_auth_mounts(&home);
-        assert_eq!(mounts.len(), 2);
-        assert!(mounts
-            .iter()
-            .any(|m| m.host_path == auth_root.join("claude") && m.guest_path == "/home/habitat/.claude"));
-        assert!(mounts.iter().any(|m| m.host_path == auth_root.join("claude.json")
-            && m.guest_path == "/home/habitat/.claude.json"));
-
-        std::fs::remove_dir_all(&home).unwrap();
+    fn named_agents_map_to_their_manifest_ids_and_custom_ones_do_not() {
+        assert_eq!(agent_state_id_for_program("claude-code"), Some("claude"));
+        assert_eq!(agent_state_id_for_program("codex"), Some("codex"));
+        assert_eq!(agent_state_id_for_program("opencode"), Some("opencode"));
+        assert_eq!(agent_state_id_for_program("my-custom-agent"), None);
+        // Every shorthand `habitat run` accepts has an id, so no named
+        // agent silently runs without its credentials.
+        for name in KNOWN_AGENT_NAMES {
+            let program = known_agent_binary(name).unwrap();
+            assert!(agent_state_id_for_program(program).is_some(), "{name}");
+        }
     }
 
     #[test]
-    fn ensure_auth_entries_exist_creates_claude_dir_and_an_empty_claude_json() {
-        let home = fresh_fake_home("ensure-claude");
-        ensure_auth_entries_exist(&home, "claude-code").unwrap();
+    fn a_named_agent_session_is_scoped_to_exactly_that_agent() {
+        let mode = RunMode::Agent(agent_invocation("claude-code"));
+        assert_eq!(agent_state_ids_for_mode(&mode), vec!["claude".to_string()]);
+    }
 
-        let auth_root = home.join(".habitat");
-        assert!(auth_root.join("claude").is_dir());
+    #[test]
+    fn a_custom_agent_session_gets_no_agent_state() {
+        let mode = RunMode::Agent(agent_invocation("my-custom-agent"));
+        assert!(agent_state_ids_for_mode(&mode).is_empty());
+    }
+
+    #[test]
+    fn a_shell_session_is_scoped_to_every_known_agent() {
         assert_eq!(
-            std::fs::read_to_string(auth_root.join("claude.json")).unwrap(),
-            "{}\n"
+            agent_state_ids_for_mode(&RunMode::Shell),
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "opencode".to_string()
+            ]
         );
-        // codex/opencode are a different agent's entries, untouched.
-        assert!(!auth_root.join("codex").exists());
-
-        std::fs::remove_dir_all(&home).unwrap();
     }
 
     #[test]
-    fn ensure_auth_entries_exist_never_overwrites_an_existing_entry() {
-        let home = fresh_fake_home("ensure-preexisting");
-        let auth_root = home.join(".habitat");
-        std::fs::create_dir_all(&auth_root).unwrap();
-        std::fs::write(auth_root.join("claude.json"), "{\"existing\":true}").unwrap();
-
-        ensure_auth_entries_exist(&home, "claude-code").unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(auth_root.join("claude.json")).unwrap(),
-            "{\"existing\":true}"
-        );
-
-        std::fs::remove_dir_all(&home).unwrap();
-    }
-
-    #[test]
-    fn ensure_auth_entries_exist_is_a_noop_for_an_unknown_custom_agent() {
-        let home = fresh_fake_home("ensure-custom");
-        ensure_auth_entries_exist(&home, "my-custom-agent").unwrap();
+    fn open_agent_state_is_a_noop_without_a_home_or_for_a_custom_agent() {
+        let home = fresh_fake_home("agent-state-noop");
+        let custom = RunMode::Agent(agent_invocation("my-custom-agent"));
+        assert!(open_agent_state(Some(&home), &custom).unwrap().is_none());
+        assert!(open_agent_state(None, &RunMode::Shell).unwrap().is_none());
+        // Nothing was created for either.
         assert!(!home.join(".habitat").exists());
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn open_agent_state_creates_only_the_named_agents_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = fresh_fake_home("agent-state-open");
+        let mode = RunMode::Agent(agent_invocation("codex"));
+        let state = open_agent_state(Some(&home), &mode).unwrap().unwrap();
+        assert_eq!(state.agents(), vec!["codex"]);
+        let agent_dir = home.join(".habitat/agents/codex");
+        assert!(agent_dir.is_dir());
+        assert_eq!(
+            std::fs::metadata(&agent_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!home.join(".habitat/agents/claude").exists());
+        drop(state);
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -1434,6 +1439,11 @@ mod tests {
         log_habitat_event(&home, "ran habitat run (shell)");
         let contents = std::fs::read_to_string(&log_path).unwrap();
         assert_eq!(contents.lines().count(), 2, "second call should append, not overwrite");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&home.join(".habitat")), 0o700);
+        assert_eq!(mode(&home.join(".habitat/logs")), 0o700);
 
         std::fs::remove_dir_all(&home).unwrap();
     }

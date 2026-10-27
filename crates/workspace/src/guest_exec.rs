@@ -174,6 +174,24 @@ impl<'a, R: CommandRunner> GuestExecRunner<'a, R> {
         let arg_refs: Vec<&str> = full.iter().map(String::as_str).collect();
         self.inner.run("scp", &arg_refs)
     }
+
+    /// `scp -r [options] <host_dir> habitat@<host>:<guest_parent>` -- copies
+    /// the directory *into* `guest_parent` (which must already exist), so
+    /// `host_dir`'s own name becomes a child of it. `scp -r` follows
+    /// symlinks on the sending side, so callers must have already verified
+    /// the host tree contains none (`agent_state` does, before calling
+    /// this); this method does not check.
+    pub fn copy_in_dir(&self, host_dir: &str, guest_parent: &str) -> io::Result<Output> {
+        let mut full = scp_option_args(&self.endpoint);
+        full.push("-r".to_string());
+        full.push(host_dir.to_string());
+        full.push(format!(
+            "{GUEST_SSH_USER}@{}:{guest_parent}",
+            self.endpoint.host
+        ));
+        let arg_refs: Vec<&str> = full.iter().map(String::as_str).collect();
+        self.inner.run("scp", &arg_refs)
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +285,25 @@ mod tests {
         );
         let guest = GuestExecRunner::new(&runner, endpoint(&key_path));
         let output = guest.copy_in("/tmp/x.patch", "/tmp/x.patch").unwrap();
+        assert!(output.status.success());
+    }
+
+    #[test]
+    fn copy_in_dir_builds_a_recursive_scp_invocation() {
+        let key_path = PathBuf::from("/tmp/habitat-guest-cp-dir-test-key");
+        let runner = FakeCommandRunner::default().with_ok(
+            &format!(
+                "scp -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o \
+                 UserKnownHostsFile=/dev/null -o BatchMode=yes -P 34567 -r /h/skills \
+                 habitat@127.0.0.1:/home/habitat/.claude",
+                key_path.display()
+            ),
+            "",
+        );
+        let guest = GuestExecRunner::new(&runner, endpoint(&key_path));
+        let output = guest
+            .copy_in_dir("/h/skills", "/home/habitat/.claude")
+            .unwrap();
         assert!(output.status.success());
     }
 }

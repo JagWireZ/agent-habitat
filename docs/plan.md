@@ -10,7 +10,7 @@ Three things make this safe in practice:
 
 - **A hard wall between the agent and your computer.** The agent runs inside a real virtual machine, not just a sandboxed folder — the kind of isolation used to run untrusted code safely at cloud-provider scale.
 - **A locked front door to the internet.** The agent can only reach the handful of services it actually needs (AI provider APIs, package registries like PyPI and npm). Everything else is blocked.
-- **Secrets never go in.** Credentials, API keys, and `.env` files are filtered out before the sandbox is even built — they never have the chance to leak, because they're never present.
+- **Secrets never go in.** Credentials, API keys, and `.env` files in your project are filtered out before the sandbox is even built -- they never have the chance to leak, because they're never present. The one deliberate exception is the AI agent's own login, which `habitat` copies in itself, file by file, from a private folder (`~/.habitat/agents/`) and nowhere else.
 
 Everything the agent does is logged, so there's always a clear record of what happened in a session.
 
@@ -70,6 +70,8 @@ A few important nuances:
 - This only blocks things from coming *in*. It doesn't restrict what the agent creates inside the sandbox — you're expected to review everything that comes back out, regardless of filename.
 - There's no in-between option in v1: if a task genuinely needs a blocked file's contents (say, a runtime environment variable), it's just unavailable. A more targeted way to inject specific secrets without exposing the whole file is a likely future improvement.
 
+**The agent's own login.** Each coding agent keeps its login and settings in a few files in its home folder. So you don't have to sign in every session, `habitat` keeps a private copy of those files under `~/.habitat/agents/<agent>/` and copies them into each new sandbox. Login files (tokens) are copied back out as they change, so a refreshed token or a first sign-in carries over to the next session. Settings files (hooks, instructions, skills) only ever go *in*: a sandboxed agent can't change what future sessions will load. A session started for one agent only receives that agent's files. Only a fixed, reviewed list of files is ever copied, never whole folders, and every copy is logged by name -- never by content. If two sessions of the same agent run at once, only the first copies tokens back.
+
 **Bringing changes back.** After each tool call, the agent's changes are written directly into your real project folder — not just committed inside the sandbox, but applied to your actual working directory, so you can see and touch them immediately. From there, it's entirely up to you: keep editing by hand, send another prompt, or commit and push whenever you're ready. There's no forced "end of session" gate on committing — that's always a deliberate, manual step you take on your own schedule.
 
 Ending the session is a separate, explicit action from committing: when you're done working with the agent, you end the session, and the disposable sandbox (its virtual disk and everything on it) is destroyed. Nothing is lost by this — anything the agent already pushed to your real folder is already there, whether or not you've committed it yet.
@@ -124,6 +126,7 @@ There's one hardened setup, not a "fast but less safe" mode and a "slow but safe
 - **The agent can't proactively check your files mid-task** — only at the two sync points described above.
 - **Sync performance at large scale (huge monorepos, big binary files) isn't yet validated** — worth checking before v1 ships.
 - **No middle ground for blocked files** — if a task needs a secret, it's simply unavailable in v1. A more targeted way to inject specific secrets is a likely future addition.
+- **Agent logins are copied, not shared** -- a refreshed token is copied back after each prompt (about every 30 seconds in a shell session) and at session end, so a hard crash of `habitat` itself can lose the latest rotation and mean signing in again. Signing out inside the sandbox does not sign you out on your machine.
 - Naming (`habitat` vs. alternatives) is still open.
 
 ## 5. Roadmap

@@ -156,7 +156,6 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
         egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
         guest_ssh_public_key: "ssh-ed25519 AAAAtestFakeKey habitat-session".to_string(),
         guest_ssh_private_key_path: paths.guest_ssh_key_path(),
-        auth_mounts: Vec::new(),
     };
     let run_args_argv = build_run_args(&launch_req);
     let run_invocation = format!(
@@ -227,7 +226,7 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
         &config,
         "localhost/habitat-guest:alpine",
         "127.0.0.1:8443".parse().unwrap(),
-        Vec::new(),
+        None,
         &AgentInvocation {
             program: "fake-agent".to_string(),
             args: vec![],
@@ -304,4 +303,194 @@ fn multi_prompt_session_syncs_a_host_edit_and_an_agent_change_through_the_real_d
 
     std::fs::remove_dir_all(&project_root).unwrap();
     std::fs::remove_dir_all(&state_dir).unwrap();
+}
+
+/// Plays the guest for the agent-state wiring test: the agent's own `ssh`
+/// invocation "refreshes the Codex token" inside the fake guest's
+/// filesystem (as a real agent would mid-run), and every other invocation
+/// -- the `mkdir`/`scp`/`chmod`/`head` of agent-state copying -- is
+/// answered by a real-filesystem-backed `FakeGuest`.
+struct AgentRefreshingGuest {
+    guest: habitat_workspace::command_runner::testing::FakeGuest,
+}
+
+impl CommandRunner for AgentRefreshingGuest {
+    fn run_with_env(
+        &self,
+        env: &[(&str, &str)],
+        program: &str,
+        args: &[&str],
+    ) -> io::Result<Output> {
+        let last = args.last().copied().unwrap_or("");
+        if program == "ssh" && last.contains("'fake-agent'") {
+            self.guest.write(
+                "/home/habitat/.codex/auth.json",
+                b"{\"refresh\":\"rotated\"}",
+            );
+            self.guest
+                .invocations
+                .lock()
+                .unwrap()
+                .push(format!("AGENT-EXEC {last}"));
+            return Ok(ok_output("agent turn completed\n"));
+        }
+        self.guest.run_with_env(env, program, args)
+    }
+}
+
+#[test]
+fn agent_auth_is_copied_in_before_the_first_prompt_and_a_refreshed_token_comes_back_out() {
+    use habitat_workspace::agent_state::AgentStateSession;
+    use habitat_workspace::command_runner::testing::FakeGuest;
+
+    let env = passing_install_env();
+    let project_root = temp_dir("as-project");
+    let state_dir = temp_dir("as-state");
+    let home = temp_dir("as-home");
+    let guest_root = temp_dir("as-guest");
+    let paths = SessionPaths::new(&state_dir);
+
+    let mut config = ProjectConfig::default();
+    config.secrets_scan.content = Toggle::Disabled;
+    write_fake_ssh_keypair(&paths.guest_ssh_key_path());
+
+    // The operator's host-side copy of the Codex login, plus another
+    // agent's token that a `codex`-scoped session must never receive.
+    let host_codex = home.join(".habitat/agents/codex/.codex");
+    std::fs::create_dir_all(&host_codex).unwrap();
+    std::fs::write(host_codex.join("auth.json"), "{\"refresh\":\"original\"}").unwrap();
+    let host_claude = home.join(".habitat/agents/claude/.claude");
+    std::fs::create_dir_all(&host_claude).unwrap();
+    std::fs::write(
+        host_claude.join(".credentials.json"),
+        "{\"claude\":\"secret\"}",
+    )
+    .unwrap();
+
+    let session_id = SessionId::from_name("habitat-run-e2e-agent-state").unwrap();
+    let launch_req = LaunchRequest {
+        session_id: session_id.clone(),
+        workspace_host_dir: paths.staging_dir(),
+        guest_image: "localhost/habitat-guest:alpine".to_string(),
+        resource_limits: config.resource_limits,
+        egress_proxy_addr: "127.0.0.1:8443".parse().unwrap(),
+        guest_ssh_public_key: "ssh-ed25519 AAAAtestFakeKey habitat-session".to_string(),
+        guest_ssh_private_key_path: paths.guest_ssh_key_path(),
+    };
+    let run_invocation = format!(
+        "podman {}",
+        build_run_args(&launch_req)
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let key_path_str = paths.guest_ssh_key_path();
+    let keygen_invocation = format!(
+        "ssh-keygen -t ed25519 -N  -f {} -C habitat-session -q",
+        key_path_str.to_str().unwrap()
+    );
+    let vm_runner = VmFakeCommandRunner::default()
+        .with_ok(&keygen_invocation, "")
+        .with_ok(&run_invocation, "containerid123\n")
+        .with_ok(
+            &format!("podman port {session_id} 2222/tcp"),
+            "127.0.0.1:34567\n",
+        )
+        .with_ok(&format!("podman rm --force --ignore {session_id}"), "");
+
+    // The launch argv itself must carry no auth bind mount: exactly the
+    // one workspace `-v`.
+    assert_eq!(launch_req_v_flags(&run_invocation), 1, "{run_invocation}");
+
+    let host_runner = SystemCommandRunner;
+    let guest_runner = AgentRefreshingGuest {
+        guest: FakeGuest::new(&guest_root),
+    };
+    let audit = MemoryAuditSink::default();
+    let deps = SessionDeps {
+        install_env: &env,
+        vm_runner: &vm_runner,
+        host_runner: &host_runner,
+        guest_runner: &guest_runner,
+        audit: &audit,
+    };
+
+    let agent_state = AgentStateSession::open(&home, &["codex"], "/home/habitat").unwrap();
+    let prompts = vec!["first prompt".to_string(), "second prompt".to_string()];
+
+    let summary = run::run_full_session(
+        &deps,
+        session_id,
+        &project_root,
+        &paths,
+        &config,
+        "localhost/habitat-guest:alpine",
+        "127.0.0.1:8443".parse().unwrap(),
+        Some(&agent_state),
+        &AgentInvocation {
+            program: "fake-agent".to_string(),
+            args: vec![],
+        },
+        prompts,
+        |_| {},
+    )
+    .expect("the full session must succeed end to end");
+    assert_eq!(summary.rounds.len(), 2);
+
+    // Copy-in happened before the first agent invocation.
+    let log = guest_runner.guest.invocations.lock().unwrap().clone();
+    let first_scp = log
+        .iter()
+        .position(|l| l.starts_with("scp "))
+        .expect("an scp copy-in");
+    let first_agent = log
+        .iter()
+        .position(|l| l.starts_with("AGENT-EXEC"))
+        .expect("an agent exec");
+    assert!(
+        first_scp < first_agent,
+        "auth must be copied in before the agent runs: {log:?}"
+    );
+
+    // The rotated token made it back to the host; the other agent's token
+    // never reached the guest.
+    assert_eq!(
+        std::fs::read_to_string(host_codex.join("auth.json")).unwrap(),
+        "{\"refresh\":\"rotated\"}"
+    );
+    assert!(!guest_runner
+        .guest
+        .exists("/home/habitat/.claude/.credentials.json"));
+
+    // Audit: credentials crossed the boundary exactly once each way (the
+    // second round and the final pass saw an unchanged file).
+    let tags: Vec<&str> = audit
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.tag())
+        .collect();
+    assert_eq!(
+        tags,
+        vec![
+            "preflight-pass",
+            "session-start",
+            "agent-state-copied-in",
+            "agent-state-copied-out",
+            "session-stop",
+        ],
+        "unexpected audit sequence: {tags:?}"
+    );
+
+    drop(agent_state);
+    for d in [&project_root, &state_dir, &home, &guest_root] {
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+/// Counts `-v` flags in a rendered `podman run` invocation string.
+fn launch_req_v_flags(invocation: &str) -> usize {
+    invocation.split_whitespace().filter(|t| *t == "-v").count()
 }
